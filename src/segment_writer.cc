@@ -236,13 +236,15 @@ class SegmentWriter::Impl {
     for (int column_index = 0; column_index < batch->num_columns(); ++column_index) {
       const auto& field = schema_.fields[static_cast<size_t>(column_index)];
       const auto& array = batch->column(column_index);
-      ARROW_ASSIGN_OR_RAISE(auto plain_payload, EncodePlain(field, array));
       ARROW_ASSIGN_OR_RAISE(const uint16_t encoding_id,
                             internal::SelectEncoding(field, *array, layout_policy_));
       std::vector<uint8_t> payload;
+      uint64_t uncompressed_length = 0;
       if (encoding_id == internal::kPlainEncodingId) {
-        payload = plain_payload;
+        ARROW_ASSIGN_OR_RAISE(payload, EncodePlain(field, array));
+        uncompressed_length = static_cast<uint64_t>(payload.size());
       } else {
+        ARROW_ASSIGN_OR_RAISE(uncompressed_length, internal::PlainEncodedSize(field, *array));
         ARROW_ASSIGN_OR_RAISE(payload, internal::EncodeNonPlain(encoding_id, field, *array));
       }
       ARROW_ASSIGN_OR_RAISE(const auto physical_type, internal::PhysicalTypeFor(*field.type));
@@ -255,7 +257,7 @@ class SegmentWriter::Impl {
       chunk.null_count = static_cast<uint64_t>(array->null_count());
       chunk.offset = position_;
       chunk.length = static_cast<uint64_t>(payload.size());
-      chunk.uncompressed_length = static_cast<uint64_t>(plain_payload.size());
+      chunk.uncompressed_length = uncompressed_length;
       chunk.checksum = internal::Crc32c(payload);
       ARROW_RETURN_NOT_OK(WriteTracked(payload));
       row_group.chunks.push_back(chunk);

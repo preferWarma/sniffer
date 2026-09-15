@@ -99,12 +99,50 @@ if(SNIFFER_BUILD_TESTS)
 endif()
 
 if(SNIFFER_BUILD_BENCHMARK)
+  set(SNIFFER_BENCHMARK_SOURCE_REVISION "unknown")
+  find_package(Git QUIET)
+  if(GIT_FOUND)
+    execute_process(
+      COMMAND "${GIT_EXECUTABLE}" rev-parse --short=12 HEAD
+      WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+      RESULT_VARIABLE SNIFFER_GIT_REVISION_RESULT
+      OUTPUT_VARIABLE SNIFFER_BENCHMARK_SOURCE_REVISION
+      OUTPUT_STRIP_TRAILING_WHITESPACE
+      ERROR_QUIET
+    )
+    if(NOT SNIFFER_GIT_REVISION_RESULT EQUAL 0)
+      set(SNIFFER_BENCHMARK_SOURCE_REVISION "unknown")
+    else()
+      execute_process(
+        COMMAND "${GIT_EXECUTABLE}" status --porcelain
+        WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+        OUTPUT_VARIABLE SNIFFER_GIT_STATUS
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+        ERROR_QUIET
+      )
+      if(NOT SNIFFER_GIT_STATUS STREQUAL "")
+        string(APPEND SNIFFER_BENCHMARK_SOURCE_REVISION "-dirty")
+      endif()
+    endif()
+  endif()
+  configure_file(
+    bench/benchmark_build_config.h.in
+    generated/benchmark_build_config.h
+    @ONLY
+  )
+
   add_executable(sniffer_core_performance_benchmark bench/performance_benchmark.cc)
   target_compile_features(sniffer_core_performance_benchmark PRIVATE cxx_std_20)
+  target_include_directories(
+    sniffer_core_performance_benchmark PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/generated"
+  )
   target_link_libraries(sniffer_core_performance_benchmark PRIVATE sniffer_core)
 
   add_executable(sniffer_core_compression_benchmark bench/compression_benchmark.cc)
   target_compile_features(sniffer_core_compression_benchmark PRIVATE cxx_std_20)
+  target_include_directories(
+    sniffer_core_compression_benchmark PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/generated"
+  )
   target_link_libraries(sniffer_core_compression_benchmark PRIVATE sniffer_core)
   if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
     target_compile_options(
@@ -124,6 +162,22 @@ if(SNIFFER_BUILD_BENCHMARK)
     add_test(
       NAME sniffer_core_compression_benchmark_smoke
       COMMAND sniffer_core_compression_benchmark --rows=1024 --iterations=1 --row-group=128
+    )
+    add_test(
+      NAME sniffer_core_performance_benchmark_json_smoke
+      COMMAND
+        "${CMAKE_COMMAND}"
+        "-DBENCHMARK_EXECUTABLE=$<TARGET_FILE:sniffer_core_performance_benchmark>"
+        -DEXPECTED_BENCHMARK=performance
+        -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/validate_benchmark_json.cmake"
+    )
+    add_test(
+      NAME sniffer_core_compression_benchmark_json_smoke
+      COMMAND
+        "${CMAKE_COMMAND}"
+        "-DBENCHMARK_EXECUTABLE=$<TARGET_FILE:sniffer_core_compression_benchmark>"
+        -DEXPECTED_BENCHMARK=compression
+        -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/validate_benchmark_json.cmake"
     )
   endif()
 endif()

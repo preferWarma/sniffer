@@ -2,6 +2,7 @@
 #include <arrow/io/api.h>
 #include <arrow/ipc/api.h>
 #include <arrow/util/compression.h>
+#include <arrow/util/config.h>
 
 #include <algorithm>
 #include <chrono>
@@ -16,6 +17,8 @@
 #include <utility>
 #include <vector>
 
+#include "benchmark_build_config.h"
+#include "benchmark_stats.h"
 #include "sniffer/io_plan.h"
 #include "sniffer/segment_reader.h"
 #include "sniffer/segment_writer.h"
@@ -26,6 +29,7 @@ struct Options {
   int64_t rows = 100000;
   int iterations = 5;
   uint32_t row_group_rows = 4096;
+  bool output_json = false;
 };
 
 Options ParseOptions(int argc, char** argv) {
@@ -47,6 +51,10 @@ Options ParseOptions(int argc, char** argv) {
       continue;
     }
     if (parse("--row-group=", &options.row_group_rows)) {
+      continue;
+    }
+    if (argument == "--output-format=json") {
+      options.output_json = true;
       continue;
     }
   }
@@ -92,6 +100,9 @@ struct Measurement {
   uint64_t output_rows = 0;
   uint64_t record_groups = 0;
   sniffer::ScanMetrics metrics;
+  sniffer::benchmark::SampleStats write_stats;
+  sniffer::benchmark::SampleStats scan_stats;
+  sniffer::benchmark::SampleStats total_stats;
 };
 
 arrow::Result<uint64_t> FileSize(const std::filesystem::path& path) {
@@ -216,11 +227,6 @@ arrow::Result<Measurement> RunArrowIpcOnce(const std::filesystem::path& path,
   return measurement;
 }
 
-double Median(std::vector<double> values) {
-  std::sort(values.begin(), values.end());
-  return values[values.size() / 2];
-}
-
 template <typename Runner>
 arrow::Result<Measurement> MedianMeasurement(int iterations, Runner&& runner) {
   std::vector<Measurement> measurements;
@@ -242,9 +248,12 @@ arrow::Result<Measurement> MedianMeasurement(int iterations, Runner&& runner) {
     totals.push_back(measurement.total_milliseconds);
   }
   Measurement result = measurements.back();
-  result.write_milliseconds = Median(std::move(writes));
-  result.scan_milliseconds = Median(std::move(scans));
-  result.total_milliseconds = Median(std::move(totals));
+  result.write_stats = sniffer::benchmark::SummarizeSamples(std::move(writes));
+  result.scan_stats = sniffer::benchmark::SummarizeSamples(std::move(scans));
+  result.total_stats = sniffer::benchmark::SummarizeSamples(std::move(totals));
+  result.write_milliseconds = result.write_stats.p50;
+  result.scan_milliseconds = result.scan_stats.p50;
+  result.total_milliseconds = result.total_stats.p50;
   return result;
 }
 
@@ -263,6 +272,9 @@ void PrintMeasurement(std::string_view format, const Measurement& measurement, i
             << " file_bytes=" << measurement.file_bytes
             << " output_rows=" << measurement.output_rows
             << " record_groups=" << measurement.record_groups;
+  sniffer::benchmark::PrintSampleStats(std::cout, "write", measurement.write_stats);
+  sniffer::benchmark::PrintSampleStats(std::cout, "scan", measurement.scan_stats);
+  sniffer::benchmark::PrintSampleStats(std::cout, "end_to_end", measurement.total_stats);
   if (format == "sniffer") {
     std::cout << " row_groups_considered=" << measurement.metrics.row_groups_considered
               << " row_groups_pruned=" << measurement.metrics.row_groups_pruned
@@ -270,6 +282,71 @@ void PrintMeasurement(std::string_view format, const Measurement& measurement, i
               << " chunk_bytes_read=" << measurement.metrics.chunk_bytes_read;
   }
   std::cout << '\n';
+}
+
+void PrintJsonMeasurement(std::string_view format, const Measurement& measurement,
+                          int64_t input_rows) {
+  std::cout << "    {\"format\":";
+  sniffer::benchmark::PrintJsonString(std::cout, format);
+  std::cout << ",\"write_ms\":" << measurement.write_milliseconds << ",\"write_rows_per_second\":"
+            << RowsPerSecond(measurement.write_milliseconds, input_rows)
+            << ",\"scan_ms\":" << measurement.scan_milliseconds << ",\"scan_rows_per_second\":"
+            << RowsPerSecond(measurement.scan_milliseconds, input_rows)
+            << ",\"end_to_end_ms\":" << measurement.total_milliseconds
+            << ",\"end_to_end_rows_per_second\":"
+            << RowsPerSecond(measurement.total_milliseconds, input_rows)
+            << ",\"file_bytes\":" << measurement.file_bytes
+            << ",\"output_rows\":" << measurement.output_rows
+            << ",\"record_groups\":" << measurement.record_groups << ",\"write_stats\":";
+  sniffer::benchmark::PrintJsonSampleStats(std::cout, measurement.write_stats);
+  std::cout << ",\"scan_stats\":";
+  sniffer::benchmark::PrintJsonSampleStats(std::cout, measurement.scan_stats);
+  std::cout << ",\"end_to_end_stats\":";
+  sniffer::benchmark::PrintJsonSampleStats(std::cout, measurement.total_stats);
+  if (format == "sniffer") {
+    std::cout << ",\"scan_metrics\":{\"row_groups_considered\":"
+              << measurement.metrics.row_groups_considered
+              << ",\"row_groups_pruned\":" << measurement.metrics.row_groups_pruned
+              << ",\"column_chunks_read\":" << measurement.metrics.column_chunks_read
+              << ",\"chunk_bytes_read\":" << measurement.metrics.chunk_bytes_read << '}';
+  }
+  std::cout << '}';
+}
+
+void PrintJsonReport(int argc, char** argv, const Options& options, uint64_t expected_rows,
+                     std::string_view build_mode, const Measurement& sniffer,
+                     const Measurement& arrow_ipc, const Measurement& arrow_ipc_zstd) {
+  std::cout << "{\n  \"benchmark\":\"performance\",\n  \"source_revision\":";
+  sniffer::benchmark::PrintJsonString(std::cout, SNIFFER_BENCHMARK_SOURCE_REVISION);
+  std::cout << ",\n  \"compiler\":";
+  sniffer::benchmark::PrintJsonString(std::cout, SNIFFER_BENCHMARK_COMPILER);
+  std::cout << ",\n  \"arrow_version\":";
+  sniffer::benchmark::PrintJsonString(std::cout, ARROW_VERSION_STRING);
+  std::cout << ",\n  \"build_mode\":";
+  sniffer::benchmark::PrintJsonString(std::cout, build_mode);
+  std::cout << ",\n  \"command_arguments\":";
+  sniffer::benchmark::PrintJsonArguments(std::cout, argc, argv);
+  std::cout << ",\n  \"configuration\":{\"rows\":" << options.rows
+            << ",\"row_group_rows\":" << options.row_group_rows
+            << ",\"iterations\":" << options.iterations << ",\"selectivity\":"
+            << static_cast<double>(expected_rows) / static_cast<double>(options.rows)
+            << ",\"distribution\":\"grouped_id_linear_value_nullable\""
+               ",\"predicate\":\"id_ge_half\",\"projection\":\"id,value\""
+               ",\"execution\":\"single_thread\",\"hardware_threads\":"
+            << std::thread::hardware_concurrency() << "},\n  \"measurements\":[\n";
+  PrintJsonMeasurement("sniffer", sniffer, options.rows);
+  std::cout << ",\n";
+  PrintJsonMeasurement("arrow_ipc", arrow_ipc, options.rows);
+  std::cout << ",\n";
+  PrintJsonMeasurement("arrow_ipc_zstd", arrow_ipc_zstd, options.rows);
+  std::cout << "\n  ],\n  \"comparisons\":{\"write_sniffer_speedup_vs_arrow_ipc\":"
+            << arrow_ipc.write_milliseconds / sniffer.write_milliseconds
+            << ",\"write_sniffer_speedup_vs_arrow_ipc_zstd\":"
+            << arrow_ipc_zstd.write_milliseconds / sniffer.write_milliseconds
+            << ",\"scan_sniffer_speedup_vs_arrow_ipc\":"
+            << arrow_ipc.scan_milliseconds / sniffer.scan_milliseconds
+            << ",\"scan_sniffer_speedup_vs_arrow_ipc_zstd\":"
+            << arrow_ipc_zstd.scan_milliseconds / sniffer.scan_milliseconds << "}\n}\n";
 }
 
 arrow::Result<int> RunBenchmark(int argc, char** argv) {
@@ -311,25 +388,33 @@ arrow::Result<int> RunBenchmark(int argc, char** argv) {
 #else
   constexpr std::string_view kBuildMode = "debug";
 #endif
-  std::cout << "benchmark=performance rows=" << options.rows
-            << " row_group_rows=" << options.row_group_rows << " iterations=" << options.iterations
-            << " selectivity="
-            << static_cast<double>(expected_rows) / static_cast<double>(options.rows)
-            << " distribution=grouped_id_linear_value_nullable"
-            << " predicate=id_ge_half projection=id,value"
-            << " execution=single_thread build_mode=" << kBuildMode
-            << " hardware_threads=" << std::thread::hardware_concurrency() << '\n';
-  PrintMeasurement("sniffer", sniffer, options.rows);
-  PrintMeasurement("arrow_ipc", arrow_ipc, options.rows);
-  PrintMeasurement("arrow_ipc_zstd", arrow_ipc_zstd, options.rows);
-  std::cout << "phase=write sniffer_speedup_vs_arrow_ipc="
-            << arrow_ipc.write_milliseconds / sniffer.write_milliseconds
-            << " sniffer_speedup_vs_arrow_ipc_zstd="
-            << arrow_ipc_zstd.write_milliseconds / sniffer.write_milliseconds << '\n';
-  std::cout << "phase=scan sniffer_speedup_vs_arrow_ipc="
-            << arrow_ipc.scan_milliseconds / sniffer.scan_milliseconds
-            << " sniffer_speedup_vs_arrow_ipc_zstd="
-            << arrow_ipc_zstd.scan_milliseconds / sniffer.scan_milliseconds << '\n';
+  if (options.output_json) {
+    PrintJsonReport(argc, argv, options, expected_rows, kBuildMode, sniffer, arrow_ipc,
+                    arrow_ipc_zstd);
+  } else {
+    std::cout << "benchmark=performance rows=" << options.rows
+              << " row_group_rows=" << options.row_group_rows
+              << " iterations=" << options.iterations << " selectivity="
+              << static_cast<double>(expected_rows) / static_cast<double>(options.rows)
+              << " distribution=grouped_id_linear_value_nullable"
+              << " predicate=id_ge_half projection=id,value"
+              << " execution=single_thread build_mode=" << kBuildMode
+              << " hardware_threads=" << std::thread::hardware_concurrency()
+              << " source_revision=" << SNIFFER_BENCHMARK_SOURCE_REVISION << " compiler=\""
+              << SNIFFER_BENCHMARK_COMPILER << "\""
+              << " arrow_version=" << ARROW_VERSION_STRING << '\n';
+    PrintMeasurement("sniffer", sniffer, options.rows);
+    PrintMeasurement("arrow_ipc", arrow_ipc, options.rows);
+    PrintMeasurement("arrow_ipc_zstd", arrow_ipc_zstd, options.rows);
+    std::cout << "phase=write sniffer_speedup_vs_arrow_ipc="
+              << arrow_ipc.write_milliseconds / sniffer.write_milliseconds
+              << " sniffer_speedup_vs_arrow_ipc_zstd="
+              << arrow_ipc_zstd.write_milliseconds / sniffer.write_milliseconds << '\n';
+    std::cout << "phase=scan sniffer_speedup_vs_arrow_ipc="
+              << arrow_ipc.scan_milliseconds / sniffer.scan_milliseconds
+              << " sniffer_speedup_vs_arrow_ipc_zstd="
+              << arrow_ipc_zstd.scan_milliseconds / sniffer.scan_milliseconds << '\n';
+  }
 
   std::error_code ignored;
   std::filesystem::remove(sniffer_path, ignored);

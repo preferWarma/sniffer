@@ -16,6 +16,8 @@ namespace sniffer::internal {
 [[nodiscard]] arrow::Result<uint16_t> SelectEncoding(const FieldSpec& field,
                                                      const arrow::Array& array,
                                                      const LayoutPolicy& layout);
+[[nodiscard]] arrow::Result<uint64_t> PlainEncodedSize(const FieldSpec& field,
+                                                       const arrow::Array& array);
 [[nodiscard]] arrow::Result<std::vector<uint8_t>> EncodeNonPlain(uint16_t encoding_id,
                                                                  const FieldSpec& field,
                                                                  const arrow::Array& array);

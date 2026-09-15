@@ -156,9 +156,13 @@ ARROW_ASSIGN_OR_RAISE(auto batches, reader->Scan(std::move(plan), metrics));
   --row-group=4096
 ```
 
+两个 benchmark 均可追加 `--output-format=json`，输出包含原始样本、统计值、源码 revision、
+编译器、Arrow 版本和完整命令参数的机器可读结果；默认保持逐行文本格式。
+
 性能对照使用相同输入、相同 Row Group/RecordBatch 切分和相同过滤投影，同时运行 Sniffer、
-未压缩 Arrow IPC 和 Arrow IPC + ZSTD。输出包括各阶段的多次运行中位耗时、吞吐、文件大小、
-剪枝和读取字节数。输入 batch 构造不计时，编码、压缩和解压均设置为单线程。
+未压缩 Arrow IPC 和 Arrow IPC + ZSTD。输出包括各阶段的原始耗时、P50、P95、最小值、变异
+系数、吞吐、文件大小、剪枝和读取字节数。输入 batch 构造不计时，编码、压缩和解压均设置为
+单线程。
 固定的测试口径、环境和参考结果见 [`bench/BENCHMARK_V1.md`](bench/BENCHMARK_V1.md)。
 
 压缩能力 benchmark 分别测试递增整数、窄值域整数、长 RLE、含 null 偏斜整数、低基数

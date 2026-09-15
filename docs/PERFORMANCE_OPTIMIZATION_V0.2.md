@@ -44,9 +44,9 @@ v0.2 聚焦现有 Segment writer、reader、codec、scan 和文件 I/O 路径的
 
 ## 3. 先建立可归因的测量
 
-- [ ] benchmark 输出每轮原始耗时，并同时报告 P50、P95、最小值和变异系数；保留现有中位数，
+- [x] benchmark 输出每轮原始耗时，并同时报告 P50、P95、最小值和变异系数；保留现有中位数，
       避免破坏脚本消费者。
-- [ ] 增加机器可读结果格式（JSON 或 CSV），记录 commit、编译器、Arrow 版本、构建参数和运行命令。
+- [x] 增加机器可读 JSON 结果格式，记录 commit、编译器、Arrow 版本、构建参数和运行命令。
 - [ ] 将文件级 benchmark 与纯内存 codec microbenchmark 分开；后者分别测 Plain、Dictionary、
       RLE、FOR + Bitpack 的 encode/decode，不包含文件打开、footer、index 和 checksum。
 - [ ] 增加 writer 分阶段计时：编码选择、Plain/非 Plain 编码、索引构建、checksum、文件写入、
@@ -65,7 +65,7 @@ v0.2 聚焦现有 Segment writer、reader、codec、scan 和文件 I/O 路径的
 
 ### 4.1 Writer
 
-- [ ] 先执行编码选择，再生成最终 payload。当前 `WriteRowGroup()` 总是完整生成 Plain payload，
+- [x] 先执行编码选择，再生成最终 payload。当前 `WriteRowGroup()` 总是完整生成 Plain payload，
       非 Plain 编码命中时又编码一次；改为用无分配的长度计算得到 `uncompressed_length`。
 - [ ] 合并编码选择采样、statistics、sort-key 和实际编码可复用的数据遍历，避免同一列重复
       `GetScalar()`、序列化和比较。
@@ -158,3 +158,26 @@ v0.2 聚焦现有 Segment writer、reader、codec、scan 和文件 I/O 路径的
       运行参数；
 - [ ] 所有新增格式语义均有 decision record，v0.2 Reader 可读取 v0.1 Segment；
 - [ ] 更新 README 的性能状态，不把合成 benchmark 结果表述为通用生产性能。
+
+## 11. 执行记录
+
+### 2026-09-16：测量输出与 writer 重复编码
+
+- 两个 benchmark 已保留每轮原始耗时，并输出 min、P50、P95 和变异系数；旧的 `*_ms` 字段
+  继续表示 P50。
+- 增加 `--output-format=json`，记录源码 revision/dirty 状态、编译器、Arrow 版本、构建模式、
+  硬件线程、完整参数、测量结果和扫描指标。
+- `WriteRowGroup()` 在选择非 Plain 编码后不再先生成完整 Plain payload；`uncompressed_length`
+  改由带溢出检查的长度计算得到。
+
+同机 Release before/after（性能 11 次、压缩 7 次，均取 P50）：
+
+| 指标 | Before | After | 变化 | 文件字节变化 |
+|---|---:|---:|---:|---:|
+| 性能场景 Sniffer 写入 | 69.9727 ms / 1.429 M rows/s | 68.2313 ms / 1.466 M rows/s | 约 +2.6% | 0 |
+| 压缩套件 Sniffer 合计编码 | 89.4024 ms / 76.604 MiB/s | 87.1047 ms / 78.625 MiB/s | 约 +2.6% | 0 |
+
+性能场景 before/after 的 CV 分别为 1.32% 和 4.77%，压缩套件分别为 3.40% 和 3.74%。当前提升
+接近运行波动，不能单独视为稳定性能结论；该改动的确定收益是消除非 Plain 路径的一份完整
+payload 分配和写入，同时保持文件大小与格式语义不变。下一步应通过 codec microbenchmark 和
+分阶段 profile 继续定位 `GetScalar()`、`SerializeScalar()`、索引构建与实际编码的占比。

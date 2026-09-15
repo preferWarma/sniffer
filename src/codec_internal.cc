@@ -622,22 +622,31 @@ arrow::Result<std::shared_ptr<arrow::Array>> DecodeForBitpack(
 
 arrow::Result<uint64_t> PlainSampleSize(const FieldSpec& field, const arrow::Array& array,
                                         int64_t sample_rows) {
+  if (sample_rows < 0 || sample_rows > array.length()) {
+    return InvalidCodec("Plain size sample exceeds array bounds");
+  }
+  const uint64_t rows = static_cast<uint64_t>(sample_rows);
   uint64_t size = 24;
   if (array.Slice(0, sample_rows)->null_count() != 0) {
-    size +=
-        static_cast<uint64_t>(sample_rows) / 8U + (static_cast<uint64_t>(sample_rows) % 8U != 0);
+    ARROW_ASSIGN_OR_RAISE(size, CheckedAdd(size, rows / 8U + (rows % 8U != 0)));
   }
   if (IsVariable(field.type->id())) {
-    size += (static_cast<uint64_t>(sample_rows) + 1U) * 8U;
+    ARROW_ASSIGN_OR_RAISE(const uint64_t offset_count, CheckedAdd(rows, uint64_t{1}));
+    ARROW_ASSIGN_OR_RAISE(const uint64_t offset_bytes, CheckedMultiply(offset_count, uint64_t{8}));
+    ARROW_ASSIGN_OR_RAISE(size, CheckedAdd(size, offset_bytes));
     const auto& binary = static_cast<const arrow::BinaryArray&>(array);
     for (int64_t row = 0; row < sample_rows; ++row) {
       if (binary.IsValid(row)) {
-        size += static_cast<uint64_t>(binary.value_length(row));
+        ARROW_ASSIGN_OR_RAISE(size,
+                              CheckedAdd(size, static_cast<uint64_t>(binary.value_length(row))));
       }
     }
   } else {
     ARROW_ASSIGN_OR_RAISE(const auto physical_type, PhysicalTypeFor(*field.type));
-    size += static_cast<uint64_t>(sample_rows) * FixedWidthBytes(physical_type);
+    ARROW_ASSIGN_OR_RAISE(
+        const uint64_t value_bytes,
+        CheckedMultiply(rows, static_cast<uint64_t>(FixedWidthBytes(physical_type))));
+    ARROW_ASSIGN_OR_RAISE(size, CheckedAdd(size, value_bytes));
   }
   return size;
 }
@@ -658,6 +667,10 @@ bool EncodingSupports(uint16_t encoding_id, const arrow::DataType& type) {
     default:
       return false;
   }
+}
+
+arrow::Result<uint64_t> PlainEncodedSize(const FieldSpec& field, const arrow::Array& array) {
+  return PlainSampleSize(field, array, array.length());
 }
 
 arrow::Result<uint16_t> SelectEncoding(const FieldSpec& field, const arrow::Array& array,
