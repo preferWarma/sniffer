@@ -17,6 +17,7 @@
 #include <utility>
 #include <vector>
 
+#include "codec_internal.h"
 #include "format_internal.h"
 #include "index_internal.h"
 #include "scalar_internal.h"
@@ -832,8 +833,13 @@ class ScanState {
       const internal::RowGroupMeta& row_group, size_t field_index) {
     const auto& chunk = row_group.chunks[field_index];
     ARROW_ASSIGN_OR_RAISE(auto payload, ReadChunk(chunk));
-    ARROW_ASSIGN_OR_RAISE(auto array,
-                          DecodePlain(footer_.schema.fields[field_index], chunk, payload));
+    std::shared_ptr<arrow::Array> array;
+    if (chunk.encoding_id == internal::kPlainEncodingId) {
+      ARROW_ASSIGN_OR_RAISE(array, DecodePlain(footer_.schema.fields[field_index], chunk, payload));
+    } else {
+      ARROW_ASSIGN_OR_RAISE(
+          array, internal::DecodeNonPlain(footer_.schema.fields[field_index], chunk, payload));
+    }
     ++metrics_->predicate_chunks_decoded;
     return array;
   }
@@ -843,8 +849,14 @@ class ScanState {
       const std::vector<uint64_t>& selection) {
     const auto& chunk = row_group.chunks[field_index];
     ARROW_ASSIGN_OR_RAISE(auto payload, ReadChunk(chunk));
-    ARROW_ASSIGN_OR_RAISE(auto array, DecodePlainSelected(footer_.schema.fields[field_index], chunk,
-                                                          payload, selection));
+    std::shared_ptr<arrow::Array> array;
+    if (chunk.encoding_id == internal::kPlainEncodingId) {
+      ARROW_ASSIGN_OR_RAISE(array, DecodePlainSelected(footer_.schema.fields[field_index], chunk,
+                                                       payload, selection));
+    } else {
+      ARROW_ASSIGN_OR_RAISE(array, internal::DecodeNonPlain(footer_.schema.fields[field_index],
+                                                            chunk, payload, &selection));
+    }
     ++metrics_->projection_chunks_decoded;
     return array;
   }
@@ -940,7 +952,9 @@ class SegmentReader::Impl {
         if (chunk.field_id != field.field_id || chunk.physical_type != expected_type) {
           return InvalidFormat("column chunk identity does not match schema");
         }
-        if (chunk.encoding_id != internal::kPlainEncodingId) {
+        if (std::find(footer_.encoding_ids.begin(), footer_.encoding_ids.end(),
+                      chunk.encoding_id) == footer_.encoding_ids.end() ||
+            !internal::EncodingSupports(chunk.encoding_id, *field.type)) {
           return arrow::Status::NotImplemented("[sniffer.format.encoding] unsupported encoding ID ",
                                                chunk.encoding_id);
         }
@@ -950,8 +964,14 @@ class SegmentReader::Impl {
         if (!field.nullable && chunk.null_count != 0) {
           return InvalidFormat("non-nullable field contains nulls");
         }
-        if (chunk.length < 24 || chunk.uncompressed_length != chunk.length) {
-          return InvalidFormat("invalid Plain column chunk length");
+        const uint64_t minimum_length = chunk.encoding_id == internal::kPlainEncodingId        ? 24U
+                                        : chunk.encoding_id == internal::kDictionaryEncodingId ? 48U
+                                        : chunk.encoding_id == internal::kRleEncodingId        ? 16U
+                                                                                        : 32U;
+        if (chunk.length < minimum_length || chunk.uncompressed_length < 24U ||
+            (chunk.encoding_id == internal::kPlainEncodingId &&
+             chunk.uncompressed_length != chunk.length)) {
+          return InvalidFormat("invalid encoded column chunk length");
         }
         ARROW_ASSIGN_OR_RAISE(const uint64_t chunk_end,
                               internal::CheckedAdd(chunk.offset, chunk.length));
@@ -1081,8 +1101,13 @@ class SegmentReader::Impl {
           return arrow::Status::Invalid(
               "[sniffer.format.checksum] ColumnChunk CRC32C mismatch for field ", chunk.field_id);
         }
-        ARROW_ASSIGN_OR_RAISE(auto array,
-                              DecodePlain(footer_.schema.fields[index], chunk, payload));
+        std::shared_ptr<arrow::Array> array;
+        if (chunk.encoding_id == internal::kPlainEncodingId) {
+          ARROW_ASSIGN_OR_RAISE(array, DecodePlain(footer_.schema.fields[index], chunk, payload));
+        } else {
+          ARROW_ASSIGN_OR_RAISE(
+              array, internal::DecodeNonPlain(footer_.schema.fields[index], chunk, payload));
+        }
         columns.push_back(std::move(array));
       }
       auto batch = arrow::RecordBatch::Make(arrow_schema, static_cast<int64_t>(row_group.row_count),

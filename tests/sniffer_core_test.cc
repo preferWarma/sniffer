@@ -1,4 +1,5 @@
 #include <arrow/api.h>
+#include <arrow/array/concatenate.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -336,6 +337,23 @@ uint64_t ReadU64(const std::vector<uint8_t>& bytes, size_t offset) {
   return value;
 }
 
+uint16_t ReadU16(const std::vector<uint8_t>& bytes, size_t offset) {
+  return static_cast<uint16_t>(bytes[offset]) |
+         static_cast<uint16_t>(static_cast<uint16_t>(bytes[offset + 1]) << 8U);
+}
+
+uint16_t FirstChunkEncoding(const std::filesystem::path& path, size_t schema_descriptor_bytes) {
+  const auto bytes = ReadFile(path);
+  const size_t trailer_offset = bytes.size() - 40;
+  const size_t footer_offset = static_cast<size_t>(ReadU64(bytes, trailer_offset + 8));
+  constexpr size_t kPrefix = 24;
+  constexpr size_t kEncodingDescriptors = 61;
+  constexpr size_t kRowGroupHeader = 16;
+  const size_t chunk_entry =
+      footer_offset + kPrefix + schema_descriptor_bytes + kEncodingDescriptors + kRowGroupHeader;
+  return ReadU16(bytes, chunk_entry + 6);
+}
+
 void WriteU16(std::vector<uint8_t>* bytes, size_t offset, uint16_t value) {
   (*bytes)[offset] = static_cast<uint8_t>(value);
   (*bytes)[offset + 1] = static_cast<uint8_t>(value >> 8U);
@@ -567,7 +585,7 @@ void TestInvalidChunkOffsetFailsOpen() {
   constexpr size_t kPrefix = 24;
   constexpr size_t kFieldDescriptor = 16;
   const size_t field_name_length = 1;
-  constexpr size_t kEncodingDescriptor = 13;
+  constexpr size_t kEncodingDescriptor = 61;
   constexpr size_t kRowGroupHeader = 16;
   const size_t chunk_entry = footer_offset + kPrefix + kFieldDescriptor + field_name_length +
                              kEncodingDescriptor + kRowGroupHeader;
@@ -592,7 +610,7 @@ void TestUnknownEncodingFailsOpen() {
   constexpr size_t kPrefix = 24;
   constexpr size_t kFieldDescriptor = 16;
   const size_t field_name_length = 1;
-  constexpr size_t kEncodingDescriptor = 13;
+  constexpr size_t kEncodingDescriptor = 61;
   constexpr size_t kRowGroupHeader = 16;
   const size_t chunk_entry = footer_offset + kPrefix + kFieldDescriptor + field_name_length +
                              kEncodingDescriptor + kRowGroupHeader;
@@ -947,7 +965,7 @@ void TestSortOrderAndIndexCorruptionValidation() {
   const size_t footer_offset = static_cast<size_t>(ReadU64(bytes, trailer_offset + 8));
   constexpr size_t kPrefix = 24;
   constexpr size_t kFieldDescriptor = 16;
-  constexpr size_t kEncodingDescriptor = 13;
+  constexpr size_t kEncodingDescriptor = 61;
   constexpr size_t kRowGroupHeader = 16;
   const size_t chunk_entry =
       footer_offset + kPrefix + kFieldDescriptor + 1 + kEncodingDescriptor + kRowGroupHeader;
@@ -1032,7 +1050,7 @@ void TestUnknownIndexVersionFailsExplicitly() {
   const size_t footer_offset = static_cast<size_t>(ReadU64(bytes, trailer_offset + 8));
   constexpr size_t kPrefix = 24;
   constexpr size_t kField = 17;
-  constexpr size_t kEncoding = 13;
+  constexpr size_t kEncoding = 61;
   constexpr size_t kRowGroup = 16 + 56;
   constexpr size_t kLayoutAndIds = 16 + 4;
   const size_t index_directory =
@@ -1082,6 +1100,337 @@ void TestCompositeSortKeyRange() {
          "composite sort-key range uses lexicographic half-open semantics");
 }
 
+void TestForcedDictionaryRoundTripAndScan() {
+  sniffer::TableSchema schema{1,
+                              {{1, "number", arrow::int64(), true, nullptr},
+                               {2, "label", arrow::utf8(), true, nullptr},
+                               {3, "bytes", arrow::binary(), true, nullptr}}};
+  auto arrow_schema = ValueOrThrow(schema.ToArrowSchema(), "Dictionary schema");
+  arrow::Int64Builder number_builder;
+  arrow::StringBuilder label_builder;
+  arrow::BinaryBuilder bytes_builder;
+  for (int64_t row = 0; row < 128; ++row) {
+    if (row % 11 == 0) {
+      RequireOk(number_builder.AppendNull(), "append Dictionary number null");
+      RequireOk(label_builder.AppendNull(), "append Dictionary label null");
+      RequireOk(bytes_builder.AppendNull(), "append Dictionary bytes null");
+      continue;
+    }
+    RequireOk(number_builder.Append(row % 5), "append Dictionary number");
+    RequireOk(label_builder.Append("label-" + std::to_string(row % 3)), "append Dictionary label");
+    const std::vector<uint8_t> bytes = {static_cast<uint8_t>(row % 4), 0,
+                                        static_cast<uint8_t>(row % 2)};
+    RequireOk(bytes_builder.Append(bytes.data(), static_cast<int32_t>(bytes.size())),
+              "append Dictionary bytes");
+  }
+  std::vector<std::shared_ptr<arrow::Array>> columns(3);
+  RequireOk(number_builder.Finish(&columns[0]), "finish Dictionary numbers");
+  RequireOk(label_builder.Finish(&columns[1]), "finish Dictionary labels");
+  RequireOk(bytes_builder.Finish(&columns[2]), "finish Dictionary bytes");
+  auto batch = arrow::RecordBatch::Make(arrow_schema, 128, std::move(columns));
+  sniffer::LayoutPolicy policy;
+  policy.target_row_group_rows = 37;
+  policy.field_encodings = {{1, sniffer::EncodingKind::kDictionary},
+                            {2, sniffer::EncodingKind::kDictionary},
+                            {3, sniffer::EncodingKind::kDictionary}};
+  TempFile file("forced_dictionary.seg");
+  WriteSegmentWithPolicy(file.path(), schema, {batch}, policy);
+  Expect(FirstChunkEncoding(file.path(), 64) ==
+             static_cast<uint16_t>(sniffer::EncodingKind::kDictionary),
+         "forced Dictionary encoding ID is persisted");
+  auto reader =
+      ValueOrThrow(sniffer::SegmentReader::Open(file.path().string()), "open Dictionary segment");
+  auto round_trip = ValueOrThrow(reader->ReadAll(), "read Dictionary segment");
+  int64_t offset = 0;
+  for (const auto& output : round_trip) {
+    Expect(output->Equals(*batch->Slice(offset, output->num_rows())),
+           "Dictionary round-trip equals input");
+    offset += output->num_rows();
+  }
+  Expect(offset == 128, "Dictionary round-trip preserves all rows");
+
+  sniffer::IOPlan plan;
+  plan.projection_field_ids = {3, 2};
+  plan.conjunctive_predicates = {
+      {1, sniffer::Predicate::Op::kEq, std::make_shared<arrow::Int64Scalar>(3)}};
+  plan.output_batch_rows = 9;
+  auto scan = CollectScan(ValueOrThrow(reader->Scan(plan), "scan Dictionary segment"));
+  int64_t selected_rows = 0;
+  for (const auto& output : scan) {
+    selected_rows += output->num_rows();
+    Expect(output->schema()->field(0)->name() == "bytes" &&
+               output->schema()->field(1)->name() == "label",
+           "Dictionary selected projection order");
+  }
+  Expect(selected_rows == 23, "Dictionary predicate and selected decode preserve matches");
+}
+
+void TestForcedRleRoundTripAndScan() {
+  sniffer::TableSchema schema{1,
+                              {{1, "group", arrow::int32(), true, nullptr},
+                               {2, "flag", arrow::boolean(), true, nullptr},
+                               {3, "all_null", arrow::int64(), true, nullptr}}};
+  auto arrow_schema = ValueOrThrow(schema.ToArrowSchema(), "RLE schema");
+  arrow::Int32Builder group_builder;
+  arrow::BooleanBuilder flag_builder;
+  arrow::Int64Builder null_builder;
+  for (int64_t row = 0; row < 150; ++row) {
+    if (row >= 60 && row < 75) {
+      RequireOk(group_builder.AppendNull(), "append RLE group null");
+      RequireOk(flag_builder.AppendNull(), "append RLE flag null");
+    } else {
+      RequireOk(group_builder.Append(static_cast<int32_t>(row / 25)), "append RLE group");
+      RequireOk(flag_builder.Append((row / 30) % 2 == 0), "append RLE flag");
+    }
+    RequireOk(null_builder.AppendNull(), "append RLE all-null value");
+  }
+  std::vector<std::shared_ptr<arrow::Array>> columns(3);
+  RequireOk(group_builder.Finish(&columns[0]), "finish RLE groups");
+  RequireOk(flag_builder.Finish(&columns[1]), "finish RLE flags");
+  RequireOk(null_builder.Finish(&columns[2]), "finish RLE nulls");
+  auto batch = arrow::RecordBatch::Make(arrow_schema, 150, std::move(columns));
+  sniffer::LayoutPolicy policy;
+  policy.target_row_group_rows = 64;
+  policy.field_encodings = {{1, sniffer::EncodingKind::kRle},
+                            {2, sniffer::EncodingKind::kRle},
+                            {3, sniffer::EncodingKind::kRle}};
+  TempFile file("forced_rle.seg");
+  WriteSegmentWithPolicy(file.path(), schema, {batch}, policy);
+  Expect(FirstChunkEncoding(file.path(), 65) == static_cast<uint16_t>(sniffer::EncodingKind::kRle),
+         "forced RLE encoding ID is persisted");
+  auto reader =
+      ValueOrThrow(sniffer::SegmentReader::Open(file.path().string()), "open RLE segment");
+  auto round_trip = ValueOrThrow(reader->ReadAll(), "read RLE segment");
+  int64_t offset = 0;
+  for (const auto& output : round_trip) {
+    Expect(output->Equals(*batch->Slice(offset, output->num_rows())),
+           "RLE round-trip equals input");
+    offset += output->num_rows();
+  }
+
+  sniffer::IOPlan plan;
+  plan.projection_field_ids = {2, 3};
+  plan.conjunctive_predicates = {
+      {1, sniffer::Predicate::Op::kEq, std::make_shared<arrow::Int32Scalar>(4)}};
+  plan.output_batch_rows = 8;
+  auto scan = CollectScan(ValueOrThrow(reader->Scan(plan), "scan RLE segment"));
+  int64_t selected_rows = 0;
+  for (const auto& output : scan) {
+    selected_rows += output->num_rows();
+    Expect(output->column(1)->null_count() == output->num_rows(),
+           "RLE selected all-null projection remains null");
+  }
+  Expect(selected_rows == 25, "RLE predicate returns the full repeated run");
+}
+
+void TestForcedForBitpackRoundTripAndScan() {
+  const auto timestamp_type = std::static_pointer_cast<arrow::TimestampType>(
+      arrow::timestamp(arrow::TimeUnit::NANO, "UTC"));
+  sniffer::TableSchema schema{1,
+                              {{1, "i8", arrow::int8(), true, nullptr},
+                               {2, "u16", arrow::uint16(), true, nullptr},
+                               {3, "i64", arrow::int64(), true, nullptr},
+                               {4, "u64", arrow::uint64(), true, nullptr},
+                               {5, "time", timestamp_type, true, nullptr}}};
+  auto arrow_schema = ValueOrThrow(schema.ToArrowSchema(), "FOR schema");
+  arrow::Int8Builder i8_builder;
+  arrow::UInt16Builder u16_builder;
+  arrow::Int64Builder i64_builder;
+  arrow::UInt64Builder u64_builder;
+  arrow::TimestampBuilder timestamp_builder(timestamp_type, arrow::default_memory_pool());
+  constexpr int64_t kRows = 131;
+  for (int64_t row = 0; row < kRows; ++row) {
+    if (row % 17 == 0) {
+      RequireOk(i8_builder.AppendNull(), "append FOR i8 null");
+      RequireOk(u16_builder.AppendNull(), "append FOR u16 null");
+      RequireOk(i64_builder.AppendNull(), "append FOR i64 null");
+      RequireOk(u64_builder.AppendNull(), "append FOR u64 null");
+      RequireOk(timestamp_builder.AppendNull(), "append FOR timestamp null");
+      continue;
+    }
+    const int8_t i8 = row == 1     ? std::numeric_limits<int8_t>::min()
+                      : row == 130 ? std::numeric_limits<int8_t>::max()
+                                   : static_cast<int8_t>(-60 + row % 100);
+    const int64_t i64 = row == 1     ? std::numeric_limits<int64_t>::min()
+                        : row == 130 ? std::numeric_limits<int64_t>::max()
+                                     : row * 13 - 700;
+    const uint64_t u64 = row == 1     ? 0
+                         : row == 130 ? std::numeric_limits<uint64_t>::max()
+                                      : static_cast<uint64_t>(row * 29);
+    RequireOk(i8_builder.Append(i8), "append FOR i8");
+    RequireOk(u16_builder.Append(static_cast<uint16_t>(60000 + row)), "append FOR u16");
+    RequireOk(i64_builder.Append(i64), "append FOR i64");
+    RequireOk(u64_builder.Append(u64), "append FOR u64");
+    RequireOk(timestamp_builder.Append(-1000000 + row * 7), "append FOR timestamp");
+  }
+  std::vector<std::shared_ptr<arrow::Array>> columns(5);
+  RequireOk(i8_builder.Finish(&columns[0]), "finish FOR i8");
+  RequireOk(u16_builder.Finish(&columns[1]), "finish FOR u16");
+  RequireOk(i64_builder.Finish(&columns[2]), "finish FOR i64");
+  RequireOk(u64_builder.Finish(&columns[3]), "finish FOR u64");
+  RequireOk(timestamp_builder.Finish(&columns[4]), "finish FOR timestamp");
+  auto batch = arrow::RecordBatch::Make(arrow_schema, kRows, std::move(columns));
+  sniffer::LayoutPolicy policy;
+  policy.target_row_group_rows = 67;
+  for (uint32_t field_id = 1; field_id <= 5; ++field_id) {
+    policy.field_encodings.push_back({field_id, sniffer::EncodingKind::kForBitpack});
+  }
+  TempFile file("forced_for.seg");
+  WriteSegmentWithPolicy(file.path(), schema, {batch}, policy);
+  Expect(FirstChunkEncoding(file.path(), 106) ==
+             static_cast<uint16_t>(sniffer::EncodingKind::kForBitpack),
+         "forced FOR + Bitpack encoding ID is persisted");
+  auto reader =
+      ValueOrThrow(sniffer::SegmentReader::Open(file.path().string()), "open FOR segment");
+  auto round_trip = ValueOrThrow(reader->ReadAll(), "read FOR segment");
+  int64_t offset = 0;
+  for (const auto& output : round_trip) {
+    Expect(output->Equals(*batch->Slice(offset, output->num_rows())),
+           "FOR round-trip equals input");
+    offset += output->num_rows();
+  }
+
+  sniffer::IOPlan plan;
+  plan.projection_field_ids = {5, 4, 1};
+  plan.conjunctive_predicates = {
+      {2, sniffer::Predicate::Op::kGe, std::make_shared<arrow::UInt16Scalar>(60080)}};
+  plan.output_batch_rows = 11;
+  auto scan = CollectScan(ValueOrThrow(reader->Scan(plan), "scan FOR segment"));
+  int64_t selected_rows = 0;
+  for (const auto& output : scan) {
+    selected_rows += output->num_rows();
+  }
+  Expect(selected_rows == 48,
+         "FOR predicate and selected projection decode preserve null semantics");
+}
+
+void TestForcedEncodingRandomizedProperty() {
+  std::mt19937_64 random(0xC0DEC0DEULL);
+  std::vector<std::optional<int64_t>> filter_values;
+  std::vector<std::optional<int64_t>> projected_values;
+  constexpr int64_t kRows = 513;
+  filter_values.reserve(kRows);
+  projected_values.reserve(kRows);
+  for (int64_t row = 0; row < kRows; ++row) {
+    if (row % 13 == 0) {
+      filter_values.push_back(std::nullopt);
+    } else {
+      filter_values.push_back(std::bit_cast<int64_t>(random()));
+    }
+    if (row % 17 == 0) {
+      projected_values.push_back(std::nullopt);
+    } else if (row % 5 == 0) {
+      projected_values.push_back(7);
+    } else {
+      projected_values.push_back(std::bit_cast<int64_t>(random()));
+    }
+  }
+  sniffer::TableSchema schema{1,
+                              {{1, "filter", arrow::int64(), true, nullptr},
+                               {2, "projected", arrow::int64(), true, nullptr}}};
+  auto arrow_schema = ValueOrThrow(schema.ToArrowSchema(), "codec property schema");
+  auto filter = BuildArray<arrow::Int64Builder, int64_t>(filter_values);
+  auto projected = BuildArray<arrow::Int64Builder, int64_t>(projected_values);
+  auto batch = arrow::RecordBatch::Make(arrow_schema, kRows, {filter, projected});
+
+  for (const auto encoding : {sniffer::EncodingKind::kDictionary, sniffer::EncodingKind::kRle,
+                              sniffer::EncodingKind::kForBitpack}) {
+    sniffer::LayoutPolicy policy;
+    policy.target_row_group_rows = 73;
+    policy.field_encodings = {{1, encoding}, {2, encoding}};
+    TempFile file("codec_property_" + std::to_string(static_cast<uint16_t>(encoding)) + ".seg");
+    WriteSegmentWithPolicy(file.path(), schema, {batch}, policy);
+    auto reader = ValueOrThrow(sniffer::SegmentReader::Open(file.path().string()),
+                               "open randomized codec segment");
+    auto round_trip = ValueOrThrow(reader->ReadAll(), "randomized codec round-trip");
+    int64_t offset = 0;
+    for (const auto& output : round_trip) {
+      Expect(output->Equals(*batch->Slice(offset, output->num_rows())),
+             "randomized forced codec round-trip");
+      offset += output->num_rows();
+    }
+
+    sniffer::IOPlan plan;
+    plan.projection_field_ids = {2};
+    plan.conjunctive_predicates = {
+        {1, sniffer::Predicate::Op::kGe, std::make_shared<arrow::Int64Scalar>(0)}};
+    plan.output_batch_rows = 31;
+    auto scan = CollectScan(ValueOrThrow(reader->Scan(plan), "randomized codec scan"));
+    arrow::Int64Builder reference_builder;
+    const auto& filter_array = static_cast<const arrow::Int64Array&>(*filter);
+    const auto& projected_array = static_cast<const arrow::Int64Array&>(*projected);
+    for (int64_t row = 0; row < kRows; ++row) {
+      if (filter_array.IsValid(row) && filter_array.Value(row) >= 0) {
+        if (projected_array.IsValid(row)) {
+          RequireOk(reference_builder.Append(projected_array.Value(row)),
+                    "append codec property reference");
+        } else {
+          RequireOk(reference_builder.AppendNull(), "append codec property reference null");
+        }
+      }
+    }
+    std::shared_ptr<arrow::Array> expected;
+    RequireOk(reference_builder.Finish(&expected), "finish codec property reference");
+    arrow::ArrayVector actual_chunks;
+    for (const auto& output : scan) {
+      actual_chunks.push_back(output->column(0));
+    }
+    auto actual = ValueOrThrow(arrow::Concatenate(actual_chunks), "concatenate codec scan");
+    Expect(actual->Equals(expected), "randomized codec IOPlan equals reference filtering");
+  }
+}
+
+void TestDeterministicEncodingSelector() {
+  sniffer::TableSchema integer_schema{1, {{1, "x", arrow::int64(), false, nullptr}}};
+  auto integer_arrow_schema = ValueOrThrow(integer_schema.ToArrowSchema(), "selector int schema");
+
+  auto repeated =
+      BuildArray<arrow::Int64Builder, int64_t>(std::vector<std::optional<int64_t>>(100, 7));
+  TempFile rle_file("selector_rle.seg");
+  WriteSegmentWithPolicy(rle_file.path(), integer_schema,
+                         {arrow::RecordBatch::Make(integer_arrow_schema, 100, {repeated})}, {});
+  Expect(
+      FirstChunkEncoding(rle_file.path(), 17) == static_cast<uint16_t>(sniffer::EncodingKind::kRle),
+      "selector chooses RLE for a long run");
+
+  std::vector<std::optional<int64_t>> ascending_values;
+  for (int64_t value = 0; value < 100; ++value) {
+    ascending_values.push_back(value);
+  }
+  auto ascending = BuildArray<arrow::Int64Builder, int64_t>(ascending_values);
+  TempFile for_file("selector_for.seg");
+  WriteSegmentWithPolicy(for_file.path(), integer_schema,
+                         {arrow::RecordBatch::Make(integer_arrow_schema, 100, {ascending})}, {});
+  Expect(FirstChunkEncoding(for_file.path(), 17) ==
+             static_cast<uint16_t>(sniffer::EncodingKind::kForBitpack),
+         "selector chooses FOR + Bitpack for a narrow ascending range");
+
+  sniffer::TableSchema string_schema{1, {{1, "x", arrow::utf8(), false, nullptr}}};
+  auto string_arrow_schema = ValueOrThrow(string_schema.ToArrowSchema(), "selector string schema");
+  std::vector<std::optional<std::string>> repeated_strings;
+  std::vector<std::optional<std::string>> unique_strings;
+  for (int64_t row = 0; row < 100; ++row) {
+    repeated_strings.push_back(row % 2 == 0 ? "alpha" : "beta");
+    unique_strings.push_back("unique-long-value-" + std::to_string(row));
+  }
+  TempFile dictionary_file("selector_dictionary.seg");
+  WriteSegmentWithPolicy(
+      dictionary_file.path(), string_schema,
+      {arrow::RecordBatch::Make(string_arrow_schema, 100, {BuildStringArray(repeated_strings)})},
+      {});
+  Expect(FirstChunkEncoding(dictionary_file.path(), 17) ==
+             static_cast<uint16_t>(sniffer::EncodingKind::kDictionary),
+         "selector chooses Dictionary for low-cardinality strings");
+
+  TempFile plain_file("selector_plain.seg");
+  WriteSegmentWithPolicy(
+      plain_file.path(), string_schema,
+      {arrow::RecordBatch::Make(string_arrow_schema, 100, {BuildStringArray(unique_strings)})}, {});
+  Expect(FirstChunkEncoding(plain_file.path(), 17) ==
+             static_cast<uint16_t>(sniffer::EncodingKind::kPlain),
+         "selector retains Plain for high-cardinality strings");
+}
+
 }  // namespace
 
 int main() {
@@ -1109,6 +1458,11 @@ int main() {
       {"legacy_footer_scan_fallback", TestLegacyFooterScanFallback},
       {"unknown_index_version", TestUnknownIndexVersionFailsExplicitly},
       {"composite_sort_key_range", TestCompositeSortKeyRange},
+      {"forced_dictionary_round_trip_and_scan", TestForcedDictionaryRoundTripAndScan},
+      {"forced_rle_round_trip_and_scan", TestForcedRleRoundTripAndScan},
+      {"forced_for_bitpack_round_trip_and_scan", TestForcedForBitpackRoundTripAndScan},
+      {"forced_encoding_randomized_property", TestForcedEncodingRandomizedProperty},
+      {"deterministic_encoding_selector", TestDeterministicEncodingSelector},
   };
 
   int failures = 0;

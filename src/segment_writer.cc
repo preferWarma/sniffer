@@ -10,6 +10,7 @@
 #include <utility>
 #include <vector>
 
+#include "codec_internal.h"
 #include "format_internal.h"
 #include "index_internal.h"
 
@@ -235,18 +236,26 @@ class SegmentWriter::Impl {
     for (int column_index = 0; column_index < batch->num_columns(); ++column_index) {
       const auto& field = schema_.fields[static_cast<size_t>(column_index)];
       const auto& array = batch->column(column_index);
-      ARROW_ASSIGN_OR_RAISE(auto payload, EncodePlain(field, array));
+      ARROW_ASSIGN_OR_RAISE(auto plain_payload, EncodePlain(field, array));
+      ARROW_ASSIGN_OR_RAISE(const uint16_t encoding_id,
+                            internal::SelectEncoding(field, *array, layout_policy_));
+      std::vector<uint8_t> payload;
+      if (encoding_id == internal::kPlainEncodingId) {
+        payload = plain_payload;
+      } else {
+        ARROW_ASSIGN_OR_RAISE(payload, internal::EncodeNonPlain(encoding_id, field, *array));
+      }
       ARROW_ASSIGN_OR_RAISE(const auto physical_type, internal::PhysicalTypeFor(*field.type));
 
       internal::ColumnChunkMeta chunk;
       chunk.field_id = field.field_id;
       chunk.physical_type = physical_type;
-      chunk.encoding_id = internal::kPlainEncodingId;
+      chunk.encoding_id = encoding_id;
       chunk.row_count = static_cast<uint64_t>(array->length());
       chunk.null_count = static_cast<uint64_t>(array->null_count());
       chunk.offset = position_;
       chunk.length = static_cast<uint64_t>(payload.size());
-      chunk.uncompressed_length = chunk.length;
+      chunk.uncompressed_length = static_cast<uint64_t>(plain_payload.size());
       chunk.checksum = internal::Crc32c(payload);
       ARROW_RETURN_NOT_OK(WriteTracked(payload));
       row_group.chunks.push_back(chunk);

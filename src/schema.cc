@@ -105,6 +105,10 @@ arrow::Status LayoutPolicy::Validate(const TableSchema& schema) const {
     return arrow::Status::Invalid(
         "[sniffer.layout.row_group] target_row_group_rows must be positive");
   }
+  if (encoding_sample_rows == 0) {
+    return arrow::Status::Invalid(
+        "[sniffer.layout.encoding] encoding_sample_rows must be positive");
+  }
 
   const auto validate_ids = [&schema](const std::vector<uint32_t>& ids,
                                       std::string_view kind) -> arrow::Status {
@@ -130,6 +134,39 @@ arrow::Status LayoutPolicy::Validate(const TableSchema& schema) const {
   ARROW_RETURN_NOT_OK(validate_ids(sort_key_field_ids, "sort-key"));
   ARROW_RETURN_NOT_OK(validate_ids(statistics_field_ids, "statistics"));
   ARROW_RETURN_NOT_OK(validate_ids(bloom_field_ids, "Bloom"));
+
+  std::unordered_set<uint32_t> encoded_fields;
+  for (const auto& override : field_encodings) {
+    if (!encoded_fields.insert(override.field_id).second) {
+      return arrow::Status::Invalid("[sniffer.layout.encoding] duplicate field override ",
+                                    override.field_id);
+    }
+    const auto field = std::find_if(schema.fields.begin(), schema.fields.end(),
+                                    [&override](const FieldSpec& candidate) {
+                                      return candidate.field_id == override.field_id;
+                                    });
+    if (field == schema.fields.end()) {
+      return arrow::Status::Invalid("[sniffer.layout.encoding] unknown field ID ",
+                                    override.field_id);
+    }
+    const auto type = field->type->id();
+    const bool integer = type == arrow::Type::INT8 || type == arrow::Type::INT16 ||
+                         type == arrow::Type::INT32 || type == arrow::Type::INT64 ||
+                         type == arrow::Type::UINT8 || type == arrow::Type::UINT16 ||
+                         type == arrow::Type::UINT32 || type == arrow::Type::UINT64;
+    const bool supported =
+        override.encoding == EncodingKind::kPlain ||
+        (override.encoding == EncodingKind::kDictionary &&
+         (integer || type == arrow::Type::STRING || type == arrow::Type::BINARY)) ||
+        (override.encoding == EncodingKind::kRle && (integer || type == arrow::Type::BOOL)) ||
+        (override.encoding == EncodingKind::kForBitpack &&
+         (integer || type == arrow::Type::TIMESTAMP));
+    if (!supported) {
+      return arrow::Status::Invalid("[sniffer.layout.encoding] encoding ",
+                                    static_cast<uint16_t>(override.encoding),
+                                    " does not support field ", override.field_id);
+    }
+  }
   return arrow::Status::OK();
 }
 

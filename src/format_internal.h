@@ -24,6 +24,11 @@ inline constexpr uint16_t kIndexBlockVersion = 1;
 inline constexpr uint16_t kPlainEncodingId = 0;
 inline constexpr uint16_t kPlainEncodingMajor = 1;
 inline constexpr uint16_t kPlainEncodingMinor = 0;
+inline constexpr uint16_t kDictionaryEncodingId = 1;
+inline constexpr uint16_t kRleEncodingId = 2;
+inline constexpr uint16_t kForBitpackEncodingId = 3;
+inline constexpr uint16_t kEncodingMajor = 1;
+inline constexpr uint16_t kEncodingMinor = 0;
 
 inline constexpr std::array<uint8_t, 8> kHeaderMagic = {'S', 'N', 'I', 'F', 'S', 'E', 'G', '1'};
 inline constexpr std::array<uint8_t, 8> kTrailerMagic = {'S', 'N', 'I', 'F', 'E', 'N', 'D', '1'};
@@ -73,6 +78,7 @@ struct FooterData {
   TableSchema schema;
   std::vector<RowGroupMeta> row_groups;
   LayoutPolicy layout_policy;
+  std::vector<uint16_t> encoding_ids;
   bool has_phase_two_metadata = true;
 };
 

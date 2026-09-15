@@ -375,7 +375,7 @@ arrow::Result<std::vector<uint8_t>> SerializeFooter(const FooterData& footer) {
   writer.WriteU16(0);
   writer.WriteU32(footer.schema.schema_version);
   writer.WriteU32(static_cast<uint32_t>(footer.schema.fields.size()));
-  writer.WriteU32(1);
+  writer.WriteU32(4);
   writer.WriteU64(static_cast<uint64_t>(footer.row_groups.size()));
 
   for (const auto& field : footer.schema.fields) {
@@ -401,6 +401,21 @@ arrow::Result<std::vector<uint8_t>> SerializeFooter(const FooterData& footer) {
   writer.WriteU16(kPlainEncodingMinor);
   writer.WriteU16(5);
   writer.WriteString("plain");
+  writer.WriteU16(kDictionaryEncodingId);
+  writer.WriteU16(kEncodingMajor);
+  writer.WriteU16(kEncodingMinor);
+  writer.WriteU16(10);
+  writer.WriteString("dictionary");
+  writer.WriteU16(kRleEncodingId);
+  writer.WriteU16(kEncodingMajor);
+  writer.WriteU16(kEncodingMinor);
+  writer.WriteU16(3);
+  writer.WriteString("rle");
+  writer.WriteU16(kForBitpackEncodingId);
+  writer.WriteU16(kEncodingMajor);
+  writer.WriteU16(kEncodingMinor);
+  writer.WriteU16(11);
+  writer.WriteString("for_bitpack");
 
   for (const auto& row_group : footer.row_groups) {
     if (row_group.chunks.size() > std::numeric_limits<uint32_t>::max()) {
@@ -495,21 +510,39 @@ arrow::Result<FooterData> ParseFooter(std::span<const uint8_t> bytes) {
   if (encoding_count > reader.remaining() / 8U) {
     return Truncated("encoding descriptors");
   }
-  bool saw_plain = false;
+  std::unordered_set<uint16_t> seen_encodings;
   for (uint32_t encoding_index = 0; encoding_index < encoding_count; ++encoding_index) {
     ARROW_ASSIGN_OR_RAISE(const uint16_t encoding_id, reader.ReadU16());
     ARROW_ASSIGN_OR_RAISE(const uint16_t major, reader.ReadU16());
     ARROW_ASSIGN_OR_RAISE(const uint16_t minor, reader.ReadU16());
     ARROW_ASSIGN_OR_RAISE(const uint16_t name_length, reader.ReadU16());
     ARROW_ASSIGN_OR_RAISE(const auto name, reader.ReadString(name_length));
-    if (encoding_id != kPlainEncodingId || major != kPlainEncodingMajor ||
-        minor > kPlainEncodingMinor || name != "plain" || saw_plain) {
+    std::string_view expected_name;
+    switch (encoding_id) {
+      case kPlainEncodingId:
+        expected_name = "plain";
+        break;
+      case kDictionaryEncodingId:
+        expected_name = "dictionary";
+        break;
+      case kRleEncodingId:
+        expected_name = "rle";
+        break;
+      case kForBitpackEncodingId:
+        expected_name = "for_bitpack";
+        break;
+      default:
+        return arrow::Status::NotImplemented(
+            "[sniffer.format.encoding] unsupported encoding descriptor");
+    }
+    if (major != kEncodingMajor || minor > kEncodingMinor || name != expected_name ||
+        !seen_encodings.insert(encoding_id).second) {
       return arrow::Status::NotImplemented(
           "[sniffer.format.encoding] unsupported encoding descriptor");
     }
-    saw_plain = true;
+    footer.encoding_ids.push_back(encoding_id);
   }
-  if (!saw_plain) {
+  if (!seen_encodings.contains(kPlainEncodingId)) {
     return InvalidFormat("missing Plain encoding descriptor");
   }
 

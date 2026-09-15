@@ -3,6 +3,8 @@ cmake_minimum_required(VERSION 3.20)
 project(sniffer_core VERSION 0.1.0 LANGUAGES CXX)
 
 option(SNIFFER_BUILD_TESTS "Build sniffer-core tests" ON)
+option(SNIFFER_BUILD_BENCHMARK "Build sniffer-core benchmark" ON)
+option(SNIFFER_BUILD_FUZZ_SMOKE "Build standalone fuzz smoke" ON)
 
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(Arrow REQUIRED arrow)
@@ -54,6 +56,7 @@ else()
 endif()
 
 add_library(sniffer_core
+  src/codec_internal.cc
   src/format_internal.cc
   src/index_internal.cc
   src/scalar_internal.cc
@@ -84,4 +87,18 @@ if(SNIFFER_BUILD_TESTS)
     target_compile_options(sniffer_core_tests PRIVATE -Wall -Wextra -Wpedantic -Wconversion)
   endif()
   add_test(NAME sniffer_core_tests COMMAND sniffer_core_tests)
+
+  if(SNIFFER_BUILD_FUZZ_SMOKE)
+    add_executable(sniffer_core_fuzz tests/sniffer_core_fuzz.cc)
+    target_compile_features(sniffer_core_fuzz PRIVATE cxx_std_20)
+    target_compile_definitions(sniffer_core_fuzz PRIVATE SNIFFER_FUZZ_STANDALONE)
+    target_link_libraries(sniffer_core_fuzz PRIVATE sniffer_core)
+    add_test(NAME sniffer_core_fuzz_smoke COMMAND sniffer_core_fuzz)
+  endif()
+endif()
+
+if(SNIFFER_BUILD_BENCHMARK)
+  add_executable(sniffer_core_benchmark bench/sniffer_core_benchmark.cc)
+  target_compile_features(sniffer_core_benchmark PRIVATE cxx_std_20)
+  target_link_libraries(sniffer_core_benchmark PRIVATE sniffer_core)
 endif()
