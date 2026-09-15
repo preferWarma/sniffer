@@ -99,9 +99,33 @@ if(SNIFFER_BUILD_TESTS)
 endif()
 
 if(SNIFFER_BUILD_BENCHMARK)
-  add_executable(sniffer_core_benchmark bench/sniffer_core_benchmark.cc)
-  target_compile_features(sniffer_core_benchmark PRIVATE cxx_std_20)
-  target_link_libraries(sniffer_core_benchmark PRIVATE sniffer_core)
+  add_executable(sniffer_core_performance_benchmark bench/performance_benchmark.cc)
+  target_compile_features(sniffer_core_performance_benchmark PRIVATE cxx_std_20)
+  target_link_libraries(sniffer_core_performance_benchmark PRIVATE sniffer_core)
+
+  add_executable(sniffer_core_compression_benchmark bench/compression_benchmark.cc)
+  target_compile_features(sniffer_core_compression_benchmark PRIVATE cxx_std_20)
+  target_link_libraries(sniffer_core_compression_benchmark PRIVATE sniffer_core)
+  if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+    target_compile_options(
+      sniffer_core_performance_benchmark
+      PRIVATE -Wall -Wextra -Wpedantic -Wconversion
+    )
+    target_compile_options(
+      sniffer_core_compression_benchmark
+      PRIVATE -Wall -Wextra -Wpedantic -Wconversion
+    )
+  endif()
+  if(SNIFFER_BUILD_TESTS)
+    add_test(
+      NAME sniffer_core_performance_benchmark_smoke
+      COMMAND sniffer_core_performance_benchmark --rows=1024 --iterations=1 --row-group=128
+    )
+    add_test(
+      NAME sniffer_core_compression_benchmark_smoke
+      COMMAND sniffer_core_compression_benchmark --rows=1024 --iterations=1 --row-group=128
+    )
+  endif()
 endif()
 
 if(SNIFFER_BUILD_EXAMPLES)

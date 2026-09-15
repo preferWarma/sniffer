@@ -147,17 +147,40 @@ ARROW_ASSIGN_OR_RAISE(auto batches, reader->Scan(std::move(plan), metrics));
 
 ## Benchmark 与 fuzz
 
-运行可重复 benchmark：
+性能 benchmark 分别统计写入、扫描和端到端耗时：
 
 ```bash
-./build/sniffer_core_benchmark \
+./build/sniffer_core_performance_benchmark \
   --rows=100000 \
   --iterations=5 \
   --row-group=4096
 ```
 
-输出包含数据分布、Row Group 大小、选择率、构建模式、硬件线程数、文件大小、读取字节数、
-剪枝数量和多次运行的中位耗时。
+性能对照使用相同输入、相同 Row Group/RecordBatch 切分和相同过滤投影，同时运行 Sniffer、
+未压缩 Arrow IPC 和 Arrow IPC + ZSTD。输出包括各阶段的多次运行中位耗时、吞吐、文件大小、
+剪枝和读取字节数。输入 batch 构造不计时，编码、压缩和解压均设置为单线程。
+固定的测试口径、环境和参考结果见 [`bench/BENCHMARK_V1.md`](bench/BENCHMARK_V1.md)。
+
+压缩能力 benchmark 分别测试递增整数、窄值域整数、长 RLE、含 null 偏斜整数、低基数
+字符串和高基数字符串，并同时衡量空间效率、压缩写入效率和解压读取效率：
+
+```bash
+./build/sniffer_core_compression_benchmark \
+  --rows=100000 \
+  --iterations=5 \
+  --row-group=4096
+```
+
+压缩比定义为 `logical_bytes / file_bytes`，数值越大表示空间效率越高；`storage_ratio` 定义为
+`file_bytes / logical_bytes`，数值越小越好。`logical_bytes` 使用 Arrow 对输入 RecordBatch 引用
+的去重 buffer 总大小，不包含 schema 和文件级元数据。压缩 benchmark 会逐个场景回读并比较
+完整 Arrow batch。每种格式重复运行并报告压缩写入和解压读取的中位耗时，以及按逻辑数据量
+计算的 MiB/s；输入构造、文件大小查询和回读正确性比较不计时。合计结果的耗时是各场景中位
+耗时之和。
+
+Arrow IPC 对照使用类型化循环完成过滤和 projection materialization，但不提供 Sniffer 的编码
+选择、Row Group 索引、剪枝和各层 checksum，因此它是序列化/通用压缩基线，不是功能完全
+等价的存储格式。结果应分别用于观察端到端成本和文件大小，不能直接解释为纯解码器速度对比。
 
 `tests/sniffer_core_fuzz.cc` 同时提供 `LLVMFuzzerTestOneInput` 入口和 CTest 使用的确定性
 standalone smoke corpus，用于检查任意 Segment 输入的解析、checksum、完整读取和扫描路径。
