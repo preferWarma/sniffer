@@ -192,6 +192,7 @@ standalone smoke corpus，用于检查任意 Segment 输入的解析、checksum�
 - [阶段一文件格式决策](docs/decisions/0001-phase-one-file-format.md)
 - [阶段二索引与扫描格式决策](docs/decisions/0002-phase-two-index-and-scan-format.md)
 - [阶段三编码与选择器决策](docs/decisions/0003-phase-three-encodings-and-selection.md)
+- [v0.2 性能优化专项 TODO](docs/PERFORMANCE_OPTIMIZATION_V0.2.md)
 
 ## 当前边界
 

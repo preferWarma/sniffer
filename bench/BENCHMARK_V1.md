@@ -124,3 +124,6 @@ IPC + ZSTD 的 136.2%。Sniffer 在长 RLE、nullable 偏斜整数和低基数�
 - 性能 benchmark 的 Arrow IPC 路径没有与 Sniffer 完全等价的索引和校验语义，因此它是工程
   基线，而不是功能完全对等的格式比较。
 - v1 不记录耗时方差和分位数。后续版本可输出每轮原始数据、P50/P95 和稳定性指标。
+
+后续优化任务、优先级和验收门槛见
+[`docs/PERFORMANCE_OPTIMIZATION_V0.2.md`](../docs/PERFORMANCE_OPTIMIZATION_V0.2.md)。
