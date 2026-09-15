@@ -211,6 +211,89 @@ void WriteSegment(const std::filesystem::path& path, const sniffer::TableSchema&
   RequireOk(writer->Finish(), "finish segment");
 }
 
+void WriteSegmentWithPolicy(const std::filesystem::path& path, const sniffer::TableSchema& schema,
+                            const std::vector<std::shared_ptr<arrow::RecordBatch>>& batches,
+                            const sniffer::LayoutPolicy& policy) {
+  auto writer =
+      ValueOrThrow(sniffer::SegmentWriter::Open(path.string(), schema, policy), "open writer");
+  for (const auto& batch : batches) {
+    RequireOk(writer->Append(batch), "append batch");
+  }
+  RequireOk(writer->Finish(), "finish segment");
+}
+
+std::vector<std::shared_ptr<arrow::RecordBatch>> CollectScan(arrow::RecordBatchIterator iterator) {
+  std::vector<std::shared_ptr<arrow::RecordBatch>> batches;
+  while (true) {
+    auto batch = ValueOrThrow(iterator.Next(), "advance scan iterator");
+    if (!batch) {
+      break;
+    }
+    batches.push_back(std::move(batch));
+  }
+  return batches;
+}
+
+std::vector<int64_t> CollectInt64Column(
+    const std::vector<std::shared_ptr<arrow::RecordBatch>>& batches, int column) {
+  std::vector<int64_t> values;
+  for (const auto& batch : batches) {
+    const auto& array = static_cast<const arrow::Int64Array&>(*batch->column(column));
+    for (int64_t row = 0; row < array.length(); ++row) {
+      Expect(array.IsValid(row), "collected int64 value is non-null");
+      values.push_back(array.Value(row));
+    }
+  }
+  return values;
+}
+
+TestData MakeScanBatch() {
+  sniffer::TableSchema schema{21,
+                              {{1, "key", arrow::int64(), false, nullptr},
+                               {2, "category", arrow::utf8(), true, nullptr},
+                               {3, "score", arrow::int32(), true, nullptr},
+                               {4, "payload", arrow::binary(), false, nullptr}}};
+  auto arrow_schema = ValueOrThrow(schema.ToArrowSchema(), "scan schema");
+  arrow::Int64Builder key_builder;
+  arrow::StringBuilder category_builder;
+  arrow::Int32Builder score_builder;
+  arrow::BinaryBuilder payload_builder;
+  for (int64_t row = 0; row < 30; ++row) {
+    RequireOk(key_builder.Append(row), "append scan key");
+    if (row % 6 == 0) {
+      RequireOk(category_builder.AppendNull(), "append category null");
+    } else {
+      RequireOk(category_builder.Append(row % 2 == 0 ? "even" : "odd"), "append category");
+    }
+    if (row % 7 == 0) {
+      RequireOk(score_builder.AppendNull(), "append score null");
+    } else {
+      RequireOk(score_builder.Append(static_cast<int32_t>(row * 10)), "append score");
+    }
+    const std::string payload = "p" + std::to_string(row);
+    RequireOk(payload_builder.Append(reinterpret_cast<const uint8_t*>(payload.data()),
+                                     static_cast<int32_t>(payload.size())),
+              "append payload");
+  }
+  std::vector<std::shared_ptr<arrow::Array>> columns(4);
+  RequireOk(key_builder.Finish(&columns[0]), "finish scan keys");
+  RequireOk(category_builder.Finish(&columns[1]), "finish categories");
+  RequireOk(score_builder.Finish(&columns[2]), "finish scores");
+  RequireOk(payload_builder.Finish(&columns[3]), "finish payloads");
+  auto batch = arrow::RecordBatch::Make(arrow_schema, 30, std::move(columns));
+  RequireOk(batch->ValidateFull(), "validate scan batch");
+  return {std::move(schema), std::move(batch)};
+}
+
+sniffer::LayoutPolicy ScanLayout() {
+  sniffer::LayoutPolicy policy;
+  policy.target_row_group_rows = 5;
+  policy.sort_key_field_ids = {1};
+  policy.statistics_field_ids = {1, 2, 3};
+  policy.bloom_field_ids = {2};
+  return policy;
+}
+
 std::vector<uint8_t> ReadFile(const std::filesystem::path& path) {
   std::ifstream stream(path, std::ios::binary | std::ios::ate);
   Expect(stream.is_open(), "open test file for reading");
@@ -573,6 +656,432 @@ void TestSchemaAndWriterStateValidation() {
   Expect(!writer->Finish().ok(), "second Finish must fail");
 }
 
+void TestIOPlanProjectionPredicatesLimitAndBatching() {
+  const auto data = MakeScanBatch();
+  TempFile file("scan_projection.seg");
+  WriteSegmentWithPolicy(file.path(), data.table_schema, {data.batch}, ScanLayout());
+  auto reader = ValueOrThrow(sniffer::SegmentReader::Open(file.path().string()), "open scan file");
+
+  sniffer::IOPlan plan;
+  plan.projection_field_ids = {4, 1};
+  plan.conjunctive_predicates = {
+      {2, sniffer::Predicate::Op::kEq, std::make_shared<arrow::StringScalar>("even")},
+      {3, sniffer::Predicate::Op::kGe, std::make_shared<arrow::Int32Scalar>(100)}};
+  plan.limit = 4;
+  plan.output_batch_rows = 2;
+  auto metrics = std::make_shared<sniffer::ScanMetrics>();
+  auto iterator = ValueOrThrow(reader->Scan(plan, metrics), "create projected scan");
+  const auto batches = CollectScan(std::move(iterator));
+  Expect(batches.size() == 2, "limit output is split into two batches");
+  Expect(CollectInt64Column(batches, 1) == std::vector<int64_t>({10, 16, 20, 22}),
+         "AND predicates and limit preserve logical row order");
+  std::vector<std::string> payloads;
+  for (const auto& batch : batches) {
+    Expect(batch->schema()->field(0)->name() == "payload" &&
+               batch->schema()->field(1)->name() == "key",
+           "projection order is caller-defined");
+    const auto& payload = static_cast<const arrow::BinaryArray&>(*batch->column(0));
+    for (int64_t row = 0; row < payload.length(); ++row) {
+      payloads.emplace_back(payload.GetView(row));
+    }
+  }
+  Expect(payloads == std::vector<std::string>({"p10", "p16", "p20", "p22"}),
+         "projection-only binary values are decoded for selected rows");
+
+  arrow::BinaryBuilder reference_payload_builder;
+  arrow::Int64Builder reference_key_builder;
+  const auto full_batches = ValueOrThrow(reader->ReadAll(), "full decode for reference filter");
+  uint64_t reference_rows = 0;
+  for (const auto& full_batch : full_batches) {
+    const auto& keys = static_cast<const arrow::Int64Array&>(*full_batch->column(0));
+    const auto& categories = static_cast<const arrow::StringArray&>(*full_batch->column(1));
+    const auto& scores = static_cast<const arrow::Int32Array&>(*full_batch->column(2));
+    const auto& payload = static_cast<const arrow::BinaryArray&>(*full_batch->column(3));
+    for (int64_t row = 0; row < full_batch->num_rows() && reference_rows < 4; ++row) {
+      if (categories.IsValid(row) && categories.GetView(row) == "even" && scores.IsValid(row) &&
+          scores.Value(row) >= 100) {
+        RequireOk(reference_payload_builder.Append(payload.GetView(row)),
+                  "append Arrow reference payload");
+        RequireOk(reference_key_builder.Append(keys.Value(row)), "append Arrow reference key");
+        ++reference_rows;
+      }
+    }
+  }
+  std::shared_ptr<arrow::Array> expected_payload;
+  std::shared_ptr<arrow::Array> expected_key;
+  RequireOk(reference_payload_builder.Finish(&expected_payload), "finish Arrow reference payload");
+  RequireOk(reference_key_builder.Finish(&expected_key), "finish Arrow reference key");
+  auto actual = ValueOrThrow(arrow::ConcatenateRecordBatches(batches), "concatenate scan result");
+  auto expected = arrow::RecordBatch::Make(actual->schema(), 4, {expected_payload, expected_key});
+  Expect(actual->Equals(*expected),
+         "IOPlan result equals full decode plus Arrow reference filtering");
+  Expect(metrics->row_groups_considered == 5 && metrics->row_groups_pruned == 2,
+         "statistics prune early row groups before the limit is reached");
+  Expect(metrics->predicate_chunks_decoded == 6 && metrics->projection_chunks_decoded == 6 &&
+             metrics->column_chunks_read == 12,
+         "predicate and projection chunks follow separate decode paths");
+}
+
+void TestBloomPrunesWithoutChunkReads() {
+  const auto data = MakeScanBatch();
+  TempFile file("scan_bloom.seg");
+  WriteSegmentWithPolicy(file.path(), data.table_schema, {data.batch}, ScanLayout());
+  auto reader = ValueOrThrow(sniffer::SegmentReader::Open(file.path().string()), "open Bloom file");
+
+  sniffer::IOPlan plan;
+  plan.projection_field_ids = {1, 4};
+  plan.conjunctive_predicates = {
+      {2, sniffer::Predicate::Op::kEq, std::make_shared<arrow::StringScalar>("absent")}};
+  plan.output_batch_rows = 3;
+  auto metrics = std::make_shared<sniffer::ScanMetrics>();
+  auto batches = CollectScan(ValueOrThrow(reader->Scan(plan, metrics), "create Bloom scan"));
+  Expect(batches.empty(), "absent Bloom value produces no rows");
+  Expect(metrics->row_groups_considered == 6 && metrics->row_groups_pruned == 6,
+         "Bloom prunes every row group");
+  Expect(metrics->column_chunks_read == 0 && metrics->chunk_bytes_read == 0,
+         "Bloom pruning reads no data ColumnChunk");
+}
+
+void TestSortKeyRangeAndEmptyProjection() {
+  const auto data = MakeScanBatch();
+  TempFile file("scan_sort_range.seg");
+  WriteSegmentWithPolicy(file.path(), data.table_schema, {data.batch}, ScanLayout());
+  auto reader = ValueOrThrow(sniffer::SegmentReader::Open(file.path().string()), "open range file");
+
+  sniffer::IOPlan range_plan;
+  range_plan.projection_field_ids = {1};
+  sniffer::SortKeyRange range;
+  range.lower =
+      std::vector<std::shared_ptr<arrow::Scalar>>{std::make_shared<arrow::Int64Scalar>(12)};
+  range.upper =
+      std::vector<std::shared_ptr<arrow::Scalar>>{std::make_shared<arrow::Int64Scalar>(18)};
+  range_plan.sort_key_range = std::move(range);
+  range_plan.output_batch_rows = 4;
+  auto metrics = std::make_shared<sniffer::ScanMetrics>();
+  auto batches =
+      CollectScan(ValueOrThrow(reader->Scan(range_plan, metrics), "create sort-key range scan"));
+  Expect(CollectInt64Column(batches, 0) == std::vector<int64_t>({12, 13, 14, 15, 16, 17}),
+         "half-open sort-key range filters row boundaries exactly");
+  Expect(batches.size() == 2 && batches[0]->num_rows() == 4 && batches[1]->num_rows() == 2,
+         "sort-key range output obeys batch size across row groups");
+  Expect(metrics->row_groups_pruned == 4 && metrics->column_chunks_read == 2 &&
+             metrics->predicate_chunks_decoded == 2 && metrics->projection_chunks_decoded == 0,
+         "sort-key index prunes four groups and reuses decoded key columns");
+
+  sniffer::IOPlan empty_projection;
+  empty_projection.conjunctive_predicates = {
+      {1, sniffer::Predicate::Op::kLt, std::make_shared<arrow::Int64Scalar>(3)}};
+  empty_projection.output_batch_rows = 2;
+  auto empty_batches =
+      CollectScan(ValueOrThrow(reader->Scan(empty_projection), "create empty-projection scan"));
+  Expect(empty_batches.size() == 2 && empty_batches[0]->num_columns() == 0 &&
+             empty_batches[0]->num_rows() == 2 && empty_batches[1]->num_rows() == 1,
+         "empty projection retains filtered row counts and batching");
+}
+
+void TestAllPredicateOperationsAndNulls() {
+  const auto data = MakeScanBatch();
+  TempFile file("scan_operators.seg");
+  WriteSegmentWithPolicy(file.path(), data.table_schema, {data.batch}, ScanLayout());
+  auto reader = ValueOrThrow(sniffer::SegmentReader::Open(file.path().string()), "open operators");
+
+  const auto scan_keys = [&reader](sniffer::Predicate predicate) {
+    sniffer::IOPlan plan;
+    plan.projection_field_ids = {1};
+    plan.conjunctive_predicates = {std::move(predicate)};
+    plan.output_batch_rows = 7;
+    return CollectInt64Column(
+        CollectScan(ValueOrThrow(reader->Scan(std::move(plan)), "create operator scan")), 0);
+  };
+  const auto key_value = [] { return std::make_shared<arrow::Int64Scalar>(10); };
+  Expect(scan_keys({1, sniffer::Predicate::Op::kEq, key_value()}) == std::vector<int64_t>({10}),
+         "equality predicate");
+  std::vector<int64_t> not_equal;
+  for (int64_t value = 0; value < 30; ++value) {
+    if (value != 10) {
+      not_equal.push_back(value);
+    }
+  }
+  Expect(scan_keys({1, sniffer::Predicate::Op::kNe, key_value()}) == not_equal,
+         "not-equal predicate");
+  Expect(scan_keys({1, sniffer::Predicate::Op::kLt, key_value()}) ==
+             std::vector<int64_t>({0, 1, 2, 3, 4, 5, 6, 7, 8, 9}),
+         "less-than predicate");
+  Expect(scan_keys({1, sniffer::Predicate::Op::kLe, key_value()}) ==
+             std::vector<int64_t>({0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10}),
+         "less-or-equal predicate");
+  std::vector<int64_t> greater;
+  std::vector<int64_t> greater_equal;
+  for (int64_t value = 10; value < 30; ++value) {
+    greater_equal.push_back(value);
+    if (value > 10) {
+      greater.push_back(value);
+    }
+  }
+  Expect(scan_keys({1, sniffer::Predicate::Op::kGt, key_value()}) == greater,
+         "greater-than predicate");
+  Expect(scan_keys({1, sniffer::Predicate::Op::kGe, key_value()}) == greater_equal,
+         "greater-or-equal predicate");
+  Expect(scan_keys({3, sniffer::Predicate::Op::kIsNull, nullptr}) ==
+             std::vector<int64_t>({0, 7, 14, 21, 28}),
+         "IS NULL predicate");
+  std::vector<int64_t> not_null;
+  for (int64_t value = 0; value < 30; ++value) {
+    if (value % 7 != 0) {
+      not_null.push_back(value);
+    }
+  }
+  Expect(scan_keys({3, sniffer::Predicate::Op::kIsNotNull, nullptr}) == not_null,
+         "IS NOT NULL predicate");
+}
+
+void TestSequentialFallbackAndPlanValidation() {
+  const auto data = MakeScanBatch();
+  TempFile file("scan_fallback.seg");
+  sniffer::LayoutPolicy policy;
+  policy.target_row_group_rows = 5;
+  WriteSegmentWithPolicy(file.path(), data.table_schema, {data.batch}, policy);
+  auto reader = ValueOrThrow(sniffer::SegmentReader::Open(file.path().string()), "open fallback");
+
+  sniffer::IOPlan fallback;
+  fallback.projection_field_ids = {1};
+  fallback.conjunctive_predicates = {
+      {2, sniffer::Predicate::Op::kEq, std::make_shared<arrow::StringScalar>("absent")}};
+  auto metrics = std::make_shared<sniffer::ScanMetrics>();
+  auto batches = CollectScan(ValueOrThrow(reader->Scan(fallback, metrics), "create fallback scan"));
+  Expect(batches.empty() && metrics->row_groups_pruned == 0 &&
+             metrics->predicate_chunks_decoded == 6 && metrics->column_chunks_read == 6,
+         "missing indexes safely degrade to predicate-column sequential scan");
+
+  sniffer::IOPlan wrong_type;
+  wrong_type.projection_field_ids = {1};
+  wrong_type.conjunctive_predicates = {
+      {1, sniffer::Predicate::Op::kEq, std::make_shared<arrow::Int32Scalar>(1)}};
+  Expect(!reader->Scan(wrong_type).ok(), "implicit predicate type conversion is rejected");
+
+  sniffer::IOPlan duplicate_projection;
+  duplicate_projection.projection_field_ids = {1, 1};
+  Expect(!reader->Scan(duplicate_projection).ok(), "duplicate projection field is rejected");
+
+  sniffer::IOPlan bad_batch_size;
+  bad_batch_size.output_batch_rows = 0;
+  Expect(!reader->Scan(bad_batch_size).ok(), "zero output batch size is rejected");
+
+  sniffer::IOPlan zero_limit;
+  zero_limit.projection_field_ids = {1};
+  zero_limit.limit = 0;
+  auto zero_metrics = std::make_shared<sniffer::ScanMetrics>();
+  Expect(CollectScan(ValueOrThrow(reader->Scan(zero_limit, zero_metrics), "scan zero limit"))
+                 .empty() &&
+             zero_metrics->row_groups_considered == 0,
+         "zero limit reads no row groups");
+
+  sniffer::IOPlan unknown_projection;
+  unknown_projection.projection_field_ids = {999};
+  Expect(!reader->Scan(unknown_projection).ok(), "unknown projection field is rejected");
+
+  sniffer::IOPlan missing_value;
+  missing_value.conjunctive_predicates = {{1, sniffer::Predicate::Op::kEq, nullptr}};
+  Expect(!reader->Scan(missing_value).ok(), "comparison predicate requires a value");
+
+  sniffer::IOPlan null_test_value;
+  null_test_value.conjunctive_predicates = {
+      {1, sniffer::Predicate::Op::kIsNull, std::make_shared<arrow::Int64Scalar>(1)}};
+  Expect(!reader->Scan(null_test_value).ok(), "null predicate rejects a comparison value");
+
+  sniffer::IOPlan missing_sort_key;
+  sniffer::SortKeyRange range;
+  range.lower =
+      std::vector<std::shared_ptr<arrow::Scalar>>{std::make_shared<arrow::Int64Scalar>(1)};
+  missing_sort_key.sort_key_range = std::move(range);
+  Expect(!reader->Scan(missing_sort_key).ok(), "sort-key range on an unsorted segment is rejected");
+}
+
+void TestSortOrderAndIndexCorruptionValidation() {
+  sniffer::TableSchema nullable_sort_schema{1, {{1, "key", arrow::int64(), true, nullptr}}};
+  sniffer::LayoutPolicy invalid_layout;
+  invalid_layout.sort_key_field_ids = {1};
+  TempFile invalid_file("nullable_sort.seg");
+  Expect(!sniffer::SegmentWriter::Open(invalid_file.path().string(), nullable_sort_schema,
+                                       invalid_layout)
+              .ok(),
+         "nullable sort-key configuration is rejected");
+
+  sniffer::TableSchema schema{1, {{1, "key", arrow::int64(), false, nullptr}}};
+  auto arrow_schema = ValueOrThrow(schema.ToArrowSchema(), "sort validation schema");
+  auto unsorted = BuildArray<arrow::Int64Builder, int64_t>({1, 3, 2});
+  auto batch = arrow::RecordBatch::Make(arrow_schema, 3, {unsorted});
+  sniffer::LayoutPolicy sorted_layout;
+  sorted_layout.target_row_group_rows = 10;
+  sorted_layout.sort_key_field_ids = {1};
+  TempFile unsorted_file("unsorted.seg");
+  auto writer = ValueOrThrow(
+      sniffer::SegmentWriter::Open(unsorted_file.path().string(), schema, sorted_layout),
+      "open unsorted writer");
+  Expect(!writer->Append(batch).ok(), "unsorted input is rejected before row groups are written");
+
+  TempFile cross_append_file("cross_append_unsorted.seg");
+  auto cross_writer = ValueOrThrow(
+      sniffer::SegmentWriter::Open(cross_append_file.path().string(), schema, sorted_layout),
+      "open cross-append sort writer");
+  auto first_values = BuildArray<arrow::Int64Builder, int64_t>({1, 3});
+  auto second_values = BuildArray<arrow::Int64Builder, int64_t>({2, 4});
+  RequireOk(cross_writer->Append(arrow::RecordBatch::Make(arrow_schema, 2, {first_values})),
+            "append first sorted batch");
+  Expect(!cross_writer->Append(arrow::RecordBatch::Make(arrow_schema, 2, {second_values})).ok(),
+         "global sort order is checked across Append calls");
+
+  sniffer::TableSchema corruption_schema{1, {{7, "x", arrow::int32(), false, nullptr}}};
+  auto corruption_arrow_schema =
+      ValueOrThrow(corruption_schema.ToArrowSchema(), "index corruption schema");
+  auto values = BuildArray<arrow::Int32Builder, int32_t>({1, 2, 3});
+  auto corruption_batch = arrow::RecordBatch::Make(corruption_arrow_schema, 3, {values});
+  sniffer::LayoutPolicy corruption_layout;
+  corruption_layout.target_row_group_rows = 10;
+  corruption_layout.statistics_field_ids = {7};
+  TempFile corruption_file("bad_index.seg");
+  WriteSegmentWithPolicy(corruption_file.path(), corruption_schema, {corruption_batch},
+                         corruption_layout);
+  auto bytes = ReadFile(corruption_file.path());
+  const size_t trailer_offset = bytes.size() - 40;
+  const size_t footer_offset = static_cast<size_t>(ReadU64(bytes, trailer_offset + 8));
+  constexpr size_t kPrefix = 24;
+  constexpr size_t kFieldDescriptor = 16;
+  constexpr size_t kEncodingDescriptor = 13;
+  constexpr size_t kRowGroupHeader = 16;
+  const size_t chunk_entry =
+      footer_offset + kPrefix + kFieldDescriptor + 1 + kEncodingDescriptor + kRowGroupHeader;
+  const uint64_t chunk_offset = ReadU64(bytes, chunk_entry + 24);
+  const uint64_t chunk_length = ReadU64(bytes, chunk_entry + 32);
+  const size_t index_offset = static_cast<size_t>(chunk_offset + chunk_length);
+  bytes[index_offset + 4] ^= 0x01U;
+  WriteFile(corruption_file.path(), bytes);
+  Expect(!sniffer::SegmentReader::Open(corruption_file.path().string()).ok(),
+         "index checksum corruption fails Open before scanning");
+}
+
+void TestBloomSignedZeroEquality() {
+  sniffer::TableSchema schema{1, {{1, "value", arrow::float64(), false, nullptr}}};
+  auto arrow_schema = ValueOrThrow(schema.ToArrowSchema(), "signed-zero schema");
+  auto values = BuildArray<arrow::DoubleBuilder, double>({0.0});
+  auto batch = arrow::RecordBatch::Make(arrow_schema, 1, {values});
+  sniffer::LayoutPolicy policy;
+  policy.bloom_field_ids = {1};
+  TempFile file("signed_zero.seg");
+  WriteSegmentWithPolicy(file.path(), schema, {batch}, policy);
+  auto reader =
+      ValueOrThrow(sniffer::SegmentReader::Open(file.path().string()), "open signed zero");
+  sniffer::IOPlan plan;
+  plan.projection_field_ids = {1};
+  plan.conjunctive_predicates = {
+      {1, sniffer::Predicate::Op::kEq, std::make_shared<arrow::DoubleScalar>(-0.0)}};
+  auto batches = CollectScan(ValueOrThrow(reader->Scan(plan), "scan signed zero"));
+  Expect(batches.size() == 1 && batches[0]->num_rows() == 1,
+         "Bloom hashing preserves +0 == -0 predicate semantics");
+}
+
+void TestLegacyFooterScanFallback() {
+  const auto data = MakeScanBatch();
+  TempFile file("legacy_footer.seg");
+  sniffer::LayoutPolicy policy;
+  policy.target_row_group_rows = 7;
+  WriteSegmentWithPolicy(file.path(), data.table_schema, {data.batch}, policy);
+  auto bytes = ReadFile(file.path());
+  constexpr size_t kTrailerSize = 40;
+  const size_t trailer_offset = bytes.size() - kTrailerSize;
+  const uint64_t footer_offset = ReadU64(bytes, trailer_offset + 8);
+  const uint64_t footer_length = ReadU64(bytes, trailer_offset + 16);
+  constexpr uint64_t kLayoutBytes = 16;
+  const uint64_t tail_length = kLayoutBytes + 24U * 5U;
+  Expect(footer_length > tail_length, "phase-two footer has a removable index tail");
+  const uint64_t legacy_footer_length = footer_length - tail_length;
+  bytes.erase(bytes.begin() + static_cast<std::ptrdiff_t>(footer_offset + legacy_footer_length),
+              bytes.begin() + static_cast<std::ptrdiff_t>(footer_offset + footer_length));
+  WriteU16(&bytes, static_cast<size_t>(footer_offset), 1);
+  const size_t legacy_trailer_offset = bytes.size() - kTrailerSize;
+  WriteU64(&bytes, legacy_trailer_offset + 16, legacy_footer_length);
+  RefreshFooterChecksums(&bytes);
+  WriteFile(file.path(), bytes);
+
+  auto reader = ValueOrThrow(sniffer::SegmentReader::Open(file.path().string()),
+                             "open legacy footer segment");
+  sniffer::IOPlan plan;
+  plan.projection_field_ids = {1};
+  plan.conjunctive_predicates = {
+      {1, sniffer::Predicate::Op::kGe, std::make_shared<arrow::Int64Scalar>(27)}};
+  auto metrics = std::make_shared<sniffer::ScanMetrics>();
+  auto batches = CollectScan(ValueOrThrow(reader->Scan(plan, metrics), "scan legacy footer"));
+  Expect(CollectInt64Column(batches, 0) == std::vector<int64_t>({27, 28, 29}),
+         "footer v1 remains scan-compatible");
+  Expect(metrics->row_groups_considered == 5 && metrics->row_groups_pruned == 0,
+         "footer v1 safely uses sequential fallback");
+}
+
+void TestUnknownIndexVersionFailsExplicitly() {
+  sniffer::TableSchema schema{1, {{7, "x", arrow::int32(), false, nullptr}}};
+  auto arrow_schema = ValueOrThrow(schema.ToArrowSchema(), "unknown index schema");
+  auto values = BuildArray<arrow::Int32Builder, int32_t>({1, 2, 3});
+  auto batch = arrow::RecordBatch::Make(arrow_schema, 3, {values});
+  sniffer::LayoutPolicy policy;
+  policy.target_row_group_rows = 10;
+  policy.statistics_field_ids = {7};
+  TempFile file("unknown_index_version.seg");
+  WriteSegmentWithPolicy(file.path(), schema, {batch}, policy);
+  auto bytes = ReadFile(file.path());
+  const size_t trailer_offset = bytes.size() - 40;
+  const size_t footer_offset = static_cast<size_t>(ReadU64(bytes, trailer_offset + 8));
+  constexpr size_t kPrefix = 24;
+  constexpr size_t kField = 17;
+  constexpr size_t kEncoding = 13;
+  constexpr size_t kRowGroup = 16 + 56;
+  constexpr size_t kLayoutAndIds = 16 + 4;
+  const size_t index_directory =
+      footer_offset + kPrefix + kField + kEncoding + kRowGroup + kLayoutAndIds;
+  const uint64_t index_offset = ReadU64(bytes, index_directory);
+  const uint64_t index_length = ReadU64(bytes, index_directory + 8);
+  WriteU16(&bytes, static_cast<size_t>(index_offset), 999);
+  const auto index_bytes = std::span<const uint8_t>(
+      bytes.data() + static_cast<size_t>(index_offset), static_cast<size_t>(index_length));
+  WriteU32(&bytes, index_directory + 16, Crc32c(index_bytes));
+  RefreshFooterChecksums(&bytes);
+  WriteFile(file.path(), bytes);
+  const auto reader = sniffer::SegmentReader::Open(file.path().string());
+  Expect(!reader.ok() && reader.status().IsNotImplemented(),
+         "unknown index block version fails as unsupported");
+}
+
+void TestCompositeSortKeyRange() {
+  sniffer::TableSchema schema{1,
+                              {{1, "major", arrow::int32(), false, nullptr},
+                               {2, "minor", arrow::utf8(), false, nullptr},
+                               {3, "value", arrow::int64(), false, nullptr}}};
+  auto arrow_schema = ValueOrThrow(schema.ToArrowSchema(), "composite sort schema");
+  auto major = BuildArray<arrow::Int32Builder, int32_t>({1, 1, 2, 2, 3});
+  auto minor = BuildStringArray({"a", "c", "a", "b", "a"});
+  auto value = BuildArray<arrow::Int64Builder, int64_t>({10, 11, 12, 13, 14});
+  auto batch = arrow::RecordBatch::Make(arrow_schema, 5, {major, minor, value});
+  sniffer::LayoutPolicy policy;
+  policy.target_row_group_rows = 2;
+  policy.sort_key_field_ids = {1, 2};
+  TempFile file("composite_sort.seg");
+  WriteSegmentWithPolicy(file.path(), schema, {batch}, policy);
+  auto reader =
+      ValueOrThrow(sniffer::SegmentReader::Open(file.path().string()), "open composite sort");
+
+  sniffer::IOPlan plan;
+  plan.projection_field_ids = {3};
+  sniffer::SortKeyRange range;
+  range.lower = std::vector<std::shared_ptr<arrow::Scalar>>{
+      std::make_shared<arrow::Int32Scalar>(1), std::make_shared<arrow::StringScalar>("b")};
+  range.upper = std::vector<std::shared_ptr<arrow::Scalar>>{
+      std::make_shared<arrow::Int32Scalar>(2), std::make_shared<arrow::StringScalar>("b")};
+  plan.sort_key_range = std::move(range);
+  plan.output_batch_rows = 8;
+  auto batches = CollectScan(ValueOrThrow(reader->Scan(plan), "scan composite range"));
+  Expect(CollectInt64Column(batches, 0) == std::vector<int64_t>({11, 12}),
+         "composite sort-key range uses lexicographic half-open semantics");
+}
+
 }  // namespace
 
 int main() {
@@ -590,6 +1099,16 @@ int main() {
       {"unknown_physical_type", TestUnknownPhysicalTypeFailsOpen},
       {"truncation", TestTruncationFailsOpen},
       {"schema_and_writer_state", TestSchemaAndWriterStateValidation},
+      {"io_plan_projection_predicates_limit", TestIOPlanProjectionPredicatesLimitAndBatching},
+      {"bloom_prunes_without_chunk_reads", TestBloomPrunesWithoutChunkReads},
+      {"sort_key_range_and_empty_projection", TestSortKeyRangeAndEmptyProjection},
+      {"all_predicate_operations_and_nulls", TestAllPredicateOperationsAndNulls},
+      {"sequential_fallback_and_plan_validation", TestSequentialFallbackAndPlanValidation},
+      {"sort_order_and_index_corruption", TestSortOrderAndIndexCorruptionValidation},
+      {"bloom_signed_zero_equality", TestBloomSignedZeroEquality},
+      {"legacy_footer_scan_fallback", TestLegacyFooterScanFallback},
+      {"unknown_index_version", TestUnknownIndexVersionFailsExplicitly},
+      {"composite_sort_key_range", TestCompositeSortKeyRange},
   };
 
   int failures = 0;

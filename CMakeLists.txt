@@ -55,6 +55,8 @@ endif()
 
 add_library(sniffer_core
   src/format_internal.cc
+  src/index_internal.cc
+  src/scalar_internal.cc
   src/schema.cc
   src/segment_reader.cc
   src/segment_writer.cc

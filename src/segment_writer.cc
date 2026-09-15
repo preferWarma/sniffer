@@ -11,6 +11,7 @@
 #include <vector>
 
 #include "format_internal.h"
+#include "index_internal.h"
 
 namespace sniffer {
 namespace {
@@ -182,6 +183,8 @@ class SegmentWriter::Impl {
     }
     ARROW_RETURN_NOT_OK(batch->ValidateFull());
     ARROW_RETURN_NOT_OK(schema_.ValidateBatch(*batch));
+    ARROW_RETURN_NOT_OK(
+        internal::ValidateAndUpdateSortOrder(schema_, layout_policy_, *batch, &previous_sort_key_));
     int64_t offset = 0;
     while (offset < batch->num_rows()) {
       const int64_t remaining = batch->num_rows() - offset;
@@ -197,7 +200,10 @@ class SegmentWriter::Impl {
     if (finished_) {
       return arrow::Status::Invalid("[sniffer.writer.state] Finish called more than once");
     }
-    internal::FooterData footer{schema_, row_groups_};
+    internal::FooterData footer;
+    footer.schema = schema_;
+    footer.row_groups = row_groups_;
+    footer.layout_policy = layout_policy_;
     ARROW_ASSIGN_OR_RAISE(auto footer_bytes, internal::SerializeFooter(footer));
     const uint64_t footer_offset = position_;
     const uint32_t footer_checksum = internal::Crc32c(footer_bytes);
@@ -221,6 +227,8 @@ class SegmentWriter::Impl {
 
  private:
   arrow::Status WriteRowGroup(const std::shared_ptr<arrow::RecordBatch>& batch) {
+    ARROW_ASSIGN_OR_RAISE(auto indexes,
+                          internal::BuildRowGroupIndex(schema_, layout_policy_, *batch));
     internal::RowGroupMeta row_group;
     row_group.row_count = static_cast<uint64_t>(batch->num_rows());
     row_group.chunks.reserve(schema_.fields.size());
@@ -243,6 +251,11 @@ class SegmentWriter::Impl {
       ARROW_RETURN_NOT_OK(WriteTracked(payload));
       row_group.chunks.push_back(chunk);
     }
+    ARROW_ASSIGN_OR_RAISE(auto index_bytes, internal::SerializeIndexBlock(schema_, indexes));
+    row_group.index_block.offset = position_;
+    row_group.index_block.length = static_cast<uint64_t>(index_bytes.size());
+    row_group.index_block.checksum = internal::Crc32c(index_bytes);
+    ARROW_RETURN_NOT_OK(WriteTracked(index_bytes));
     row_groups_.push_back(std::move(row_group));
     return arrow::Status::OK();
   }
@@ -274,6 +287,7 @@ class SegmentWriter::Impl {
   uint64_t position_ = 0;
   uint32_t file_checksum_ = 0;
   std::vector<internal::RowGroupMeta> row_groups_;
+  std::vector<std::shared_ptr<arrow::Scalar>> previous_sort_key_;
   bool finished_ = false;
 };
 
@@ -281,7 +295,7 @@ arrow::Result<std::unique_ptr<SegmentWriter>> SegmentWriter::Open(std::string pa
                                                                   TableSchema schema,
                                                                   LayoutPolicy layout_policy) {
   ARROW_RETURN_NOT_OK(schema.Validate());
-  ARROW_RETURN_NOT_OK(layout_policy.ValidatePhaseOne());
+  ARROW_RETURN_NOT_OK(layout_policy.Validate(schema));
   auto impl = std::make_unique<Impl>(std::move(path), std::move(schema), std::move(layout_policy));
   ARROW_RETURN_NOT_OK(impl->Initialize());
   return std::unique_ptr<SegmentWriter>(new SegmentWriter(std::move(impl)));

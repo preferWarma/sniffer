@@ -6,7 +6,10 @@
 #include <array>
 #include <limits>
 #include <string_view>
+#include <unordered_map>
 #include <unordered_set>
+
+#include "scalar_internal.h"
 
 namespace sniffer::internal {
 namespace {
@@ -51,6 +54,16 @@ arrow::Result<arrow::TimeUnit::type> ParseTimeUnit(uint8_t value) {
     default:
       return InvalidFormat("unknown timestamp unit");
   }
+}
+
+arrow::Result<const FieldSpec*> FindField(const TableSchema& schema, uint32_t field_id) {
+  const auto field = std::find_if(
+      schema.fields.begin(), schema.fields.end(),
+      [field_id](const FieldSpec& candidate) { return candidate.field_id == field_id; });
+  if (field == schema.fields.end()) {
+    return InvalidFormat("index references unknown field ID");
+  }
+  return &*field;
 }
 
 }  // namespace
@@ -409,6 +422,32 @@ arrow::Result<std::vector<uint8_t>> SerializeFooter(const FooterData& footer) {
       writer.WriteU32(0);
     }
   }
+
+  if (footer.layout_policy.sort_key_field_ids.size() > std::numeric_limits<uint32_t>::max() ||
+      footer.layout_policy.statistics_field_ids.size() > std::numeric_limits<uint32_t>::max() ||
+      footer.layout_policy.bloom_field_ids.size() > std::numeric_limits<uint32_t>::max()) {
+    return arrow::Status::Invalid("[sniffer.format.limit] too many configured index fields");
+  }
+  ARROW_RETURN_NOT_OK(footer.layout_policy.Validate(footer.schema));
+  writer.WriteU32(footer.layout_policy.target_row_group_rows);
+  writer.WriteU32(static_cast<uint32_t>(footer.layout_policy.sort_key_field_ids.size()));
+  writer.WriteU32(static_cast<uint32_t>(footer.layout_policy.statistics_field_ids.size()));
+  writer.WriteU32(static_cast<uint32_t>(footer.layout_policy.bloom_field_ids.size()));
+  for (const uint32_t field_id : footer.layout_policy.sort_key_field_ids) {
+    writer.WriteU32(field_id);
+  }
+  for (const uint32_t field_id : footer.layout_policy.statistics_field_ids) {
+    writer.WriteU32(field_id);
+  }
+  for (const uint32_t field_id : footer.layout_policy.bloom_field_ids) {
+    writer.WriteU32(field_id);
+  }
+  for (const auto& row_group : footer.row_groups) {
+    writer.WriteU64(row_group.index_block.offset);
+    writer.WriteU64(row_group.index_block.length);
+    writer.WriteU32(row_group.index_block.checksum);
+    writer.WriteU32(0);
+  }
   return std::move(writer).Finish();
 }
 
@@ -416,12 +455,15 @@ arrow::Result<FooterData> ParseFooter(std::span<const uint8_t> bytes) {
   ByteReader reader(bytes);
   ARROW_ASSIGN_OR_RAISE(const uint16_t payload_version, reader.ReadU16());
   ARROW_ASSIGN_OR_RAISE(const uint16_t prefix_reserved, reader.ReadU16());
-  if (payload_version != kFooterPayloadVersion || prefix_reserved != 0) {
+  if ((payload_version != kLegacyFooterPayloadVersion &&
+       payload_version != kFooterPayloadVersion) ||
+      prefix_reserved != 0) {
     return arrow::Status::NotImplemented(
         "[sniffer.format.footer_version] unsupported footer payload");
   }
 
   FooterData footer;
+  footer.has_phase_two_metadata = payload_version >= kFooterPayloadVersion;
   ARROW_ASSIGN_OR_RAISE(footer.schema.schema_version, reader.ReadU32());
   ARROW_ASSIGN_OR_RAISE(const uint32_t field_count, reader.ReadU32());
   ARROW_ASSIGN_OR_RAISE(const uint32_t encoding_count, reader.ReadU32());
@@ -510,10 +552,214 @@ arrow::Result<FooterData> ParseFooter(std::span<const uint8_t> bytes) {
     }
     footer.row_groups.push_back(std::move(row_group));
   }
+  if (payload_version == kLegacyFooterPayloadVersion) {
+    footer.has_phase_two_metadata = false;
+    if (reader.remaining() != 0) {
+      return InvalidFormat("trailing footer bytes");
+    }
+    return footer;
+  }
+
+  ARROW_ASSIGN_OR_RAISE(footer.layout_policy.target_row_group_rows, reader.ReadU32());
+  ARROW_ASSIGN_OR_RAISE(const uint32_t sort_key_count, reader.ReadU32());
+  ARROW_ASSIGN_OR_RAISE(const uint32_t statistics_count, reader.ReadU32());
+  ARROW_ASSIGN_OR_RAISE(const uint32_t bloom_count, reader.ReadU32());
+  const uint64_t configured_count =
+      static_cast<uint64_t>(sort_key_count) + statistics_count + bloom_count;
+  if (configured_count > reader.remaining() / 4U) {
+    return Truncated("layout policy field IDs");
+  }
+  footer.layout_policy.sort_key_field_ids.reserve(sort_key_count);
+  footer.layout_policy.statistics_field_ids.reserve(statistics_count);
+  footer.layout_policy.bloom_field_ids.reserve(bloom_count);
+  for (uint32_t index = 0; index < sort_key_count; ++index) {
+    ARROW_ASSIGN_OR_RAISE(const uint32_t field_id, reader.ReadU32());
+    footer.layout_policy.sort_key_field_ids.push_back(field_id);
+  }
+  for (uint32_t index = 0; index < statistics_count; ++index) {
+    ARROW_ASSIGN_OR_RAISE(const uint32_t field_id, reader.ReadU32());
+    footer.layout_policy.statistics_field_ids.push_back(field_id);
+  }
+  for (uint32_t index = 0; index < bloom_count; ++index) {
+    ARROW_ASSIGN_OR_RAISE(const uint32_t field_id, reader.ReadU32());
+    footer.layout_policy.bloom_field_ids.push_back(field_id);
+  }
+  ARROW_RETURN_NOT_OK(footer.layout_policy.Validate(footer.schema));
+  if (row_group_count > reader.remaining() / 24U) {
+    return Truncated("row group index directory");
+  }
+  for (auto& row_group : footer.row_groups) {
+    ARROW_ASSIGN_OR_RAISE(row_group.index_block.offset, reader.ReadU64());
+    ARROW_ASSIGN_OR_RAISE(row_group.index_block.length, reader.ReadU64());
+    ARROW_ASSIGN_OR_RAISE(row_group.index_block.checksum, reader.ReadU32());
+    ARROW_ASSIGN_OR_RAISE(const uint32_t reserved, reader.ReadU32());
+    if (reserved != 0) {
+      return InvalidFormat("non-zero index directory reserved field");
+    }
+  }
   if (reader.remaining() != 0) {
     return InvalidFormat("trailing footer bytes");
   }
   return footer;
+}
+
+arrow::Result<std::vector<uint8_t>> SerializeIndexBlock(const TableSchema& schema,
+                                                        const RowGroupIndex& index) {
+  if (index.statistics.size() > std::numeric_limits<uint32_t>::max() ||
+      index.blooms.size() > std::numeric_limits<uint32_t>::max() ||
+      index.sort_keys.size() > std::numeric_limits<uint32_t>::max()) {
+    return arrow::Status::Invalid("[sniffer.format.limit] too many row-group indexes");
+  }
+  ByteWriter writer;
+  writer.WriteU16(kIndexBlockVersion);
+  writer.WriteU16(0);
+  writer.WriteU32(static_cast<uint32_t>(index.statistics.size()));
+  writer.WriteU32(static_cast<uint32_t>(index.blooms.size()));
+  writer.WriteU32(static_cast<uint32_t>(index.sort_keys.size()));
+  writer.WriteU32(0);
+
+  for (const auto& statistics : index.statistics) {
+    ARROW_ASSIGN_OR_RAISE(const auto* field, FindField(schema, statistics.field_id));
+    const bool has_min_max = statistics.min && statistics.max;
+    std::vector<uint8_t> min_bytes;
+    std::vector<uint8_t> max_bytes;
+    if (has_min_max) {
+      ARROW_ASSIGN_OR_RAISE(min_bytes, SerializeScalar(*field, *statistics.min));
+      ARROW_ASSIGN_OR_RAISE(max_bytes, SerializeScalar(*field, *statistics.max));
+    }
+    writer.WriteU32(statistics.field_id);
+    writer.WriteU32(has_min_max ? 1U : 0U);
+    writer.WriteU64(statistics.null_count);
+    writer.WriteU64(static_cast<uint64_t>(min_bytes.size()));
+    writer.WriteU64(static_cast<uint64_t>(max_bytes.size()));
+    writer.WriteBytes(min_bytes);
+    writer.WriteBytes(max_bytes);
+  }
+  for (const auto& bloom : index.blooms) {
+    if (bloom.bits.size() > std::numeric_limits<uint64_t>::max()) {
+      return arrow::Status::Invalid("[sniffer.format.limit] Bloom filter is too large");
+    }
+    writer.WriteU32(bloom.field_id);
+    writer.WriteU32(bloom.hash_count);
+    writer.WriteU64(bloom.bit_count);
+    writer.WriteU64(static_cast<uint64_t>(bloom.bits.size()));
+    writer.WriteBytes(bloom.bits);
+  }
+  for (const auto& sort_key : index.sort_keys) {
+    ARROW_ASSIGN_OR_RAISE(const auto* field, FindField(schema, sort_key.field_id));
+    if (!sort_key.first || !sort_key.last) {
+      return InvalidFormat("missing sort-key boundary");
+    }
+    ARROW_ASSIGN_OR_RAISE(auto first_bytes, SerializeScalar(*field, *sort_key.first));
+    ARROW_ASSIGN_OR_RAISE(auto last_bytes, SerializeScalar(*field, *sort_key.last));
+    writer.WriteU32(sort_key.field_id);
+    writer.WriteU32(0);
+    writer.WriteU64(static_cast<uint64_t>(first_bytes.size()));
+    writer.WriteU64(static_cast<uint64_t>(last_bytes.size()));
+    writer.WriteBytes(first_bytes);
+    writer.WriteBytes(last_bytes);
+  }
+  return std::move(writer).Finish();
+}
+
+arrow::Result<RowGroupIndex> ParseIndexBlock(const TableSchema& schema,
+                                             std::span<const uint8_t> bytes) {
+  ByteReader reader(bytes);
+  ARROW_ASSIGN_OR_RAISE(const uint16_t version, reader.ReadU16());
+  ARROW_ASSIGN_OR_RAISE(const uint16_t prefix_reserved, reader.ReadU16());
+  if (version != kIndexBlockVersion || prefix_reserved != 0) {
+    return arrow::Status::NotImplemented("[sniffer.format.index_version] unsupported index block");
+  }
+  ARROW_ASSIGN_OR_RAISE(const uint32_t statistics_count, reader.ReadU32());
+  ARROW_ASSIGN_OR_RAISE(const uint32_t bloom_count, reader.ReadU32());
+  ARROW_ASSIGN_OR_RAISE(const uint32_t sort_key_count, reader.ReadU32());
+  ARROW_ASSIGN_OR_RAISE(const uint32_t reserved, reader.ReadU32());
+  if (reserved != 0) {
+    return InvalidFormat("non-zero index block reserved field");
+  }
+  ARROW_ASSIGN_OR_RAISE(const uint64_t minimum_statistics_bytes,
+                        CheckedMultiply(static_cast<uint64_t>(statistics_count), uint64_t{32}));
+  ARROW_ASSIGN_OR_RAISE(const uint64_t minimum_bloom_bytes,
+                        CheckedMultiply(static_cast<uint64_t>(bloom_count), uint64_t{24}));
+  ARROW_ASSIGN_OR_RAISE(const uint64_t minimum_sort_key_bytes,
+                        CheckedMultiply(static_cast<uint64_t>(sort_key_count), uint64_t{24}));
+  ARROW_ASSIGN_OR_RAISE(const uint64_t minimum_index_bytes,
+                        CheckedAdd(minimum_statistics_bytes, minimum_bloom_bytes));
+  ARROW_ASSIGN_OR_RAISE(const uint64_t minimum_entry_bytes,
+                        CheckedAdd(minimum_index_bytes, minimum_sort_key_bytes));
+  if (minimum_entry_bytes > reader.remaining()) {
+    return Truncated("index block entries");
+  }
+
+  RowGroupIndex index;
+  std::unordered_set<uint32_t> statistics_ids;
+  std::unordered_set<uint32_t> bloom_ids;
+  std::unordered_set<uint32_t> sort_key_ids;
+  index.statistics.reserve(statistics_count);
+  index.blooms.reserve(bloom_count);
+  index.sort_keys.reserve(sort_key_count);
+  for (uint32_t entry = 0; entry < statistics_count; ++entry) {
+    StatisticsMeta statistics;
+    ARROW_ASSIGN_OR_RAISE(statistics.field_id, reader.ReadU32());
+    ARROW_ASSIGN_OR_RAISE(const uint32_t flags, reader.ReadU32());
+    ARROW_ASSIGN_OR_RAISE(statistics.null_count, reader.ReadU64());
+    ARROW_ASSIGN_OR_RAISE(const uint64_t min_length, reader.ReadU64());
+    ARROW_ASSIGN_OR_RAISE(const uint64_t max_length, reader.ReadU64());
+    if ((flags & ~1U) != 0 || !statistics_ids.insert(statistics.field_id).second) {
+      return InvalidFormat("invalid statistics entry flags or duplicate field");
+    }
+    ARROW_ASSIGN_OR_RAISE(const auto* field, FindField(schema, statistics.field_id));
+    ARROW_ASSIGN_OR_RAISE(auto min_bytes, reader.ReadBytes(min_length));
+    ARROW_ASSIGN_OR_RAISE(auto max_bytes, reader.ReadBytes(max_length));
+    if ((flags & 1U) != 0) {
+      ARROW_ASSIGN_OR_RAISE(statistics.min, ParseScalar(*field, min_bytes));
+      ARROW_ASSIGN_OR_RAISE(statistics.max, ParseScalar(*field, max_bytes));
+      ARROW_ASSIGN_OR_RAISE(const int order, CompareScalars(*statistics.min, *statistics.max));
+      if (order > 0) {
+        return InvalidFormat("statistics minimum exceeds maximum");
+      }
+    } else if (min_length != 0 || max_length != 0) {
+      return InvalidFormat("statistics without min/max has scalar bytes");
+    }
+    index.statistics.push_back(std::move(statistics));
+  }
+  for (uint32_t entry = 0; entry < bloom_count; ++entry) {
+    BloomMeta bloom;
+    ARROW_ASSIGN_OR_RAISE(bloom.field_id, reader.ReadU32());
+    ARROW_ASSIGN_OR_RAISE(bloom.hash_count, reader.ReadU32());
+    ARROW_ASSIGN_OR_RAISE(bloom.bit_count, reader.ReadU64());
+    ARROW_ASSIGN_OR_RAISE(const uint64_t byte_count, reader.ReadU64());
+    ARROW_ASSIGN_OR_RAISE(const auto* ignored_field, FindField(schema, bloom.field_id));
+    static_cast<void>(ignored_field);
+    if (!bloom_ids.insert(bloom.field_id).second || bloom.hash_count != 7 || bloom.bit_count == 0 ||
+        bloom.bit_count % 8U != 0 || (bloom.bit_count & (bloom.bit_count - 1U)) != 0 ||
+        byte_count != bloom.bit_count / 8U || byte_count > std::numeric_limits<size_t>::max()) {
+      return InvalidFormat("invalid Bloom filter entry");
+    }
+    ARROW_ASSIGN_OR_RAISE(auto bit_bytes, reader.ReadBytes(byte_count));
+    bloom.bits.assign(bit_bytes.begin(), bit_bytes.end());
+    index.blooms.push_back(std::move(bloom));
+  }
+  for (uint32_t entry = 0; entry < sort_key_count; ++entry) {
+    SortKeyMeta sort_key;
+    ARROW_ASSIGN_OR_RAISE(sort_key.field_id, reader.ReadU32());
+    ARROW_ASSIGN_OR_RAISE(const uint32_t entry_reserved, reader.ReadU32());
+    ARROW_ASSIGN_OR_RAISE(const uint64_t first_length, reader.ReadU64());
+    ARROW_ASSIGN_OR_RAISE(const uint64_t last_length, reader.ReadU64());
+    if (entry_reserved != 0 || !sort_key_ids.insert(sort_key.field_id).second) {
+      return InvalidFormat("invalid sort-key entry");
+    }
+    ARROW_ASSIGN_OR_RAISE(const auto* field, FindField(schema, sort_key.field_id));
+    ARROW_ASSIGN_OR_RAISE(auto first_bytes, reader.ReadBytes(first_length));
+    ARROW_ASSIGN_OR_RAISE(auto last_bytes, reader.ReadBytes(last_length));
+    ARROW_ASSIGN_OR_RAISE(sort_key.first, ParseScalar(*field, first_bytes));
+    ARROW_ASSIGN_OR_RAISE(sort_key.last, ParseScalar(*field, last_bytes));
+    index.sort_keys.push_back(std::move(sort_key));
+  }
+  if (reader.remaining() != 0) {
+    return InvalidFormat("trailing index block bytes");
+  }
+  return index;
 }
 
 }  // namespace sniffer::internal

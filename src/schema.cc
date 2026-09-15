@@ -2,7 +2,9 @@
 
 #include <arrow/util/key_value_metadata.h>
 
+#include <algorithm>
 #include <charconv>
+#include <string_view>
 #include <unordered_set>
 
 #include "sniffer/layout.h"
@@ -94,6 +96,40 @@ arrow::Status LayoutPolicy::ValidatePhaseOne() const {
   if (!sort_key_field_ids.empty() || !statistics_field_ids.empty() || !bloom_field_ids.empty()) {
     return arrow::Status::NotImplemented("[sniffer.layout.index] indexes are a phase-two feature");
   }
+  return arrow::Status::OK();
+}
+
+arrow::Status LayoutPolicy::Validate(const TableSchema& schema) const {
+  ARROW_RETURN_NOT_OK(schema.Validate());
+  if (target_row_group_rows == 0) {
+    return arrow::Status::Invalid(
+        "[sniffer.layout.row_group] target_row_group_rows must be positive");
+  }
+
+  const auto validate_ids = [&schema](const std::vector<uint32_t>& ids,
+                                      std::string_view kind) -> arrow::Status {
+    std::unordered_set<uint32_t> seen;
+    for (const uint32_t id : ids) {
+      if (!seen.insert(id).second) {
+        return arrow::Status::Invalid("[sniffer.layout.index] duplicate ", kind, " field ID ", id);
+      }
+      const auto field =
+          std::find_if(schema.fields.begin(), schema.fields.end(),
+                       [id](const FieldSpec& candidate) { return candidate.field_id == id; });
+      if (field == schema.fields.end()) {
+        return arrow::Status::Invalid("[sniffer.layout.index] unknown ", kind, " field ID ", id);
+      }
+      if (kind == "sort-key" && field->nullable) {
+        return arrow::Status::Invalid("[sniffer.layout.sort_key] sort-key field ", id,
+                                      " must be non-nullable");
+      }
+    }
+    return arrow::Status::OK();
+  };
+
+  ARROW_RETURN_NOT_OK(validate_ids(sort_key_field_ids, "sort-key"));
+  ARROW_RETURN_NOT_OK(validate_ids(statistics_field_ids, "statistics"));
+  ARROW_RETURN_NOT_OK(validate_ids(bloom_field_ids, "Bloom"));
   return arrow::Status::OK();
 }
 

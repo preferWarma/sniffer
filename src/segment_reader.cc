@@ -5,14 +5,21 @@
 #include <bit>
 #include <cstddef>
 #include <cstdint>
+#include <deque>
 #include <fstream>
 #include <limits>
+#include <memory>
+#include <optional>
 #include <span>
 #include <string>
+#include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
 #include "format_internal.h"
+#include "index_internal.h"
+#include "scalar_internal.h"
 
 namespace sniffer {
 namespace {
@@ -317,16 +324,608 @@ arrow::Result<std::shared_ptr<arrow::Array>> DecodePlain(const FieldSpec& field,
   return arrow::Status::NotImplemented("[sniffer.format.type] unknown physical type");
 }
 
+arrow::Result<std::shared_ptr<arrow::Array>> SelectArray(
+    const std::shared_ptr<arrow::Array>& source, const std::vector<uint64_t>& selection) {
+  ARROW_ASSIGN_OR_RAISE(auto builder, arrow::MakeBuilder(source->type()));
+  if (selection.size() > static_cast<size_t>(std::numeric_limits<int64_t>::max())) {
+    return arrow::Status::Invalid("[sniffer.scan.limit] selection exceeds Arrow limit");
+  }
+  ARROW_RETURN_NOT_OK(builder->Reserve(static_cast<int64_t>(selection.size())));
+  for (const uint64_t row : selection) {
+    if (row >= static_cast<uint64_t>(source->length())) {
+      return InvalidFormat("selection row exceeds source array");
+    }
+    ARROW_ASSIGN_OR_RAISE(auto scalar, source->GetScalar(static_cast<int64_t>(row)));
+    ARROW_RETURN_NOT_OK(builder->AppendScalar(*scalar));
+  }
+  std::shared_ptr<arrow::Array> result;
+  ARROW_RETURN_NOT_OK(builder->Finish(&result));
+  return result;
+}
+
+arrow::Result<std::shared_ptr<arrow::Array>> DecodePlainSelected(
+    const FieldSpec& field, const internal::ColumnChunkMeta& chunk,
+    std::span<const uint8_t> payload, const std::vector<uint64_t>& selection) {
+  internal::ByteReader payload_reader(payload);
+  ARROW_ASSIGN_OR_RAISE(const uint64_t validity_length, payload_reader.ReadU64());
+  ARROW_ASSIGN_OR_RAISE(const uint64_t offsets_length, payload_reader.ReadU64());
+  ARROW_ASSIGN_OR_RAISE(const uint64_t values_length, payload_reader.ReadU64());
+  ARROW_ASSIGN_OR_RAISE(auto validity, payload_reader.ReadBytes(validity_length));
+  ARROW_ASSIGN_OR_RAISE(auto offsets, payload_reader.ReadBytes(offsets_length));
+  ARROW_ASSIGN_OR_RAISE(auto values, payload_reader.ReadBytes(values_length));
+  if (payload_reader.remaining() != 0) {
+    return InvalidFormat("trailing Plain payload bytes");
+  }
+  ARROW_RETURN_NOT_OK(ValidateValidity(validity, chunk.row_count, chunk.null_count));
+
+  std::vector<uint64_t> variable_offsets;
+  const bool variable = chunk.physical_type == internal::PhysicalTypeId::kString ||
+                        chunk.physical_type == internal::PhysicalTypeId::kBinary;
+  const uint32_t width = internal::FixedWidthBytes(chunk.physical_type);
+  if (variable) {
+    ARROW_ASSIGN_OR_RAISE(const uint64_t offset_count,
+                          internal::CheckedAdd(chunk.row_count, uint64_t{1}));
+    ARROW_ASSIGN_OR_RAISE(const uint64_t expected_bytes,
+                          internal::CheckedMultiply(offset_count, uint64_t{8}));
+    if (offsets.size() != expected_bytes || offset_count > std::numeric_limits<size_t>::max()) {
+      return InvalidFormat("invalid variable-size offset buffer length");
+    }
+    internal::ByteReader offset_reader(offsets);
+    variable_offsets.reserve(static_cast<size_t>(offset_count));
+    for (uint64_t index = 0; index < offset_count; ++index) {
+      ARROW_ASSIGN_OR_RAISE(const uint64_t offset, offset_reader.ReadU64());
+      if ((!variable_offsets.empty() && offset < variable_offsets.back()) ||
+          offset > values.size()) {
+        return InvalidFormat("variable-size offsets are not monotonic and bounded");
+      }
+      variable_offsets.push_back(offset);
+    }
+    if (variable_offsets.front() != 0 || variable_offsets.back() != values.size()) {
+      return InvalidFormat("variable-size offsets are not normalized");
+    }
+  } else {
+    if (!offsets.empty()) {
+      return InvalidFormat("fixed-width Plain payload has offsets");
+    }
+    ARROW_ASSIGN_OR_RAISE(const uint64_t expected_values,
+                          internal::CheckedMultiply(chunk.row_count, static_cast<uint64_t>(width)));
+    if (values.size() != expected_values) {
+      return InvalidFormat("invalid fixed-width values length");
+    }
+  }
+
+  ARROW_ASSIGN_OR_RAISE(auto builder, arrow::MakeBuilder(field.type));
+  if (selection.size() > static_cast<size_t>(std::numeric_limits<int64_t>::max())) {
+    return arrow::Status::Invalid("[sniffer.scan.limit] selection exceeds Arrow limit");
+  }
+  ARROW_RETURN_NOT_OK(builder->Reserve(static_cast<int64_t>(selection.size())));
+  uint64_t previous = 0;
+  bool first_row = true;
+  for (const uint64_t row : selection) {
+    if (row >= chunk.row_count || (!first_row && row <= previous)) {
+      return InvalidFormat("selection vector must be strictly increasing and bounded");
+    }
+    first_row = false;
+    previous = row;
+    if (!IsValid(validity, row)) {
+      ARROW_RETURN_NOT_OK(builder->AppendNull());
+      continue;
+    }
+    std::span<const uint8_t> scalar_bytes;
+    if (variable) {
+      const uint64_t begin = variable_offsets[static_cast<size_t>(row)];
+      const uint64_t end = variable_offsets[static_cast<size_t>(row + 1U)];
+      scalar_bytes = values.subspan(static_cast<size_t>(begin), static_cast<size_t>(end - begin));
+    } else {
+      ARROW_ASSIGN_OR_RAISE(const uint64_t begin,
+                            internal::CheckedMultiply(row, static_cast<uint64_t>(width)));
+      scalar_bytes = values.subspan(static_cast<size_t>(begin), width);
+    }
+    ARROW_ASSIGN_OR_RAISE(auto scalar, internal::ParseScalar(field, scalar_bytes));
+    ARROW_RETURN_NOT_OK(builder->AppendScalar(*scalar));
+  }
+  std::shared_ptr<arrow::Array> result;
+  ARROW_RETURN_NOT_OK(builder->Finish(&result));
+  ARROW_RETURN_NOT_OK(result->ValidateFull());
+  return result;
+}
+
+arrow::Result<size_t> FindFieldIndex(const TableSchema& schema, uint32_t field_id) {
+  for (size_t index = 0; index < schema.fields.size(); ++index) {
+    if (schema.fields[index].field_id == field_id) {
+      return index;
+    }
+  }
+  return arrow::Status::Invalid("[sniffer.plan.field] unknown field ID ", field_id);
+}
+
+arrow::Result<int> CompareKeyVectors(const std::vector<std::shared_ptr<arrow::Scalar>>& left,
+                                     const std::vector<std::shared_ptr<arrow::Scalar>>& right) {
+  if (left.size() != right.size()) {
+    return arrow::Status::Invalid("[sniffer.plan.sort_key] key arity mismatch");
+  }
+  for (size_t index = 0; index < left.size(); ++index) {
+    ARROW_ASSIGN_OR_RAISE(const int order, internal::CompareScalars(*left[index], *right[index]));
+    if (order != 0) {
+      return order;
+    }
+  }
+  return 0;
+}
+
+arrow::Status ValidatePlan(const internal::FooterData& footer, const IOPlan& plan) {
+  if (plan.output_batch_rows == 0) {
+    return arrow::Status::Invalid("[sniffer.plan.batch] output_batch_rows must be positive");
+  }
+  std::unordered_set<uint32_t> projection_ids;
+  for (const uint32_t field_id : plan.projection_field_ids) {
+    ARROW_ASSIGN_OR_RAISE(const size_t ignored, FindFieldIndex(footer.schema, field_id));
+    static_cast<void>(ignored);
+    if (!projection_ids.insert(field_id).second) {
+      return arrow::Status::Invalid("[sniffer.plan.projection] duplicate field ID ", field_id);
+    }
+  }
+  for (const auto& predicate : plan.conjunctive_predicates) {
+    ARROW_ASSIGN_OR_RAISE(const size_t field_index,
+                          FindFieldIndex(footer.schema, predicate.field_id));
+    const bool null_test =
+        predicate.op == Predicate::Op::kIsNull || predicate.op == Predicate::Op::kIsNotNull;
+    if (null_test) {
+      if (predicate.value) {
+        return arrow::Status::Invalid("[sniffer.plan.predicate] null test must not carry a value");
+      }
+    } else if (!predicate.value || !predicate.value->is_valid ||
+               !predicate.value->type->Equals(footer.schema.fields[field_index].type)) {
+      return arrow::Status::Invalid(
+          "[sniffer.plan.predicate] comparison value must be non-null and exactly typed");
+    }
+  }
+  if (!plan.sort_key_range) {
+    return arrow::Status::OK();
+  }
+  const auto& sort_fields = footer.layout_policy.sort_key_field_ids;
+  if (sort_fields.empty()) {
+    return arrow::Status::Invalid(
+        "[sniffer.plan.sort_key] range requires a configured segment sort key");
+  }
+  const auto validate_bound =
+      [&footer,
+       &sort_fields](const std::optional<std::vector<std::shared_ptr<arrow::Scalar>>>& bound)
+      -> arrow::Status {
+    if (!bound) {
+      return arrow::Status::OK();
+    }
+    if (bound->size() != sort_fields.size()) {
+      return arrow::Status::Invalid("[sniffer.plan.sort_key] bound arity mismatch");
+    }
+    for (size_t index = 0; index < bound->size(); ++index) {
+      ARROW_ASSIGN_OR_RAISE(const size_t field_index,
+                            FindFieldIndex(footer.schema, sort_fields[index]));
+      const auto& value = (*bound)[index];
+      if (!value || !value->is_valid || internal::ScalarHasNaN(*value) ||
+          !value->type->Equals(footer.schema.fields[field_index].type)) {
+        return arrow::Status::Invalid(
+            "[sniffer.plan.sort_key] bound values must be non-null, non-NaN, and exactly typed");
+      }
+    }
+    return arrow::Status::OK();
+  };
+  ARROW_RETURN_NOT_OK(validate_bound(plan.sort_key_range->lower));
+  ARROW_RETURN_NOT_OK(validate_bound(plan.sort_key_range->upper));
+  if (plan.sort_key_range->lower && plan.sort_key_range->upper) {
+    ARROW_ASSIGN_OR_RAISE(const int order, CompareKeyVectors(*plan.sort_key_range->lower,
+                                                             *plan.sort_key_range->upper));
+    if (order > 0) {
+      return arrow::Status::Invalid("[sniffer.plan.sort_key] lower bound exceeds upper bound");
+    }
+  }
+  return arrow::Status::OK();
+}
+
+bool EvaluateOrderedResult(int order, Predicate::Op op) {
+  switch (op) {
+    case Predicate::Op::kEq:
+      return order == 0;
+    case Predicate::Op::kNe:
+      return order != 0;
+    case Predicate::Op::kLt:
+      return order < 0;
+    case Predicate::Op::kLe:
+      return order <= 0;
+    case Predicate::Op::kGt:
+      return order > 0;
+    case Predicate::Op::kGe:
+      return order >= 0;
+    case Predicate::Op::kIsNull:
+    case Predicate::Op::kIsNotNull:
+      break;
+  }
+  return false;
+}
+
+arrow::Result<bool> EvaluatePredicate(const arrow::Array& array, uint64_t row,
+                                      const Predicate& predicate) {
+  const bool is_null = array.IsNull(static_cast<int64_t>(row));
+  if (predicate.op == Predicate::Op::kIsNull) {
+    return is_null;
+  }
+  if (predicate.op == Predicate::Op::kIsNotNull) {
+    return !is_null;
+  }
+  if (is_null) {
+    return false;
+  }
+  ARROW_ASSIGN_OR_RAISE(auto value, array.GetScalar(static_cast<int64_t>(row)));
+  if (internal::ScalarHasNaN(*value) || internal::ScalarHasNaN(*predicate.value)) {
+    return predicate.op == Predicate::Op::kNe;
+  }
+  ARROW_ASSIGN_OR_RAISE(const int order, internal::CompareScalars(*value, *predicate.value));
+  return EvaluateOrderedResult(order, predicate.op);
+}
+
+const internal::StatisticsMeta* FindStatistics(const internal::RowGroupIndex& index,
+                                               uint32_t field_id) {
+  const auto found = std::find_if(index.statistics.begin(), index.statistics.end(),
+                                  [field_id](const internal::StatisticsMeta& candidate) {
+                                    return candidate.field_id == field_id;
+                                  });
+  return found == index.statistics.end() ? nullptr : &*found;
+}
+
+const internal::BloomMeta* FindBloom(const internal::RowGroupIndex& index, uint32_t field_id) {
+  const auto found = std::find_if(
+      index.blooms.begin(), index.blooms.end(),
+      [field_id](const internal::BloomMeta& candidate) { return candidate.field_id == field_id; });
+  return found == index.blooms.end() ? nullptr : &*found;
+}
+
+arrow::Result<bool> PredicatePrunes(const TableSchema& schema,
+                                    const internal::RowGroupMeta& row_group,
+                                    const internal::RowGroupIndex& index,
+                                    const Predicate& predicate) {
+  const auto* statistics = FindStatistics(index, predicate.field_id);
+  if (statistics) {
+    if (predicate.op == Predicate::Op::kIsNull) {
+      return statistics->null_count == 0;
+    }
+    if (predicate.op == Predicate::Op::kIsNotNull) {
+      return statistics->null_count == row_group.row_count;
+    }
+    if (statistics->null_count == row_group.row_count) {
+      return true;
+    }
+    if (internal::ScalarHasNaN(*predicate.value)) {
+      return predicate.op != Predicate::Op::kNe;
+    }
+    if (statistics->min && statistics->max) {
+      ARROW_ASSIGN_OR_RAISE(const int min_order,
+                            internal::CompareScalars(*statistics->min, *predicate.value));
+      ARROW_ASSIGN_OR_RAISE(const int max_order,
+                            internal::CompareScalars(*statistics->max, *predicate.value));
+      switch (predicate.op) {
+        case Predicate::Op::kEq:
+          if (min_order > 0 || max_order < 0) {
+            return true;
+          }
+          break;
+        case Predicate::Op::kNe:
+          if (min_order == 0 && max_order == 0) {
+            return true;
+          }
+          break;
+        case Predicate::Op::kLt:
+          if (min_order >= 0) {
+            return true;
+          }
+          break;
+        case Predicate::Op::kLe:
+          if (min_order > 0) {
+            return true;
+          }
+          break;
+        case Predicate::Op::kGt:
+          if (max_order <= 0) {
+            return true;
+          }
+          break;
+        case Predicate::Op::kGe:
+          if (max_order < 0) {
+            return true;
+          }
+          break;
+        case Predicate::Op::kIsNull:
+        case Predicate::Op::kIsNotNull:
+          break;
+      }
+    }
+  }
+  if (predicate.op == Predicate::Op::kEq) {
+    const auto* bloom = FindBloom(index, predicate.field_id);
+    if (bloom) {
+      ARROW_ASSIGN_OR_RAISE(const size_t field_index, FindFieldIndex(schema, predicate.field_id));
+      ARROW_ASSIGN_OR_RAISE(
+          const bool may_contain,
+          internal::BloomMayContain(schema.fields[field_index], *bloom, *predicate.value));
+      if (!may_contain) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+arrow::Result<bool> SortRangePrunes(const internal::FooterData& footer,
+                                    const internal::RowGroupIndex& index,
+                                    const SortKeyRange& range) {
+  if (index.sort_keys.size() != footer.layout_policy.sort_key_field_ids.size()) {
+    return false;
+  }
+  std::vector<std::shared_ptr<arrow::Scalar>> first;
+  std::vector<std::shared_ptr<arrow::Scalar>> last;
+  first.reserve(index.sort_keys.size());
+  last.reserve(index.sort_keys.size());
+  for (size_t position = 0; position < index.sort_keys.size(); ++position) {
+    if (index.sort_keys[position].field_id != footer.layout_policy.sort_key_field_ids[position]) {
+      return false;
+    }
+    first.push_back(index.sort_keys[position].first);
+    last.push_back(index.sort_keys[position].last);
+  }
+  if (range.lower) {
+    ARROW_ASSIGN_OR_RAISE(const int order, CompareKeyVectors(last, *range.lower));
+    if (order < 0 || (order == 0 && !range.lower_inclusive)) {
+      return true;
+    }
+  }
+  if (range.upper) {
+    ARROW_ASSIGN_OR_RAISE(const int order, CompareKeyVectors(first, *range.upper));
+    if (order > 0 || (order == 0 && !range.upper_inclusive)) {
+      return true;
+    }
+  }
+  return false;
+}
+
 }  // namespace
+
+class ScanState {
+ public:
+  ScanState(std::string path, uint64_t file_size, internal::FooterData footer,
+            std::vector<internal::RowGroupIndex> indexes, IOPlan plan,
+            std::shared_ptr<ScanMetrics> metrics, std::shared_ptr<arrow::Schema> output_schema)
+      : path_(std::move(path)),
+        file_size_(file_size),
+        footer_(std::move(footer)),
+        indexes_(std::move(indexes)),
+        plan_(std::move(plan)),
+        metrics_(std::move(metrics)),
+        output_schema_(std::move(output_schema)) {}
+
+  arrow::Result<std::shared_ptr<arrow::RecordBatch>> Next() {
+    if (plan_.limit && produced_ >= *plan_.limit) {
+      return std::shared_ptr<arrow::RecordBatch>();
+    }
+    uint64_t target_rows = plan_.output_batch_rows;
+    if (plan_.limit) {
+      target_rows = std::min<uint64_t>(target_rows, *plan_.limit - produced_);
+    }
+    while (buffered_rows_ < target_rows && next_row_group_ < footer_.row_groups.size()) {
+      uint64_t remaining_limit = std::numeric_limits<uint64_t>::max();
+      if (plan_.limit) {
+        remaining_limit = *plan_.limit - produced_ - buffered_rows_;
+      }
+      ARROW_ASSIGN_OR_RAISE(auto batch, ReadNextMatchingRowGroup(remaining_limit));
+      if (batch) {
+        buffered_rows_ += static_cast<uint64_t>(batch->num_rows());
+        buffered_.push_back(std::move(batch));
+      }
+    }
+    if (buffered_rows_ == 0) {
+      return std::shared_ptr<arrow::RecordBatch>();
+    }
+
+    const uint64_t emit_rows = std::min<uint64_t>(target_rows, buffered_rows_);
+    uint64_t remaining = emit_rows;
+    arrow::RecordBatchVector pieces;
+    while (remaining != 0) {
+      const auto& front = buffered_.front();
+      const int64_t available = front->num_rows() - buffered_front_offset_;
+      const int64_t take =
+          static_cast<int64_t>(std::min<uint64_t>(static_cast<uint64_t>(available), remaining));
+      pieces.push_back(front->Slice(buffered_front_offset_, take));
+      buffered_front_offset_ += take;
+      remaining -= static_cast<uint64_t>(take);
+      buffered_rows_ -= static_cast<uint64_t>(take);
+      if (buffered_front_offset_ == front->num_rows()) {
+        buffered_.pop_front();
+        buffered_front_offset_ = 0;
+      }
+    }
+    produced_ += emit_rows;
+    if (pieces.size() == 1) {
+      return pieces.front();
+    }
+    return arrow::ConcatenateRecordBatches(pieces);
+  }
+
+ private:
+  arrow::Result<std::shared_ptr<arrow::RecordBatch>> ReadNextMatchingRowGroup(
+      uint64_t remaining_limit) {
+    while (next_row_group_ < footer_.row_groups.size() && remaining_limit != 0) {
+      const size_t row_group_index = next_row_group_++;
+      const auto& row_group = footer_.row_groups[row_group_index];
+      const auto& index = indexes_[row_group_index];
+      ++metrics_->row_groups_considered;
+      ARROW_ASSIGN_OR_RAISE(const bool pruned, IsPruned(row_group, index));
+      if (pruned) {
+        ++metrics_->row_groups_pruned;
+        continue;
+      }
+
+      std::unordered_map<size_t, std::shared_ptr<arrow::Array>> filter_columns;
+      for (const auto& predicate : plan_.conjunctive_predicates) {
+        ARROW_ASSIGN_OR_RAISE(const size_t field_index,
+                              FindFieldIndex(footer_.schema, predicate.field_id));
+        if (!filter_columns.contains(field_index)) {
+          ARROW_ASSIGN_OR_RAISE(auto array, DecodePredicateChunk(row_group, field_index));
+          filter_columns.emplace(field_index, std::move(array));
+        }
+      }
+      if (plan_.sort_key_range) {
+        for (const uint32_t field_id : footer_.layout_policy.sort_key_field_ids) {
+          ARROW_ASSIGN_OR_RAISE(const size_t field_index, FindFieldIndex(footer_.schema, field_id));
+          if (!filter_columns.contains(field_index)) {
+            ARROW_ASSIGN_OR_RAISE(auto array, DecodePredicateChunk(row_group, field_index));
+            filter_columns.emplace(field_index, std::move(array));
+          }
+        }
+      }
+
+      std::vector<uint64_t> selection;
+      selection.reserve(
+          static_cast<size_t>(std::min<uint64_t>(row_group.row_count, remaining_limit)));
+      for (uint64_t row = 0;
+           row < row_group.row_count && static_cast<uint64_t>(selection.size()) < remaining_limit;
+           ++row) {
+        ARROW_ASSIGN_OR_RAISE(const bool matches, RowMatches(row, filter_columns));
+        if (matches) {
+          selection.push_back(row);
+        }
+      }
+      if (selection.empty()) {
+        continue;
+      }
+
+      std::vector<std::shared_ptr<arrow::Array>> projected_columns;
+      projected_columns.reserve(plan_.projection_field_ids.size());
+      for (const uint32_t field_id : plan_.projection_field_ids) {
+        ARROW_ASSIGN_OR_RAISE(const size_t field_index, FindFieldIndex(footer_.schema, field_id));
+        const auto decoded = filter_columns.find(field_index);
+        if (decoded != filter_columns.end()) {
+          ARROW_ASSIGN_OR_RAISE(auto selected, SelectArray(decoded->second, selection));
+          projected_columns.push_back(std::move(selected));
+        } else {
+          ARROW_ASSIGN_OR_RAISE(auto selected,
+                                DecodeProjectionChunk(row_group, field_index, selection));
+          projected_columns.push_back(std::move(selected));
+        }
+      }
+      auto batch = arrow::RecordBatch::Make(output_schema_, static_cast<int64_t>(selection.size()),
+                                            std::move(projected_columns));
+      ARROW_RETURN_NOT_OK(batch->ValidateFull());
+      return batch;
+    }
+    return std::shared_ptr<arrow::RecordBatch>();
+  }
+  arrow::Result<std::vector<uint8_t>> ReadChunk(const internal::ColumnChunkMeta& chunk) {
+    ARROW_ASSIGN_OR_RAISE(auto payload, ReadRange(path_, file_size_, chunk.offset, chunk.length));
+    ++metrics_->column_chunks_read;
+    metrics_->chunk_bytes_read += chunk.length;
+    if (internal::Crc32c(payload) != chunk.checksum) {
+      return arrow::Status::Invalid(
+          "[sniffer.format.checksum] ColumnChunk CRC32C mismatch for field ", chunk.field_id);
+    }
+    return payload;
+  }
+
+  arrow::Result<std::shared_ptr<arrow::Array>> DecodePredicateChunk(
+      const internal::RowGroupMeta& row_group, size_t field_index) {
+    const auto& chunk = row_group.chunks[field_index];
+    ARROW_ASSIGN_OR_RAISE(auto payload, ReadChunk(chunk));
+    ARROW_ASSIGN_OR_RAISE(auto array,
+                          DecodePlain(footer_.schema.fields[field_index], chunk, payload));
+    ++metrics_->predicate_chunks_decoded;
+    return array;
+  }
+
+  arrow::Result<std::shared_ptr<arrow::Array>> DecodeProjectionChunk(
+      const internal::RowGroupMeta& row_group, size_t field_index,
+      const std::vector<uint64_t>& selection) {
+    const auto& chunk = row_group.chunks[field_index];
+    ARROW_ASSIGN_OR_RAISE(auto payload, ReadChunk(chunk));
+    ARROW_ASSIGN_OR_RAISE(auto array, DecodePlainSelected(footer_.schema.fields[field_index], chunk,
+                                                          payload, selection));
+    ++metrics_->projection_chunks_decoded;
+    return array;
+  }
+
+  arrow::Result<bool> IsPruned(const internal::RowGroupMeta& row_group,
+                               const internal::RowGroupIndex& index) const {
+    for (const auto& predicate : plan_.conjunctive_predicates) {
+      ARROW_ASSIGN_OR_RAISE(const bool prunes,
+                            PredicatePrunes(footer_.schema, row_group, index, predicate));
+      if (prunes) {
+        return true;
+      }
+    }
+    if (plan_.sort_key_range) {
+      return SortRangePrunes(footer_, index, *plan_.sort_key_range);
+    }
+    return false;
+  }
+
+  arrow::Result<bool> RowMatches(
+      uint64_t row,
+      const std::unordered_map<size_t, std::shared_ptr<arrow::Array>>& columns) const {
+    for (const auto& predicate : plan_.conjunctive_predicates) {
+      ARROW_ASSIGN_OR_RAISE(const size_t field_index,
+                            FindFieldIndex(footer_.schema, predicate.field_id));
+      ARROW_ASSIGN_OR_RAISE(const bool matches,
+                            EvaluatePredicate(*columns.at(field_index), row, predicate));
+      if (!matches) {
+        return false;
+      }
+    }
+    if (!plan_.sort_key_range) {
+      return true;
+    }
+    std::vector<std::shared_ptr<arrow::Scalar>> key;
+    key.reserve(footer_.layout_policy.sort_key_field_ids.size());
+    for (const uint32_t field_id : footer_.layout_policy.sort_key_field_ids) {
+      ARROW_ASSIGN_OR_RAISE(const size_t field_index, FindFieldIndex(footer_.schema, field_id));
+      ARROW_ASSIGN_OR_RAISE(auto value,
+                            columns.at(field_index)->GetScalar(static_cast<int64_t>(row)));
+      key.push_back(std::move(value));
+    }
+    const auto& range = *plan_.sort_key_range;
+    if (range.lower) {
+      ARROW_ASSIGN_OR_RAISE(const int order, CompareKeyVectors(key, *range.lower));
+      if (order < 0 || (order == 0 && !range.lower_inclusive)) {
+        return false;
+      }
+    }
+    if (range.upper) {
+      ARROW_ASSIGN_OR_RAISE(const int order, CompareKeyVectors(key, *range.upper));
+      if (order > 0 || (order == 0 && !range.upper_inclusive)) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  std::string path_;
+  uint64_t file_size_;
+  internal::FooterData footer_;
+  std::vector<internal::RowGroupIndex> indexes_;
+  IOPlan plan_;
+  std::shared_ptr<ScanMetrics> metrics_;
+  std::shared_ptr<arrow::Schema> output_schema_;
+  size_t next_row_group_ = 0;
+  std::deque<std::shared_ptr<arrow::RecordBatch>> buffered_;
+  uint64_t buffered_rows_ = 0;
+  int64_t buffered_front_offset_ = 0;
+  uint64_t produced_ = 0;
+};
 
 class SegmentReader::Impl {
  public:
   Impl(std::string path, uint64_t file_size, internal::FooterTrailer trailer,
-       internal::FooterData footer)
+       internal::FooterData footer, std::vector<internal::RowGroupIndex> indexes)
       : path_(std::move(path)),
         file_size_(file_size),
         trailer_(trailer),
-        footer_(std::move(footer)) {}
+        footer_(std::move(footer)),
+        indexes_(std::move(indexes)) {}
 
   arrow::Status ValidateDirectory() const {
     uint64_t previous_end = internal::kHeaderSize;
@@ -362,11 +961,109 @@ class SegmentReader::Impl {
         }
         previous_end = chunk_end;
       }
+      if (footer_.has_phase_two_metadata) {
+        if (row_group.index_block.length < 20U) {
+          return InvalidFormat("row group index block is too small");
+        }
+        ARROW_ASSIGN_OR_RAISE(
+            const uint64_t index_end,
+            internal::CheckedAdd(row_group.index_block.offset, row_group.index_block.length));
+        if (row_group.index_block.offset < previous_end || index_end > trailer_.footer_offset) {
+          return arrow::Status::Invalid("[sniffer.format.bounds] invalid index block range");
+        }
+        previous_end = index_end;
+      } else if (row_group.index_block.offset != 0 || row_group.index_block.length != 0 ||
+                 row_group.index_block.checksum != 0) {
+        return InvalidFormat("legacy footer contains index metadata");
+      }
     }
     if (previous_end > trailer_.footer_offset) {
       return arrow::Status::Invalid("[sniffer.format.bounds] data overlaps footer");
     }
     return arrow::Status::OK();
+  }
+
+  arrow::Status LoadIndexes() {
+    indexes_.clear();
+    indexes_.reserve(footer_.row_groups.size());
+    if (!footer_.has_phase_two_metadata) {
+      indexes_.resize(footer_.row_groups.size());
+      return arrow::Status::OK();
+    }
+    std::vector<std::shared_ptr<arrow::Scalar>> previous_last_key;
+    for (const auto& row_group : footer_.row_groups) {
+      ARROW_ASSIGN_OR_RAISE(auto bytes, ReadRange(path_, file_size_, row_group.index_block.offset,
+                                                  row_group.index_block.length));
+      if (internal::Crc32c(bytes) != row_group.index_block.checksum) {
+        return arrow::Status::Invalid("[sniffer.format.checksum] index block CRC32C mismatch");
+      }
+      ARROW_ASSIGN_OR_RAISE(auto index, internal::ParseIndexBlock(footer_.schema, bytes));
+      if (index.statistics.size() != footer_.layout_policy.statistics_field_ids.size() ||
+          index.blooms.size() != footer_.layout_policy.bloom_field_ids.size() ||
+          index.sort_keys.size() != footer_.layout_policy.sort_key_field_ids.size()) {
+        return InvalidFormat("index block does not match layout policy");
+      }
+      for (size_t position = 0; position < index.statistics.size(); ++position) {
+        if (index.statistics[position].field_id !=
+                footer_.layout_policy.statistics_field_ids[position] ||
+            index.statistics[position].null_count > row_group.row_count) {
+          return InvalidFormat("statistics index does not match row group");
+        }
+      }
+      for (size_t position = 0; position < index.blooms.size(); ++position) {
+        if (index.blooms[position].field_id != footer_.layout_policy.bloom_field_ids[position]) {
+          return InvalidFormat("Bloom index does not match layout policy");
+        }
+      }
+      std::vector<std::shared_ptr<arrow::Scalar>> first_key;
+      std::vector<std::shared_ptr<arrow::Scalar>> last_key;
+      for (size_t position = 0; position < index.sort_keys.size(); ++position) {
+        if (index.sort_keys[position].field_id !=
+            footer_.layout_policy.sort_key_field_ids[position]) {
+          return InvalidFormat("sort-key index does not match layout policy");
+        }
+        first_key.push_back(index.sort_keys[position].first);
+        last_key.push_back(index.sort_keys[position].last);
+      }
+      if (!first_key.empty()) {
+        ARROW_ASSIGN_OR_RAISE(const int local_order, CompareKeyVectors(first_key, last_key));
+        if (local_order > 0) {
+          return InvalidFormat("sort-key row-group boundaries are reversed");
+        }
+        if (!previous_last_key.empty()) {
+          ARROW_ASSIGN_OR_RAISE(const int global_order,
+                                CompareKeyVectors(previous_last_key, first_key));
+          if (global_order > 0) {
+            return InvalidFormat("sort-key row groups are not globally ordered");
+          }
+        }
+        previous_last_key = std::move(last_key);
+      }
+      indexes_.push_back(std::move(index));
+    }
+    return arrow::Status::OK();
+  }
+
+  arrow::Result<arrow::RecordBatchIterator> Scan(IOPlan plan,
+                                                 std::shared_ptr<ScanMetrics> metrics) const {
+    ARROW_RETURN_NOT_OK(ValidatePlan(footer_, plan));
+    if (!metrics) {
+      metrics = std::make_shared<ScanMetrics>();
+    } else {
+      *metrics = {};
+    }
+    ARROW_ASSIGN_OR_RAISE(auto full_schema, footer_.schema.ToArrowSchema());
+    std::vector<std::shared_ptr<arrow::Field>> projected_fields;
+    projected_fields.reserve(plan.projection_field_ids.size());
+    for (const uint32_t field_id : plan.projection_field_ids) {
+      ARROW_ASSIGN_OR_RAISE(const size_t field_index, FindFieldIndex(footer_.schema, field_id));
+      projected_fields.push_back(full_schema->field(static_cast<int>(field_index)));
+    }
+    auto output_schema = arrow::schema(std::move(projected_fields), full_schema->metadata());
+    auto state = std::make_shared<ScanState>(path_, file_size_, footer_, indexes_, std::move(plan),
+                                             std::move(metrics), std::move(output_schema));
+    return arrow::MakeFunctionIterator(
+        [state]() -> arrow::Result<std::shared_ptr<arrow::RecordBatch>> { return state->Next(); });
   }
 
   arrow::Result<std::vector<std::shared_ptr<arrow::RecordBatch>>> ReadAll() const {
@@ -438,6 +1135,7 @@ class SegmentReader::Impl {
   uint64_t file_size_;
   internal::FooterTrailer trailer_;
   internal::FooterData footer_;
+  std::vector<internal::RowGroupIndex> indexes_;
 };
 
 arrow::Result<std::unique_ptr<SegmentReader>> SegmentReader::Open(std::string path) {
@@ -473,8 +1171,10 @@ arrow::Result<std::unique_ptr<SegmentReader>> SegmentReader::Open(std::string pa
     return arrow::Status::Invalid("[sniffer.format.checksum] footer CRC32C mismatch");
   }
   ARROW_ASSIGN_OR_RAISE(auto footer, internal::ParseFooter(footer_bytes));
-  auto impl = std::make_unique<Impl>(std::move(path), file_size, trailer, std::move(footer));
+  auto impl = std::make_unique<Impl>(std::move(path), file_size, trailer, std::move(footer),
+                                     std::vector<internal::RowGroupIndex>{});
   ARROW_RETURN_NOT_OK(impl->ValidateDirectory());
+  ARROW_RETURN_NOT_OK(impl->LoadIndexes());
   return std::unique_ptr<SegmentReader>(new SegmentReader(std::move(impl)));
 }
 
@@ -488,6 +1188,11 @@ uint64_t SegmentReader::num_row_groups() const { return impl_->num_row_groups();
 
 arrow::Result<std::vector<std::shared_ptr<arrow::RecordBatch>>> SegmentReader::ReadAll() const {
   return impl_->ReadAll();
+}
+
+arrow::Result<arrow::RecordBatchIterator> SegmentReader::Scan(
+    IOPlan plan, std::shared_ptr<ScanMetrics> metrics) const {
+  return impl_->Scan(std::move(plan), std::move(metrics));
 }
 
 arrow::Status SegmentReader::VerifyFileChecksum() const { return impl_->VerifyFileChecksum(); }

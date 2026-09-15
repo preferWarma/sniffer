@@ -9,6 +9,7 @@
 #include <string>
 #include <vector>
 
+#include "sniffer/layout.h"
 #include "sniffer/schema.h"
 
 namespace sniffer::internal {
@@ -17,7 +18,9 @@ inline constexpr uint16_t kFormatMajor = 1;
 inline constexpr uint16_t kFormatMinor = 0;
 inline constexpr uint32_t kHeaderSize = 32;
 inline constexpr uint32_t kTrailerSize = 40;
-inline constexpr uint16_t kFooterPayloadVersion = 1;
+inline constexpr uint16_t kLegacyFooterPayloadVersion = 1;
+inline constexpr uint16_t kFooterPayloadVersion = 2;
+inline constexpr uint16_t kIndexBlockVersion = 1;
 inline constexpr uint16_t kPlainEncodingId = 0;
 inline constexpr uint16_t kPlainEncodingMajor = 1;
 inline constexpr uint16_t kPlainEncodingMinor = 0;
@@ -54,14 +57,49 @@ struct ColumnChunkMeta {
   uint32_t checksum = 0;
 };
 
+struct IndexBlockMeta {
+  uint64_t offset = 0;
+  uint64_t length = 0;
+  uint32_t checksum = 0;
+};
+
 struct RowGroupMeta {
   uint64_t row_count = 0;
   std::vector<ColumnChunkMeta> chunks;
+  IndexBlockMeta index_block;
 };
 
 struct FooterData {
   TableSchema schema;
   std::vector<RowGroupMeta> row_groups;
+  LayoutPolicy layout_policy;
+  bool has_phase_two_metadata = true;
+};
+
+struct StatisticsMeta {
+  uint32_t field_id = 0;
+  uint64_t null_count = 0;
+  std::shared_ptr<arrow::Scalar> min;
+  std::shared_ptr<arrow::Scalar> max;
+};
+
+struct BloomMeta {
+  uint32_t field_id = 0;
+  uint64_t bit_count = 0;
+  uint32_t hash_count = 0;
+  std::vector<uint8_t> bits;
+};
+
+struct SortKeyMeta {
+  uint32_t field_id = 0;
+  std::shared_ptr<arrow::Scalar> first;
+  std::shared_ptr<arrow::Scalar> last;
+};
+
+struct RowGroupIndex {
+  std::vector<StatisticsMeta> statistics;
+  std::vector<BloomMeta> blooms;
+  std::vector<SortKeyMeta> sort_keys;
 };
 
 struct FooterTrailer {
@@ -122,5 +160,9 @@ class ByteReader {
 
 [[nodiscard]] arrow::Result<std::vector<uint8_t>> SerializeFooter(const FooterData& footer);
 [[nodiscard]] arrow::Result<FooterData> ParseFooter(std::span<const uint8_t> bytes);
+[[nodiscard]] arrow::Result<std::vector<uint8_t>> SerializeIndexBlock(const TableSchema& schema,
+                                                                      const RowGroupIndex& index);
+[[nodiscard]] arrow::Result<RowGroupIndex> ParseIndexBlock(const TableSchema& schema,
+                                                           std::span<const uint8_t> bytes);
 
 }  // namespace sniffer::internal
