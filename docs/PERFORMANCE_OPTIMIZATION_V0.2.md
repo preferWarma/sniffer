@@ -83,7 +83,7 @@ v0.2 聚焦现有 Segment writer、reader、codec、scan 和文件 I/O 路径的
 - [x] FOR decode 使用 typed base/delta 和按字/批量 bit unpack，移除每值 `ScalarFromBits()`。
 - [ ] Plain selected decode 按物理类型直接 append，移除每个命中行的 `ParseScalar()` 和
       `AppendScalar()` 动态分派。
-- [ ] `RowsToDecode()` 的全量路径改为顺序迭代视图，避免构造 `[0..row_count)` 临时 vector。
+- [x] `RowsToDecode()` 的全量路径改为顺序迭代视图，避免构造 `[0..row_count)` 临时 vector。
 - [ ] 对每项 typed fast path 保留通用安全 fallback，并用 property tests 证明两条路径逐值一致。
 
 ## 5. P1：优化扫描执行
@@ -103,7 +103,7 @@ v0.2 聚焦现有 Segment writer、reader、codec、scan 和文件 I/O 路径的
 
 ## 6. P1：优化文件 I/O 与 checksum
 
-- [ ] Reader 生命周期内复用一个随机访问文件句柄。当前 `ReadRange()` 每次读取 chunk 都重新
+- [x] Reader 生命周期内复用一个随机访问文件句柄。当前 `ReadRange()` 每次读取 chunk 都重新
       打开文件并 seek，应改为有明确所有权的 `RandomAccessFile`/等价 RAII 抽象。
 - [ ] 合并相邻或距离很近的候选 chunk 读取，减少系统调用，同时保证未命中列块不会被读取。
 - [ ] 评估 Arrow buffer、pread 和 mmap 三种 backend；默认实现必须可移植，mmap 只能作为可选
@@ -287,3 +287,45 @@ warm/cold cache、reader 文件句柄复用以及 `bench/BENCHMARK_V2.md` 仍按
 | 端到端吞吐 | 4.767 M rows/s | 5.956 M rows/s | 约 +25% |
 
 文件仍为 675,943 字节，仍剪枝 6/13 Row Group、读取 14 个 ColumnChunk 和 184,036 字节。
+
+### 2026-09-16：Reader 持久化随机访问文件句柄
+
+- `SegmentReader::Open()` 只打开一次只读文件句柄；envelope、footer、索引、ColumnChunk、
+  `ReadAll()` 和文件 checksum 验证都通过同一个带边界检查的 `ReadAt()`/顺序 checksum 接口读取。
+- 文件句柄使用共享所有权，保证 scan iterator 可以安全地晚于 `SegmentReader` 销毁；底层 stream
+  使用互斥保护 seek/read 状态，多个 iterator 不会竞争同一个文件位置。
+- `ReaderMetrics::file_handles_opened` 提供可观测验证；测试覆盖 open、scan、ReadAll 和 checksum
+  验证全过程仅打开一个句柄。格式字节、checksum 语义、剪枝数量和 chunk 读取量均未改变。
+
+同机 Release、10 万行、8,192 行 Row Group、50% 选择率、11 次 P50：
+
+| 指标 | Before | After | 变化 |
+|---|---:|---:|---:|
+| 扫描总耗时 | 2.5044 ms | 2.0638 ms | -17.6% |
+| 扫描吞吐 | 39.930 M rows/s | 48.454 M rows/s | +21.3% |
+| envelope I/O | 0.1739 ms | 0.1305 ms | -24.9% |
+| index I/O | 0.1912 ms | 0.0665 ms | -65.2% |
+| chunk I/O | 0.2244 ms | 0.0607 ms | -73.0% |
+
+扫描 CV 从 10.65% 降至 8.47%，P95 从 3.1982 ms 降至 2.6335 ms；结果仍属于 warm-cache
+合成场景，后续完整矩阵需要把 cold-cache 和不同 Row Group 数量分开记录。Release 8/8 CTest、
+fuzz smoke 和 benchmark JSON smoke 均通过。
+
+### 2026-09-16：非 Plain 全量解码移除 row-id 临时数组
+
+- Dictionary、RLE 和 FOR + Bitpack 全量解码不再构造 `[0..row_count)` 的 `uint64_t` vector；
+  连续行与 selection 行使用分别实例化的顺序循环，selection 的严格递增和边界校验保持不变。
+- 10 万行每次全量解码减少约 0.76 MiB row-id 临时分配。新增测试覆盖 Dictionary、RLE、FOR
+  对重复、降序和越界 selection 的拒绝路径。
+- 第一版通用 visitor 导致 FOR 明显回退，已在提交前弃用；最终实现保留紧凑 typed 循环。
+
+同机 Release、10 万值、11 次 P50：
+
+| 解码场景 | Before | After | 吞吐变化 |
+|---|---:|---:|---:|
+| Dictionary string | 2.0998 ms / 515.96 MiB/s | 1.9987 ms / 542.05 MiB/s | +5.1% |
+| RLE int64 | 1.0138 ms / 752.56 MiB/s | 0.9974 ms / 764.92 MiB/s | +1.6% |
+| FOR + Bitpack int64 | 0.3886 ms / 1,993.85 MiB/s | 0.3925 ms / 1,973.96 MiB/s | -1.0% |
+
+FOR 的 1.0% 差异低于本轮运行波动，不作为稳定回退或提升结论；该小步的确定收益是消除与
+Row Group 行数线性增长的临时内存，同时保持 payload、输出数组和错误语义不变。

@@ -10,6 +10,7 @@
 #include <fstream>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <span>
 #include <string>
@@ -37,35 +38,89 @@ arrow::Status InvalidFormat(const std::string& detail) {
   return arrow::Status::Invalid("[sniffer.format.invalid] ", detail);
 }
 
-arrow::Result<std::vector<uint8_t>> ReadRange(const std::string& path, uint64_t file_size,
-                                              uint64_t offset, uint64_t length) {
-  ARROW_ASSIGN_OR_RAISE(const uint64_t end, internal::CheckedAdd(offset, length));
-  if (end > file_size) {
-    return arrow::Status::Invalid("[sniffer.format.bounds] read range exceeds file size");
-  }
-  if (offset > static_cast<uint64_t>(std::numeric_limits<std::streamoff>::max()) ||
-      length > static_cast<uint64_t>(std::numeric_limits<std::streamsize>::max()) ||
-      length > static_cast<uint64_t>(std::numeric_limits<size_t>::max())) {
-    return arrow::Status::Invalid("[sniffer.format.limit] read range exceeds platform limits");
+class RandomAccessFile {
+ public:
+  static arrow::Result<std::shared_ptr<RandomAccessFile>> Open(
+      std::string path, const std::shared_ptr<ReaderMetrics>& metrics) {
+    auto file = std::shared_ptr<RandomAccessFile>(new RandomAccessFile(std::move(path)));
+    file->stream_.open(file->path_, std::ios::binary | std::ios::ate);
+    if (!file->stream_.is_open()) {
+      return IoError("cannot open segment for reading", file->path_);
+    }
+    const std::streampos end_position = file->stream_.tellg();
+    if (end_position < 0) {
+      return IoError("cannot determine segment size", file->path_);
+    }
+    file->size_ = static_cast<uint64_t>(end_position);
+    if (metrics) {
+      ++metrics->file_handles_opened;
+    }
+    return file;
   }
 
-  std::ifstream stream(path, std::ios::binary);
-  if (!stream.is_open()) {
-    return IoError("cannot open segment for reading", path);
-  }
-  stream.seekg(static_cast<std::streamoff>(offset));
-  if (!stream) {
-    return IoError("cannot seek segment", path);
-  }
-  std::vector<uint8_t> bytes(static_cast<size_t>(length));
-  if (length != 0) {
-    stream.read(reinterpret_cast<char*>(bytes.data()), static_cast<std::streamsize>(length));
-    if (!stream) {
-      return IoError("cannot read segment range", path);
+  [[nodiscard]] uint64_t size() const { return size_; }
+
+  arrow::Result<std::vector<uint8_t>> ReadAt(uint64_t offset, uint64_t length) {
+    ARROW_ASSIGN_OR_RAISE(const uint64_t end, internal::CheckedAdd(offset, length));
+    if (end > size_) {
+      return arrow::Status::Invalid("[sniffer.format.bounds] read range exceeds file size");
     }
+    if (offset > static_cast<uint64_t>(std::numeric_limits<std::streamoff>::max()) ||
+        length > static_cast<uint64_t>(std::numeric_limits<std::streamsize>::max()) ||
+        length > static_cast<uint64_t>(std::numeric_limits<size_t>::max())) {
+      return arrow::Status::Invalid("[sniffer.format.limit] read range exceeds platform limits");
+    }
+
+    std::lock_guard<std::mutex> lock(mutex_);
+    stream_.clear();
+    stream_.seekg(static_cast<std::streamoff>(offset));
+    if (!stream_) {
+      return IoError("cannot seek segment", path_);
+    }
+    std::vector<uint8_t> bytes(static_cast<size_t>(length));
+    if (length != 0) {
+      stream_.read(reinterpret_cast<char*>(bytes.data()), static_cast<std::streamsize>(length));
+      if (!stream_) {
+        return IoError("cannot read segment range", path_);
+      }
+    }
+    return bytes;
   }
-  return bytes;
-}
+
+  arrow::Result<uint32_t> ChecksumPrefix(uint64_t length) {
+    if (length > size_) {
+      return arrow::Status::Invalid("[sniffer.format.bounds] checksum range exceeds file size");
+    }
+    std::lock_guard<std::mutex> lock(mutex_);
+    stream_.clear();
+    stream_.seekg(0);
+    if (!stream_) {
+      return IoError("cannot seek segment for checksum", path_);
+    }
+    uint64_t remaining = length;
+    uint32_t checksum = 0;
+    std::array<uint8_t, 64 * 1024> buffer{};
+    while (remaining != 0) {
+      const size_t to_read =
+          static_cast<size_t>(std::min<uint64_t>(remaining, static_cast<uint64_t>(buffer.size())));
+      stream_.read(reinterpret_cast<char*>(buffer.data()), static_cast<std::streamsize>(to_read));
+      if (!stream_) {
+        return IoError("cannot read segment for checksum", path_);
+      }
+      checksum = internal::Crc32c(std::span<const uint8_t>(buffer.data(), to_read), checksum);
+      remaining -= static_cast<uint64_t>(to_read);
+    }
+    return checksum;
+  }
+
+ private:
+  explicit RandomAccessFile(std::string path) : path_(std::move(path)) {}
+
+  std::string path_;
+  uint64_t size_ = 0;
+  std::ifstream stream_;
+  std::mutex mutex_;
+};
 
 bool IsValid(std::span<const uint8_t> validity, uint64_t index) {
   if (validity.empty()) {
@@ -874,11 +929,10 @@ arrow::Result<std::shared_ptr<arrow::Array>> DecodePlain(const FieldSpec& field,
 
 class ScanState {
  public:
-  ScanState(std::string path, uint64_t file_size, internal::FooterData footer,
+  ScanState(std::shared_ptr<RandomAccessFile> file, internal::FooterData footer,
             std::vector<internal::RowGroupIndex> indexes, IOPlan plan,
             std::shared_ptr<ScanMetrics> metrics, std::shared_ptr<arrow::Schema> output_schema)
-      : path_(std::move(path)),
-        file_size_(file_size),
+      : file_(std::move(file)),
         footer_(std::move(footer)),
         indexes_(std::move(indexes)),
         plan_(std::move(plan)),
@@ -1021,7 +1075,7 @@ class ScanState {
     std::vector<uint8_t> payload;
     {
       internal::NanosecondTimer timer(&metrics_->chunk_io_nanoseconds);
-      ARROW_ASSIGN_OR_RAISE(payload, ReadRange(path_, file_size_, chunk.offset, chunk.length));
+      ARROW_ASSIGN_OR_RAISE(payload, file_->ReadAt(chunk.offset, chunk.length));
     }
     ++metrics_->column_chunks_read;
     metrics_->chunk_bytes_read += chunk.length;
@@ -1128,8 +1182,7 @@ class ScanState {
     return true;
   }
 
-  std::string path_;
-  uint64_t file_size_;
+  std::shared_ptr<RandomAccessFile> file_;
   internal::FooterData footer_;
   std::vector<internal::RowGroupIndex> indexes_;
   IOPlan plan_;
@@ -1144,11 +1197,10 @@ class ScanState {
 
 class SegmentReader::Impl {
  public:
-  Impl(std::string path, uint64_t file_size, internal::FooterTrailer trailer,
+  Impl(std::shared_ptr<RandomAccessFile> file, internal::FooterTrailer trailer,
        internal::FooterData footer, std::vector<internal::RowGroupIndex> indexes,
        std::shared_ptr<ReaderMetrics> metrics)
-      : path_(std::move(path)),
-        file_size_(file_size),
+      : file_(std::move(file)),
         trailer_(trailer),
         footer_(std::move(footer)),
         indexes_(std::move(indexes)),
@@ -1230,8 +1282,8 @@ class SegmentReader::Impl {
       std::vector<uint8_t> bytes;
       {
         internal::NanosecondTimer timer(metrics_ ? &metrics_->index_io_nanoseconds : nullptr);
-        ARROW_ASSIGN_OR_RAISE(bytes, ReadRange(path_, file_size_, row_group.index_block.offset,
-                                               row_group.index_block.length));
+        ARROW_ASSIGN_OR_RAISE(
+            bytes, file_->ReadAt(row_group.index_block.offset, row_group.index_block.length));
       }
       {
         internal::NanosecondTimer timer(metrics_ ? &metrics_->index_checksum_nanoseconds : nullptr);
@@ -1305,7 +1357,7 @@ class SegmentReader::Impl {
       projected_fields.push_back(full_schema->field(static_cast<int>(field_index)));
     }
     auto output_schema = arrow::schema(std::move(projected_fields), full_schema->metadata());
-    auto state = std::make_shared<ScanState>(path_, file_size_, footer_, indexes_, std::move(plan),
+    auto state = std::make_shared<ScanState>(file_, footer_, indexes_, std::move(plan),
                                              std::move(metrics), std::move(output_schema));
     return arrow::MakeFunctionIterator(
         [state]() -> arrow::Result<std::shared_ptr<arrow::RecordBatch>> { return state->Next(); });
@@ -1320,8 +1372,7 @@ class SegmentReader::Impl {
       columns.reserve(row_group.chunks.size());
       for (size_t index = 0; index < row_group.chunks.size(); ++index) {
         const auto& chunk = row_group.chunks[index];
-        ARROW_ASSIGN_OR_RAISE(auto payload,
-                              ReadRange(path_, file_size_, chunk.offset, chunk.length));
+        ARROW_ASSIGN_OR_RAISE(auto payload, file_->ReadAt(chunk.offset, chunk.length));
         if (internal::Crc32c(payload) != chunk.checksum) {
           return arrow::Status::Invalid(
               "[sniffer.format.checksum] ColumnChunk CRC32C mismatch for field ", chunk.field_id);
@@ -1356,23 +1407,8 @@ class SegmentReader::Impl {
 
   arrow::Status VerifyFileChecksum() const {
     internal::NanosecondTimer timer(metrics_ ? &metrics_->file_checksum_nanoseconds : nullptr);
-    std::ifstream stream(path_, std::ios::binary);
-    if (!stream.is_open()) {
-      return IoError("cannot open segment for checksum", path_);
-    }
-    uint64_t remaining = trailer_.footer_offset + trailer_.footer_length;
-    uint32_t checksum = 0;
-    std::array<uint8_t, 64 * 1024> buffer{};
-    while (remaining != 0) {
-      const size_t to_read =
-          static_cast<size_t>(std::min<uint64_t>(remaining, static_cast<uint64_t>(buffer.size())));
-      stream.read(reinterpret_cast<char*>(buffer.data()), static_cast<std::streamsize>(to_read));
-      if (!stream) {
-        return IoError("cannot read segment for checksum", path_);
-      }
-      checksum = internal::Crc32c(std::span<const uint8_t>(buffer.data(), to_read), checksum);
-      remaining -= static_cast<uint64_t>(to_read);
-    }
+    ARROW_ASSIGN_OR_RAISE(const uint32_t checksum,
+                          file_->ChecksumPrefix(trailer_.footer_offset + trailer_.footer_length));
     if (checksum != trailer_.file_checksum) {
       return arrow::Status::Invalid("[sniffer.format.checksum] file CRC32C mismatch");
     }
@@ -1383,8 +1419,7 @@ class SegmentReader::Impl {
   uint64_t num_row_groups() const { return static_cast<uint64_t>(footer_.row_groups.size()); }
 
  private:
-  std::string path_;
-  uint64_t file_size_;
+  std::shared_ptr<RandomAccessFile> file_;
   internal::FooterTrailer trailer_;
   internal::FooterData footer_;
   std::vector<internal::RowGroupIndex> indexes_;
@@ -1396,31 +1431,23 @@ arrow::Result<std::unique_ptr<SegmentReader>> SegmentReader::Open(
   if (metrics) {
     *metrics = {};
   }
-  uint64_t file_size = 0;
+  std::shared_ptr<RandomAccessFile> file;
   {
     internal::NanosecondTimer timer(metrics ? &metrics->envelope_io_nanoseconds : nullptr);
-    std::ifstream stream(path, std::ios::binary | std::ios::ate);
-    if (!stream.is_open()) {
-      return IoError("cannot open segment for reading", path);
-    }
-    const std::streampos end_position = stream.tellg();
-    if (end_position < 0) {
-      return IoError("cannot determine segment size", path);
-    }
-    file_size = static_cast<uint64_t>(end_position);
-    if (file_size < internal::kHeaderSize + internal::kTrailerSize) {
-      return arrow::Status::Invalid("[sniffer.format.truncated] segment is smaller than envelope");
-    }
+    ARROW_ASSIGN_OR_RAISE(file, RandomAccessFile::Open(std::move(path), metrics));
+  }
+  const uint64_t file_size = file->size();
+  if (file_size < internal::kHeaderSize + internal::kTrailerSize) {
+    return arrow::Status::Invalid("[sniffer.format.truncated] segment is smaller than envelope");
   }
 
   std::vector<uint8_t> header;
   std::vector<uint8_t> trailer_bytes;
   {
     internal::NanosecondTimer timer(metrics ? &metrics->envelope_io_nanoseconds : nullptr);
-    ARROW_ASSIGN_OR_RAISE(header, ReadRange(path, file_size, 0, internal::kHeaderSize));
-    ARROW_ASSIGN_OR_RAISE(
-        trailer_bytes,
-        ReadRange(path, file_size, file_size - internal::kTrailerSize, internal::kTrailerSize));
+    ARROW_ASSIGN_OR_RAISE(header, file->ReadAt(0, internal::kHeaderSize));
+    ARROW_ASSIGN_OR_RAISE(trailer_bytes,
+                          file->ReadAt(file_size - internal::kTrailerSize, internal::kTrailerSize));
   }
   internal::FooterTrailer trailer;
   {
@@ -1437,8 +1464,7 @@ arrow::Result<std::unique_ptr<SegmentReader>> SegmentReader::Open(
   std::vector<uint8_t> footer_bytes;
   {
     internal::NanosecondTimer timer(metrics ? &metrics->envelope_io_nanoseconds : nullptr);
-    ARROW_ASSIGN_OR_RAISE(footer_bytes,
-                          ReadRange(path, file_size, trailer.footer_offset, trailer.footer_length));
+    ARROW_ASSIGN_OR_RAISE(footer_bytes, file->ReadAt(trailer.footer_offset, trailer.footer_length));
   }
   internal::FooterData footer;
   {
@@ -1448,7 +1474,7 @@ arrow::Result<std::unique_ptr<SegmentReader>> SegmentReader::Open(
     }
     ARROW_ASSIGN_OR_RAISE(footer, internal::ParseFooter(footer_bytes));
   }
-  auto impl = std::make_unique<Impl>(std::move(path), file_size, trailer, std::move(footer),
+  auto impl = std::make_unique<Impl>(std::move(file), trailer, std::move(footer),
                                      std::vector<internal::RowGroupIndex>{}, metrics);
   {
     internal::NanosecondTimer timer(metrics ? &metrics->directory_validation_nanoseconds : nullptr);

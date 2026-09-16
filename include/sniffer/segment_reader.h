@@ -14,6 +14,7 @@
 namespace sniffer {
 
 struct ReaderMetrics {
+  uint64_t file_handles_opened = 0;
   uint64_t envelope_io_nanoseconds = 0;
   uint64_t metadata_parse_nanoseconds = 0;
   uint64_t directory_validation_nanoseconds = 0;

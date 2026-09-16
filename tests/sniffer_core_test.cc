@@ -583,6 +583,36 @@ void TestTypedDictionaryMatchesScalarReference() {
   }
 }
 
+void TestNonPlainSelectionValidation() {
+  const sniffer::FieldSpec field{1, "value", arrow::int64(), true, nullptr};
+  const auto array =
+      BuildArray<arrow::Int64Builder, int64_t>({7, 7, std::nullopt, 9, 10, 10, 10, 12});
+  constexpr std::array<uint16_t, 3> kEncodings = {sniffer::internal::kDictionaryEncodingId,
+                                                  sniffer::internal::kRleEncodingId,
+                                                  sniffer::internal::kForBitpackEncodingId};
+  for (const uint16_t encoding : kEncodings) {
+    const auto payload = ValueOrThrow(sniffer::internal::EncodeNonPlain(encoding, field, *array),
+                                      "encode selection validation payload");
+    sniffer::internal::ColumnChunkMeta chunk;
+    chunk.field_id = field.field_id;
+    chunk.physical_type = sniffer::internal::PhysicalTypeId::kInt64;
+    chunk.encoding_id = encoding;
+    chunk.row_count = static_cast<uint64_t>(array->length());
+    chunk.null_count = static_cast<uint64_t>(array->null_count());
+    chunk.length = static_cast<uint64_t>(payload.size());
+
+    const std::vector<uint64_t> duplicate = {1, 1};
+    const std::vector<uint64_t> descending = {3, 2};
+    const std::vector<uint64_t> out_of_bounds = {0, chunk.row_count};
+    Expect(!sniffer::internal::DecodeNonPlain(field, chunk, payload, &duplicate).ok(),
+           "non-Plain decode rejects duplicate selection rows");
+    Expect(!sniffer::internal::DecodeNonPlain(field, chunk, payload, &descending).ok(),
+           "non-Plain decode rejects descending selection rows");
+    Expect(!sniffer::internal::DecodeNonPlain(field, chunk, payload, &out_of_bounds).ok(),
+           "non-Plain decode rejects out-of-bounds selection rows");
+  }
+}
+
 void WriteSegment(const std::filesystem::path& path, const sniffer::TableSchema& schema,
                   const std::vector<std::shared_ptr<arrow::RecordBatch>>& batches,
                   uint32_t row_group_rows = 64 * 1024) {
@@ -1331,7 +1361,8 @@ void TestOptionalPhaseMetrics() {
   Expect(reader_metrics->metadata_parse_nanoseconds != std::numeric_limits<uint64_t>::max() &&
              reader_metrics->envelope_io_nanoseconds + reader_metrics->metadata_parse_nanoseconds +
                      reader_metrics->index_parse_nanoseconds >
-                 0,
+                 0 &&
+             reader_metrics->file_handles_opened == 1,
          "optional reader metrics reset and record open timings");
 
   sniffer::IOPlan plan;
@@ -1346,6 +1377,10 @@ void TestOptionalPhaseMetrics() {
                                      scan_metrics->chunk_io_nanoseconds >
                                  0,
          "scan metrics record execution phase timings");
+  const auto all_batches = ValueOrThrow(reader->ReadAll(), "read all with retained file handle");
+  RequireOk(reader->VerifyFileChecksum(), "verify with retained file handle");
+  Expect(!all_batches.empty() && reader_metrics->file_handles_opened == 1,
+         "reader reuses one file handle across open, scan, read-all, and checksum verification");
 }
 
 void TestSequentialFallbackAndPlanValidation() {
@@ -1959,6 +1994,7 @@ int main() {
       {"typed_array_hash_matches_scalar_reference", TestTypedArrayHashMatchesScalarReference},
       {"plain_variable_bulk_copy_matches_reference", TestPlainVariableBulkCopyMatchesReference},
       {"typed_dictionary_matches_scalar_reference", TestTypedDictionaryMatchesScalarReference},
+      {"non_plain_selection_validation", TestNonPlainSelectionValidation},
       {"forced_rle_round_trip_and_scan", TestForcedRleRoundTripAndScan},
       {"typed_rle_matches_scalar_reference", TestTypedRleMatchesScalarReference},
       {"forced_for_bitpack_round_trip_and_scan", TestForcedForBitpackRoundTripAndScan},
