@@ -764,11 +764,37 @@ struct ResolvedScanPlan {
   std::vector<size_t> projection_field_indices;
   std::vector<size_t> predicate_field_indices;
   std::vector<PredicateEvaluator> predicate_evaluators;
+  std::vector<size_t> predicate_evaluation_order;
   std::vector<size_t> sort_key_field_indices;
 };
 
 arrow::Result<ResolvedScanPlan::PredicateEvaluator> ResolvePredicateEvaluator(
     const FieldSpec& field, Predicate::Op op);
+
+std::pair<uint8_t, uint8_t> PredicatePriority(const FieldSpec& field, Predicate::Op op) {
+  uint8_t selectivity_rank = 0;
+  switch (op) {
+    case Predicate::Op::kEq:
+    case Predicate::Op::kIsNull:
+      selectivity_rank = 0;
+      break;
+    case Predicate::Op::kLt:
+    case Predicate::Op::kLe:
+    case Predicate::Op::kGt:
+    case Predicate::Op::kGe:
+      selectivity_rank = 1;
+      break;
+    case Predicate::Op::kNe:
+      selectivity_rank = 2;
+      break;
+    case Predicate::Op::kIsNotNull:
+      selectivity_rank = 3;
+      break;
+  }
+  const uint8_t cost_rank =
+      field.type->id() == arrow::Type::STRING || field.type->id() == arrow::Type::BINARY ? 1 : 0;
+  return {selectivity_rank, cost_rank};
+}
 
 arrow::Result<ResolvedScanPlan> ValidatePlan(const internal::FooterData& footer,
                                              const IOPlan& plan) {
@@ -806,6 +832,21 @@ arrow::Result<ResolvedScanPlan> ValidatePlan(const internal::FooterData& footer,
         auto evaluator, ResolvePredicateEvaluator(footer.schema.fields[field_index], predicate.op));
     resolved.predicate_evaluators.push_back(evaluator);
   }
+  resolved.predicate_evaluation_order.reserve(plan.conjunctive_predicates.size());
+  for (size_t position = 0; position < plan.conjunctive_predicates.size(); ++position) {
+    resolved.predicate_evaluation_order.push_back(position);
+  }
+  std::stable_sort(
+      resolved.predicate_evaluation_order.begin(), resolved.predicate_evaluation_order.end(),
+      [&footer, &plan, &resolved](size_t left, size_t right) {
+        const auto left_priority =
+            PredicatePriority(footer.schema.fields[resolved.predicate_field_indices[left]],
+                              plan.conjunctive_predicates[left].op);
+        const auto right_priority =
+            PredicatePriority(footer.schema.fields[resolved.predicate_field_indices[right]],
+                              plan.conjunctive_predicates[right].op);
+        return left_priority < right_priority;
+      });
   if (!plan.sort_key_range) {
     return resolved;
   }
@@ -1212,11 +1253,17 @@ class ScanState {
         internal::NanosecondTimer timer(&metrics_->predicate_nanoseconds);
         selection.reserve(
             static_cast<size_t>(std::min<uint64_t>(row_group.row_count, remaining_limit)));
+        const bool reorder_predicates = plan_.conjunctive_predicates.size() > 1;
         for (uint64_t row = 0;
              row < row_group.row_count && static_cast<uint64_t>(selection.size()) < remaining_limit;
              ++row) {
-          ARROW_ASSIGN_OR_RAISE(const bool matches,
-                                RowMatches(row, predicate_columns, sort_key_columns));
+          bool matches = false;
+          if (reorder_predicates) {
+            ARROW_ASSIGN_OR_RAISE(matches,
+                                  RowMatchesReordered(row, predicate_columns, sort_key_columns));
+          } else {
+            ARROW_ASSIGN_OR_RAISE(matches, RowMatches(row, predicate_columns, sort_key_columns));
+          }
           if (matches) {
             selection.push_back(row);
           }
@@ -1327,6 +1374,41 @@ class ScanState {
       return SortRangePrunes(footer_, index, *plan_.sort_key_range);
     }
     return false;
+  }
+
+  arrow::Result<bool> RowMatchesReordered(
+      uint64_t row, const std::vector<const arrow::Array*>& predicate_columns,
+      const std::vector<const arrow::Array*>& sort_key_columns) const {
+    for (const size_t position : resolved_plan_.predicate_evaluation_order) {
+      const auto& predicate = plan_.conjunctive_predicates[position];
+      const auto evaluator = resolved_plan_.predicate_evaluators[position];
+      if (!evaluator(*predicate_columns[position], row, predicate)) {
+        return false;
+      }
+    }
+    if (!plan_.sort_key_range) {
+      return true;
+    }
+    std::vector<std::shared_ptr<arrow::Scalar>> key;
+    key.reserve(sort_key_columns.size());
+    for (const auto* column : sort_key_columns) {
+      ARROW_ASSIGN_OR_RAISE(auto value, column->GetScalar(static_cast<int64_t>(row)));
+      key.push_back(std::move(value));
+    }
+    const auto& range = *plan_.sort_key_range;
+    if (range.lower) {
+      ARROW_ASSIGN_OR_RAISE(const int order, CompareKeyVectors(key, *range.lower));
+      if (order < 0 || (order == 0 && !range.lower_inclusive)) {
+        return false;
+      }
+    }
+    if (range.upper) {
+      ARROW_ASSIGN_OR_RAISE(const int order, CompareKeyVectors(key, *range.upper));
+      if (order > 0 || (order == 0 && !range.upper_inclusive)) {
+        return false;
+      }
+    }
+    return true;
   }
 
   arrow::Result<bool> RowMatches(uint64_t row,

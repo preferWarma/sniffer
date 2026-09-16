@@ -94,7 +94,7 @@ v0.2 聚焦现有 Segment writer、reader、codec、scan 和文件 I/O 路径的
       `GetScalar()`、虚调用和临时对象。
 - [x] 在计划校验时为 predicate 绑定 typed evaluator，并按 predicate 顺序对齐已解码列指针；
       逐行判断不再执行类型 switch 或 `unordered_map` 查找。
-- [ ] 将多个 AND predicate 融合到同一次 selection 构建，优先执行成本低、选择性高的谓词。
+- [x] 将多个 AND predicate 融合到同一次 selection 构建，优先执行成本低、选择性高的谓词。
 - [ ] 比较 index vector、bitmap 和连续 range 表示在 1%/10%/50%/100% 选择率下的成本，使用
       确定性阈值选择表示。
 - [x] projection 与 predicate 是同一列时，直接从已解码列构造输出，提供 typed take/filter 路径。
@@ -162,6 +162,29 @@ v0.2 聚焦现有 Segment writer、reader、codec、scan 和文件 I/O 路径的
 - [ ] 更新 README 的性能状态，不把合成 benchmark 结果表述为通用生产性能。
 
 ## 11. 执行记录
+
+### 2026-09-17：确定性 AND predicate 执行顺序
+
+- 多 predicate 计划在校验阶段生成独立执行序：`EQ/IS NULL` 优先，其次范围比较、`NE`、
+  `IS NOT NULL`；同一选择性等级中 fixed-width 先于 string/binary，完全相同时保留用户原始顺序。
+  该规则只改变 AND 短路顺序，不改变公共 `IOPlan`、输出行序、null/NaN 语义或落盘格式。
+- 0/1 predicate 保留原直接循环 fast path，多 predicate 才读取重排数组。曾尝试增加逐值求值计数，
+  同机 A/B 发现它会拖慢单 predicate 热路径，因此在最终实现中移除，没有为可观测性接受性能回退。
+- GTest 使用低选择性 predicate 在前的输入计划，验证混合 int64/string/nullable 字段仍输出同一结果，
+  并重复执行确认计划结果确定；全类型、全部比较操作、null、NaN、Bloom 与 sort-key 测试继续通过。
+
+同一时段分别构建父提交 `03e40ac` 与当前工作树，Release、10 万行、Row Group 4,096、21 次 P50：
+
+| 场景 | 指标 | Before | After | 变化 |
+|---|---|---:|---:|---:|
+| 三 predicate | predicate 阶段 | 0.4223 ms | 0.3476 ms | -17.7% |
+| 三 predicate | scan | 2.7888 ms | 2.6523 ms | -4.9% |
+| 单 predicate | predicate 阶段 | 0.1786 ms | 0.1822 ms | +2.0% |
+| 单 predicate | scan | 1.9279 ms | 1.9701 ms | +2.2% |
+
+单 predicate 差异处于当轮系统波动范围，不作为稳定回退；三 predicate 的 Row Group 剪枝数、
+ColumnChunk 读取数和读取字节保持不变。启发式不是数据分布统计模型，后续 cost model 仍需在完整
+选择率矩阵中校准。
 
 ### 2026-09-17：预绑定 typed predicate evaluator
 

@@ -1271,29 +1271,34 @@ TEST(SnifferCoreTest, IOPlanProjectionPredicatesLimitAndBatching) {
       << "predicate and projection chunks follow separate decode paths";
 }
 
-TEST(SnifferCoreTest, ResolvedPlanPreservesRepeatedPredicateAndProjectionOrder) {
+TEST(SnifferCoreTest, PredicateExecutionOrderIsDeterministic) {
   const auto data = MakeScanBatch();
   TempFile file("scan_resolved_plan.seg");
-  WriteSegmentWithPolicy(file.path(), data.table_schema, {data.batch}, ScanLayout());
+  WriteSegment(file.path(), data.table_schema, {data.batch}, 30);
   auto reader =
       ValueOrThrow(sniffer::SegmentReader::Open(file.path().string()), "open resolved-plan file");
 
   sniffer::IOPlan plan;
   plan.projection_field_ids = {4, 1};
   plan.conjunctive_predicates = {
+      {3, sniffer::Predicate::Op::kIsNotNull, nullptr},
       {1, sniffer::Predicate::Op::kGe, std::make_shared<arrow::Int64Scalar>(8)},
       {2, sniffer::Predicate::Op::kEq, std::make_shared<arrow::StringScalar>("even")},
-      {1, sniffer::Predicate::Op::kLt, std::make_shared<arrow::Int64Scalar>(15)},
-      {3, sniffer::Predicate::Op::kGe, std::make_shared<arrow::Int32Scalar>(80)}};
+      {1, sniffer::Predicate::Op::kLt, std::make_shared<arrow::Int64Scalar>(15)}};
   plan.output_batch_rows = 2;
-  const auto batches =
-      CollectScan(ValueOrThrow(reader->Scan(plan), "scan with pre-resolved field indices"));
+  auto metrics = std::make_shared<sniffer::ScanMetrics>();
+  const auto batches = CollectScan(
+      ValueOrThrow(reader->Scan(plan, metrics), "scan with deterministic predicate order"));
 
   EXPECT_TRUE(CollectInt64Column(batches, 1) == std::vector<int64_t>({8, 10}))
       << "compiled predicates retain field alignment and null comparison semantics";
   EXPECT_TRUE(!batches.empty() && batches.front()->schema()->field(0)->name() == "payload" &&
               batches.front()->schema()->field(1)->name() == "key")
       << "pre-resolved projection indices retain caller order";
+  const auto repeated =
+      CollectScan(ValueOrThrow(reader->Scan(plan, metrics), "repeat deterministic predicate scan"));
+  EXPECT_TRUE(CollectInt64Column(repeated, 1) == std::vector<int64_t>({8, 10}))
+      << "predicate planning is deterministic across scans";
 }
 
 TEST(SnifferCoreTest, BloomPrunesWithoutChunkReads) {
