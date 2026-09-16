@@ -49,9 +49,9 @@ v0.2 聚焦现有 Segment writer、reader、codec、scan 和文件 I/O 路径的
 - [x] 增加机器可读 JSON 结果格式，记录 commit、编译器、Arrow 版本、构建参数和运行命令。
 - [x] 将文件级 benchmark 与纯内存 codec microbenchmark 分开；后者分别测 Plain、Dictionary、
       RLE、FOR + Bitpack 的 encode/decode，不包含文件打开、footer、index 和 checksum。
-- [ ] 增加 writer 分阶段计时：编码选择、Plain/非 Plain 编码、索引构建、checksum、文件写入、
+- [x] 增加 writer 分阶段计时：编码选择、Plain/非 Plain 编码、索引构建、checksum、文件写入、
       footer/trailer。
-- [ ] 增加 reader 分阶段计时：Open/全文件校验、索引解析、chunk I/O、chunk checksum、解码、
+- [x] 增加 reader 分阶段计时：Open/全文件校验、索引解析、chunk I/O、chunk checksum、解码、
       谓词、selection materialization、RecordBatch 拼接。
 - [ ] 使用 Instruments 或等价 profiler 保存 CPU flamegraph 摘要和 allocation hot spots；先证明
       热点，再修改实现。
@@ -90,12 +90,12 @@ v0.2 聚焦现有 Segment writer、reader、codec、scan 和文件 I/O 路径的
 
 - [ ] 在计划校验时一次性把 `field_id` 解析为列下标，避免 predicate、projection 和逐行判断中
       重复线性调用 `FindFieldIndex()`。
-- [ ] 为各基础类型实现 typed predicate kernel，直接读取 Arrow values/validity；避免逐行
+- [x] 为各基础类型实现 typed predicate kernel，直接读取 Arrow values/validity；避免逐行
       `GetScalar()`、虚调用和临时对象。
 - [ ] 将多个 AND predicate 融合到同一次 selection 构建，优先执行成本低、选择性高的谓词。
 - [ ] 比较 index vector、bitmap 和连续 range 表示在 1%/10%/50%/100% 选择率下的成本，使用
       确定性阈值选择表示。
-- [ ] projection 与 predicate 是同一列时，直接从已解码列构造输出，提供 typed take/filter 路径。
+- [x] projection 与 predicate 是同一列时，直接从已解码列构造输出，提供 typed take/filter 路径。
 - [ ] 减少跨 Row Group 输出时的 `ConcatenateRecordBatches()` 拷贝；优先返回合法 slice，只有确实
       需要单个连续 batch 时才合并。
 - [ ] 针对 `limit` 做早停，确保不解码超过最后命中行所需的 projection 数据。
@@ -260,3 +260,30 @@ Group 都有 chunk/index 元数据和 checksum；该场景本身不可字典化�
 随机 property/fuzz smoke、三个 benchmark 文本 smoke 和三个 JSON schema smoke。`clang-format` 与
 `git diff --check` 通过。v0.2 尚未完成：分阶段计时、RSS/allocation、完整 Row Group/选择率/宽表矩阵、
 warm/cold cache、reader 文件句柄复用以及 `bench/BENCHMARK_V2.md` 仍按第 3、5、6、10 节继续推进。
+
+### 2026-09-16：分阶段计时与 typed scan kernel
+
+- `SegmentWriter::Open()` 和 `SegmentReader::Open()` 增加可选 metrics；不传 metrics 时计时器不读取
+  时钟。`ScanMetrics` 增加扫描阶段耗时，原有剪枝、chunk 数和读取字节计数保持兼容。
+- performance benchmark 对每个阶段记录 11 轮原始样本及 min/P50/P95/CV，JSON smoke 同时校验
+  `phase_stats`。writer 覆盖校验、索引、编码选择、编码、checksum、文件写入、footer；reader 覆盖
+  envelope/index、剪枝、chunk I/O/checksum、解码、谓词、投影及 batch materialization。
+- 第一轮 profile 显示 writer P50 主要为编码 7.9038 ms、checksum 2.5296 ms、索引 2.2205 ms；
+  reader 的谓词为 2.1866 ms、已解码列投影为 1.9985 ms，而 chunk I/O 仅 0.2033 ms。因此下一项
+  选择 typed predicate/projection，而未优先改造文件句柄。
+- predicate 现在对全部首期平铺类型直接读取 Arrow typed value；string/binary 使用无分配字节比较，
+  float/double 保留 NaN 和 signed-zero 语义。谓词列同时参与 projection 时通过 typed builder 选择，
+  不再逐行 `GetScalar()`/`AppendScalar()`。
+- 新增全部 14 种首期类型的 equality、null projection reference test，并覆盖 NaN `!=` 语义和可选
+  metrics 的 reset/累加行为。
+
+同机 Release、10 万行、8,192 行 Row Group、11 次 P50：
+
+| 指标 | typed scan 前 | typed scan 后 | 变化 |
+|---|---:|---:|---:|
+| 扫描总耗时 / 吞吐 | 6.1711 ms / 16.205 M rows/s | 2.3491 ms / 42.570 M rows/s | 吞吐约 2.63x |
+| predicate 阶段 | 2.1866 ms | 0.2801 ms | 约 -87% |
+| projection 阶段 | 1.9985 ms | 0.1171 ms | 约 -94% |
+| 端到端吞吐 | 4.767 M rows/s | 5.956 M rows/s | 约 +25% |
+
+文件仍为 675,943 字节，仍剪枝 6/13 Row Group、读取 14 个 ColumnChunk 和 184,036 字节。

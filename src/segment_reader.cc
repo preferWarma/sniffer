@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <deque>
@@ -12,6 +13,8 @@
 #include <optional>
 #include <span>
 #include <string>
+#include <string_view>
+#include <type_traits>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -20,6 +23,7 @@
 #include "codec_internal.h"
 #include "format_internal.h"
 #include "index_internal.h"
+#include "metrics_internal.h"
 #include "scalar_internal.h"
 
 namespace sniffer {
@@ -325,23 +329,116 @@ arrow::Result<std::shared_ptr<arrow::Array>> DecodePlainImpl(const FieldSpec& fi
   return arrow::Status::NotImplemented("[sniffer.format.type] unknown physical type");
 }
 
-arrow::Result<std::shared_ptr<arrow::Array>> SelectArray(
-    const std::shared_ptr<arrow::Array>& source, const std::vector<uint64_t>& selection) {
-  ARROW_ASSIGN_OR_RAISE(auto builder, arrow::MakeBuilder(source->type()));
+template <typename ArrayType, typename BuilderType>
+arrow::Result<std::shared_ptr<arrow::Array>> SelectPrimitiveValues(
+    const arrow::Array& untyped, const std::vector<uint64_t>& selection, BuilderType* builder) {
   if (selection.size() > static_cast<size_t>(std::numeric_limits<int64_t>::max())) {
     return arrow::Status::Invalid("[sniffer.scan.limit] selection exceeds Arrow limit");
   }
+  const auto& source = static_cast<const ArrayType&>(untyped);
   ARROW_RETURN_NOT_OK(builder->Reserve(static_cast<int64_t>(selection.size())));
   for (const uint64_t row : selection) {
-    if (row >= static_cast<uint64_t>(source->length())) {
+    if (row >= static_cast<uint64_t>(source.length())) {
       return InvalidFormat("selection row exceeds source array");
     }
-    ARROW_ASSIGN_OR_RAISE(auto scalar, source->GetScalar(static_cast<int64_t>(row)));
-    ARROW_RETURN_NOT_OK(builder->AppendScalar(*scalar));
+    if (source.IsNull(static_cast<int64_t>(row))) {
+      ARROW_RETURN_NOT_OK(builder->AppendNull());
+    } else {
+      ARROW_RETURN_NOT_OK(builder->Append(source.Value(static_cast<int64_t>(row))));
+    }
   }
   std::shared_ptr<arrow::Array> result;
   ARROW_RETURN_NOT_OK(builder->Finish(&result));
   return result;
+}
+
+template <typename ArrayType, typename BuilderType>
+arrow::Result<std::shared_ptr<arrow::Array>> SelectBinaryValues(
+    const arrow::Array& untyped, const std::vector<uint64_t>& selection, BuilderType* builder) {
+  if (selection.size() > static_cast<size_t>(std::numeric_limits<int64_t>::max())) {
+    return arrow::Status::Invalid("[sniffer.scan.limit] selection exceeds Arrow limit");
+  }
+  const auto& source = static_cast<const ArrayType&>(untyped);
+  ARROW_RETURN_NOT_OK(builder->Reserve(static_cast<int64_t>(selection.size())));
+  for (const uint64_t row : selection) {
+    if (row >= static_cast<uint64_t>(source.length())) {
+      return InvalidFormat("selection row exceeds source array");
+    }
+    if (source.IsNull(static_cast<int64_t>(row))) {
+      ARROW_RETURN_NOT_OK(builder->AppendNull());
+    } else {
+      ARROW_RETURN_NOT_OK(builder->Append(source.GetView(static_cast<int64_t>(row))));
+    }
+  }
+  std::shared_ptr<arrow::Array> result;
+  ARROW_RETURN_NOT_OK(builder->Finish(&result));
+  return result;
+}
+
+arrow::Result<std::shared_ptr<arrow::Array>> SelectArray(
+    const std::shared_ptr<arrow::Array>& source, const std::vector<uint64_t>& selection) {
+  switch (source->type_id()) {
+    case arrow::Type::BOOL: {
+      arrow::BooleanBuilder builder;
+      return SelectPrimitiveValues<arrow::BooleanArray>(*source, selection, &builder);
+    }
+    case arrow::Type::INT8: {
+      arrow::Int8Builder builder;
+      return SelectPrimitiveValues<arrow::Int8Array>(*source, selection, &builder);
+    }
+    case arrow::Type::INT16: {
+      arrow::Int16Builder builder;
+      return SelectPrimitiveValues<arrow::Int16Array>(*source, selection, &builder);
+    }
+    case arrow::Type::INT32: {
+      arrow::Int32Builder builder;
+      return SelectPrimitiveValues<arrow::Int32Array>(*source, selection, &builder);
+    }
+    case arrow::Type::INT64: {
+      arrow::Int64Builder builder;
+      return SelectPrimitiveValues<arrow::Int64Array>(*source, selection, &builder);
+    }
+    case arrow::Type::UINT8: {
+      arrow::UInt8Builder builder;
+      return SelectPrimitiveValues<arrow::UInt8Array>(*source, selection, &builder);
+    }
+    case arrow::Type::UINT16: {
+      arrow::UInt16Builder builder;
+      return SelectPrimitiveValues<arrow::UInt16Array>(*source, selection, &builder);
+    }
+    case arrow::Type::UINT32: {
+      arrow::UInt32Builder builder;
+      return SelectPrimitiveValues<arrow::UInt32Array>(*source, selection, &builder);
+    }
+    case arrow::Type::UINT64: {
+      arrow::UInt64Builder builder;
+      return SelectPrimitiveValues<arrow::UInt64Array>(*source, selection, &builder);
+    }
+    case arrow::Type::FLOAT: {
+      arrow::FloatBuilder builder;
+      return SelectPrimitiveValues<arrow::FloatArray>(*source, selection, &builder);
+    }
+    case arrow::Type::DOUBLE: {
+      arrow::DoubleBuilder builder;
+      return SelectPrimitiveValues<arrow::DoubleArray>(*source, selection, &builder);
+    }
+    case arrow::Type::TIMESTAMP: {
+      arrow::TimestampBuilder builder(
+          std::static_pointer_cast<arrow::TimestampType>(source->type()),
+          arrow::default_memory_pool());
+      return SelectPrimitiveValues<arrow::TimestampArray>(*source, selection, &builder);
+    }
+    case arrow::Type::STRING: {
+      arrow::StringBuilder builder;
+      return SelectBinaryValues<arrow::StringArray>(*source, selection, &builder);
+    }
+    case arrow::Type::BINARY: {
+      arrow::BinaryBuilder builder;
+      return SelectBinaryValues<arrow::BinaryArray>(*source, selection, &builder);
+    }
+    default:
+      return arrow::Status::NotImplemented("[sniffer.scan.type] unsupported projection type");
+  }
 }
 
 arrow::Result<std::shared_ptr<arrow::Array>> DecodePlainSelected(
@@ -544,6 +641,45 @@ bool EvaluateOrderedResult(int order, Predicate::Op op) {
   return false;
 }
 
+template <typename ArrayType, typename ScalarType>
+arrow::Result<bool> EvaluatePrimitivePredicate(const arrow::Array& untyped, uint64_t row,
+                                               const Predicate& predicate) {
+  const auto& array = static_cast<const ArrayType&>(untyped);
+  const auto left = array.Value(static_cast<int64_t>(row));
+  const auto right = static_cast<const ScalarType&>(*predicate.value).value;
+  if constexpr (std::is_floating_point_v<decltype(left)>) {
+    if (std::isnan(left) || std::isnan(right)) {
+      return predicate.op == Predicate::Op::kNe;
+    }
+  }
+  const int order = left < right ? -1 : (left > right ? 1 : 0);
+  return EvaluateOrderedResult(order, predicate.op);
+}
+
+int CompareBinaryViews(std::string_view left, std::string_view right) {
+  const size_t common_size = std::min(left.size(), right.size());
+  for (size_t index = 0; index < common_size; ++index) {
+    const auto left_byte = static_cast<uint8_t>(left[index]);
+    const auto right_byte = static_cast<uint8_t>(right[index]);
+    if (left_byte < right_byte) {
+      return -1;
+    }
+    if (left_byte > right_byte) {
+      return 1;
+    }
+  }
+  return left.size() < right.size() ? -1 : (left.size() > right.size() ? 1 : 0);
+}
+
+template <typename ArrayType>
+arrow::Result<bool> EvaluateBinaryPredicate(const arrow::Array& untyped, uint64_t row,
+                                            const Predicate& predicate) {
+  const auto& array = static_cast<const ArrayType&>(untyped);
+  const auto left = array.GetView(static_cast<int64_t>(row));
+  const auto right = static_cast<const arrow::BaseBinaryScalar&>(*predicate.value).view();
+  return EvaluateOrderedResult(CompareBinaryViews(left, right), predicate.op);
+}
+
 arrow::Result<bool> EvaluatePredicate(const arrow::Array& array, uint64_t row,
                                       const Predicate& predicate) {
   const bool is_null = array.IsNull(static_cast<int64_t>(row));
@@ -556,12 +692,49 @@ arrow::Result<bool> EvaluatePredicate(const arrow::Array& array, uint64_t row,
   if (is_null) {
     return false;
   }
-  ARROW_ASSIGN_OR_RAISE(auto value, array.GetScalar(static_cast<int64_t>(row)));
-  if (internal::ScalarHasNaN(*value) || internal::ScalarHasNaN(*predicate.value)) {
-    return predicate.op == Predicate::Op::kNe;
+  switch (array.type_id()) {
+    case arrow::Type::BOOL:
+      return EvaluatePrimitivePredicate<arrow::BooleanArray, arrow::BooleanScalar>(array, row,
+                                                                                   predicate);
+    case arrow::Type::INT8:
+      return EvaluatePrimitivePredicate<arrow::Int8Array, arrow::Int8Scalar>(array, row, predicate);
+    case arrow::Type::INT16:
+      return EvaluatePrimitivePredicate<arrow::Int16Array, arrow::Int16Scalar>(array, row,
+                                                                               predicate);
+    case arrow::Type::INT32:
+      return EvaluatePrimitivePredicate<arrow::Int32Array, arrow::Int32Scalar>(array, row,
+                                                                               predicate);
+    case arrow::Type::INT64:
+      return EvaluatePrimitivePredicate<arrow::Int64Array, arrow::Int64Scalar>(array, row,
+                                                                               predicate);
+    case arrow::Type::UINT8:
+      return EvaluatePrimitivePredicate<arrow::UInt8Array, arrow::UInt8Scalar>(array, row,
+                                                                               predicate);
+    case arrow::Type::UINT16:
+      return EvaluatePrimitivePredicate<arrow::UInt16Array, arrow::UInt16Scalar>(array, row,
+                                                                                 predicate);
+    case arrow::Type::UINT32:
+      return EvaluatePrimitivePredicate<arrow::UInt32Array, arrow::UInt32Scalar>(array, row,
+                                                                                 predicate);
+    case arrow::Type::UINT64:
+      return EvaluatePrimitivePredicate<arrow::UInt64Array, arrow::UInt64Scalar>(array, row,
+                                                                                 predicate);
+    case arrow::Type::FLOAT:
+      return EvaluatePrimitivePredicate<arrow::FloatArray, arrow::FloatScalar>(array, row,
+                                                                               predicate);
+    case arrow::Type::DOUBLE:
+      return EvaluatePrimitivePredicate<arrow::DoubleArray, arrow::DoubleScalar>(array, row,
+                                                                                 predicate);
+    case arrow::Type::TIMESTAMP:
+      return EvaluatePrimitivePredicate<arrow::TimestampArray, arrow::TimestampScalar>(array, row,
+                                                                                       predicate);
+    case arrow::Type::STRING:
+      return EvaluateBinaryPredicate<arrow::StringArray>(array, row, predicate);
+    case arrow::Type::BINARY:
+      return EvaluateBinaryPredicate<arrow::BinaryArray>(array, row, predicate);
+    default:
+      return arrow::Status::NotImplemented("[sniffer.scan.type] unsupported predicate type");
   }
-  ARROW_ASSIGN_OR_RAISE(const int order, internal::CompareScalars(*value, *predicate.value));
-  return EvaluateOrderedResult(order, predicate.op);
 }
 
 const internal::StatisticsMeta* FindStatistics(const internal::RowGroupIndex& index,
@@ -756,6 +929,7 @@ class ScanState {
     if (pieces.size() == 1) {
       return pieces.front();
     }
+    internal::NanosecondTimer timer(&metrics_->batch_materialization_nanoseconds);
     return arrow::ConcatenateRecordBatches(pieces);
   }
 
@@ -767,7 +941,11 @@ class ScanState {
       const auto& row_group = footer_.row_groups[row_group_index];
       const auto& index = indexes_[row_group_index];
       ++metrics_->row_groups_considered;
-      ARROW_ASSIGN_OR_RAISE(const bool pruned, IsPruned(row_group, index));
+      bool pruned = false;
+      {
+        internal::NanosecondTimer timer(&metrics_->pruning_nanoseconds);
+        ARROW_ASSIGN_OR_RAISE(pruned, IsPruned(row_group, index));
+      }
       if (pruned) {
         ++metrics_->row_groups_pruned;
         continue;
@@ -793,14 +971,17 @@ class ScanState {
       }
 
       std::vector<uint64_t> selection;
-      selection.reserve(
-          static_cast<size_t>(std::min<uint64_t>(row_group.row_count, remaining_limit)));
-      for (uint64_t row = 0;
-           row < row_group.row_count && static_cast<uint64_t>(selection.size()) < remaining_limit;
-           ++row) {
-        ARROW_ASSIGN_OR_RAISE(const bool matches, RowMatches(row, filter_columns));
-        if (matches) {
-          selection.push_back(row);
+      {
+        internal::NanosecondTimer timer(&metrics_->predicate_nanoseconds);
+        selection.reserve(
+            static_cast<size_t>(std::min<uint64_t>(row_group.row_count, remaining_limit)));
+        for (uint64_t row = 0;
+             row < row_group.row_count && static_cast<uint64_t>(selection.size()) < remaining_limit;
+             ++row) {
+          ARROW_ASSIGN_OR_RAISE(const bool matches, RowMatches(row, filter_columns));
+          if (matches) {
+            selection.push_back(row);
+          }
         }
       }
       if (selection.empty()) {
@@ -813,7 +994,11 @@ class ScanState {
         ARROW_ASSIGN_OR_RAISE(const size_t field_index, FindFieldIndex(footer_.schema, field_id));
         const auto decoded = filter_columns.find(field_index);
         if (decoded != filter_columns.end()) {
-          ARROW_ASSIGN_OR_RAISE(auto selected, SelectArray(decoded->second, selection));
+          std::shared_ptr<arrow::Array> selected;
+          {
+            internal::NanosecondTimer timer(&metrics_->projection_nanoseconds);
+            ARROW_ASSIGN_OR_RAISE(selected, SelectArray(decoded->second, selection));
+          }
           projected_columns.push_back(std::move(selected));
         } else {
           ARROW_ASSIGN_OR_RAISE(auto selected,
@@ -821,20 +1006,31 @@ class ScanState {
           projected_columns.push_back(std::move(selected));
         }
       }
-      auto batch = arrow::RecordBatch::Make(output_schema_, static_cast<int64_t>(selection.size()),
-                                            std::move(projected_columns));
-      ARROW_RETURN_NOT_OK(batch->ValidateFull());
+      std::shared_ptr<arrow::RecordBatch> batch;
+      {
+        internal::NanosecondTimer timer(&metrics_->batch_materialization_nanoseconds);
+        batch = arrow::RecordBatch::Make(output_schema_, static_cast<int64_t>(selection.size()),
+                                         std::move(projected_columns));
+        ARROW_RETURN_NOT_OK(batch->ValidateFull());
+      }
       return batch;
     }
     return std::shared_ptr<arrow::RecordBatch>();
   }
   arrow::Result<std::vector<uint8_t>> ReadChunk(const internal::ColumnChunkMeta& chunk) {
-    ARROW_ASSIGN_OR_RAISE(auto payload, ReadRange(path_, file_size_, chunk.offset, chunk.length));
+    std::vector<uint8_t> payload;
+    {
+      internal::NanosecondTimer timer(&metrics_->chunk_io_nanoseconds);
+      ARROW_ASSIGN_OR_RAISE(payload, ReadRange(path_, file_size_, chunk.offset, chunk.length));
+    }
     ++metrics_->column_chunks_read;
     metrics_->chunk_bytes_read += chunk.length;
-    if (internal::Crc32c(payload) != chunk.checksum) {
-      return arrow::Status::Invalid(
-          "[sniffer.format.checksum] ColumnChunk CRC32C mismatch for field ", chunk.field_id);
+    {
+      internal::NanosecondTimer timer(&metrics_->chunk_checksum_nanoseconds);
+      if (internal::Crc32c(payload) != chunk.checksum) {
+        return arrow::Status::Invalid(
+            "[sniffer.format.checksum] ColumnChunk CRC32C mismatch for field ", chunk.field_id);
+      }
     }
     return payload;
   }
@@ -844,12 +1040,15 @@ class ScanState {
     const auto& chunk = row_group.chunks[field_index];
     ARROW_ASSIGN_OR_RAISE(auto payload, ReadChunk(chunk));
     std::shared_ptr<arrow::Array> array;
-    if (chunk.encoding_id == internal::kPlainEncodingId) {
-      ARROW_ASSIGN_OR_RAISE(
-          array, internal::DecodePlain(footer_.schema.fields[field_index], chunk, payload));
-    } else {
-      ARROW_ASSIGN_OR_RAISE(
-          array, internal::DecodeNonPlain(footer_.schema.fields[field_index], chunk, payload));
+    {
+      internal::NanosecondTimer timer(&metrics_->decode_nanoseconds);
+      if (chunk.encoding_id == internal::kPlainEncodingId) {
+        ARROW_ASSIGN_OR_RAISE(
+            array, internal::DecodePlain(footer_.schema.fields[field_index], chunk, payload));
+      } else {
+        ARROW_ASSIGN_OR_RAISE(
+            array, internal::DecodeNonPlain(footer_.schema.fields[field_index], chunk, payload));
+      }
     }
     ++metrics_->predicate_chunks_decoded;
     return array;
@@ -861,12 +1060,15 @@ class ScanState {
     const auto& chunk = row_group.chunks[field_index];
     ARROW_ASSIGN_OR_RAISE(auto payload, ReadChunk(chunk));
     std::shared_ptr<arrow::Array> array;
-    if (chunk.encoding_id == internal::kPlainEncodingId) {
-      ARROW_ASSIGN_OR_RAISE(array, DecodePlainSelected(footer_.schema.fields[field_index], chunk,
-                                                       payload, selection));
-    } else {
-      ARROW_ASSIGN_OR_RAISE(array, internal::DecodeNonPlain(footer_.schema.fields[field_index],
-                                                            chunk, payload, &selection));
+    {
+      internal::NanosecondTimer timer(&metrics_->decode_nanoseconds);
+      if (chunk.encoding_id == internal::kPlainEncodingId) {
+        ARROW_ASSIGN_OR_RAISE(array, DecodePlainSelected(footer_.schema.fields[field_index], chunk,
+                                                         payload, selection));
+      } else {
+        ARROW_ASSIGN_OR_RAISE(array, internal::DecodeNonPlain(footer_.schema.fields[field_index],
+                                                              chunk, payload, &selection));
+      }
     }
     ++metrics_->projection_chunks_decoded;
     return array;
@@ -943,12 +1145,14 @@ class ScanState {
 class SegmentReader::Impl {
  public:
   Impl(std::string path, uint64_t file_size, internal::FooterTrailer trailer,
-       internal::FooterData footer, std::vector<internal::RowGroupIndex> indexes)
+       internal::FooterData footer, std::vector<internal::RowGroupIndex> indexes,
+       std::shared_ptr<ReaderMetrics> metrics)
       : path_(std::move(path)),
         file_size_(file_size),
         trailer_(trailer),
         footer_(std::move(footer)),
-        indexes_(std::move(indexes)) {}
+        indexes_(std::move(indexes)),
+        metrics_(std::move(metrics)) {}
 
   arrow::Status ValidateDirectory() const {
     uint64_t previous_end = internal::kHeaderSize;
@@ -1023,12 +1227,22 @@ class SegmentReader::Impl {
     }
     std::vector<std::shared_ptr<arrow::Scalar>> previous_last_key;
     for (const auto& row_group : footer_.row_groups) {
-      ARROW_ASSIGN_OR_RAISE(auto bytes, ReadRange(path_, file_size_, row_group.index_block.offset,
-                                                  row_group.index_block.length));
-      if (internal::Crc32c(bytes) != row_group.index_block.checksum) {
-        return arrow::Status::Invalid("[sniffer.format.checksum] index block CRC32C mismatch");
+      std::vector<uint8_t> bytes;
+      {
+        internal::NanosecondTimer timer(metrics_ ? &metrics_->index_io_nanoseconds : nullptr);
+        ARROW_ASSIGN_OR_RAISE(bytes, ReadRange(path_, file_size_, row_group.index_block.offset,
+                                               row_group.index_block.length));
       }
-      ARROW_ASSIGN_OR_RAISE(auto index, internal::ParseIndexBlock(footer_.schema, bytes));
+      {
+        internal::NanosecondTimer timer(metrics_ ? &metrics_->index_checksum_nanoseconds : nullptr);
+        if (internal::Crc32c(bytes) != row_group.index_block.checksum) {
+          return arrow::Status::Invalid("[sniffer.format.checksum] index block CRC32C mismatch");
+        }
+      }
+      internal::RowGroupIndex index;
+      internal::NanosecondTimer parse_timer(metrics_ ? &metrics_->index_parse_nanoseconds
+                                                     : nullptr);
+      ARROW_ASSIGN_OR_RAISE(index, internal::ParseIndexBlock(footer_.schema, bytes));
       if (index.statistics.size() != footer_.layout_policy.statistics_field_ids.size() ||
           index.blooms.size() != footer_.layout_policy.bloom_field_ids.size() ||
           index.sort_keys.size() != footer_.layout_policy.sort_key_field_ids.size()) {
@@ -1141,6 +1355,7 @@ class SegmentReader::Impl {
   }
 
   arrow::Status VerifyFileChecksum() const {
+    internal::NanosecondTimer timer(metrics_ ? &metrics_->file_checksum_nanoseconds : nullptr);
     std::ifstream stream(path_, std::ios::binary);
     if (!stream.is_open()) {
       return IoError("cannot open segment for checksum", path_);
@@ -1173,44 +1388,72 @@ class SegmentReader::Impl {
   internal::FooterTrailer trailer_;
   internal::FooterData footer_;
   std::vector<internal::RowGroupIndex> indexes_;
+  std::shared_ptr<ReaderMetrics> metrics_;
 };
 
-arrow::Result<std::unique_ptr<SegmentReader>> SegmentReader::Open(std::string path) {
-  std::ifstream stream(path, std::ios::binary | std::ios::ate);
-  if (!stream.is_open()) {
-    return IoError("cannot open segment for reading", path);
+arrow::Result<std::unique_ptr<SegmentReader>> SegmentReader::Open(
+    std::string path, std::shared_ptr<ReaderMetrics> metrics) {
+  if (metrics) {
+    *metrics = {};
   }
-  const std::streampos end_position = stream.tellg();
-  if (end_position < 0) {
-    return IoError("cannot determine segment size", path);
+  uint64_t file_size = 0;
+  {
+    internal::NanosecondTimer timer(metrics ? &metrics->envelope_io_nanoseconds : nullptr);
+    std::ifstream stream(path, std::ios::binary | std::ios::ate);
+    if (!stream.is_open()) {
+      return IoError("cannot open segment for reading", path);
+    }
+    const std::streampos end_position = stream.tellg();
+    if (end_position < 0) {
+      return IoError("cannot determine segment size", path);
+    }
+    file_size = static_cast<uint64_t>(end_position);
+    if (file_size < internal::kHeaderSize + internal::kTrailerSize) {
+      return arrow::Status::Invalid("[sniffer.format.truncated] segment is smaller than envelope");
+    }
   }
-  const uint64_t file_size = static_cast<uint64_t>(end_position);
-  if (file_size < internal::kHeaderSize + internal::kTrailerSize) {
-    return arrow::Status::Invalid("[sniffer.format.truncated] segment is smaller than envelope");
-  }
-  stream.close();
 
-  ARROW_ASSIGN_OR_RAISE(auto header, ReadRange(path, file_size, 0, internal::kHeaderSize));
-  ARROW_RETURN_NOT_OK(internal::ValidateHeader(header));
-  ARROW_ASSIGN_OR_RAISE(
-      auto trailer_bytes,
-      ReadRange(path, file_size, file_size - internal::kTrailerSize, internal::kTrailerSize));
-  ARROW_ASSIGN_OR_RAISE(auto trailer, internal::ParseTrailer(trailer_bytes));
+  std::vector<uint8_t> header;
+  std::vector<uint8_t> trailer_bytes;
+  {
+    internal::NanosecondTimer timer(metrics ? &metrics->envelope_io_nanoseconds : nullptr);
+    ARROW_ASSIGN_OR_RAISE(header, ReadRange(path, file_size, 0, internal::kHeaderSize));
+    ARROW_ASSIGN_OR_RAISE(
+        trailer_bytes,
+        ReadRange(path, file_size, file_size - internal::kTrailerSize, internal::kTrailerSize));
+  }
+  internal::FooterTrailer trailer;
+  {
+    internal::NanosecondTimer timer(metrics ? &metrics->metadata_parse_nanoseconds : nullptr);
+    ARROW_RETURN_NOT_OK(internal::ValidateHeader(header));
+    ARROW_ASSIGN_OR_RAISE(trailer, internal::ParseTrailer(trailer_bytes));
+  }
   ARROW_ASSIGN_OR_RAISE(const uint64_t footer_end,
                         internal::CheckedAdd(trailer.footer_offset, trailer.footer_length));
   if (trailer.footer_offset < internal::kHeaderSize ||
       footer_end != file_size - internal::kTrailerSize) {
     return arrow::Status::Invalid("[sniffer.format.bounds] invalid footer range");
   }
-  ARROW_ASSIGN_OR_RAISE(auto footer_bytes,
-                        ReadRange(path, file_size, trailer.footer_offset, trailer.footer_length));
-  if (internal::Crc32c(footer_bytes) != trailer.footer_checksum) {
-    return arrow::Status::Invalid("[sniffer.format.checksum] footer CRC32C mismatch");
+  std::vector<uint8_t> footer_bytes;
+  {
+    internal::NanosecondTimer timer(metrics ? &metrics->envelope_io_nanoseconds : nullptr);
+    ARROW_ASSIGN_OR_RAISE(footer_bytes,
+                          ReadRange(path, file_size, trailer.footer_offset, trailer.footer_length));
   }
-  ARROW_ASSIGN_OR_RAISE(auto footer, internal::ParseFooter(footer_bytes));
+  internal::FooterData footer;
+  {
+    internal::NanosecondTimer timer(metrics ? &metrics->metadata_parse_nanoseconds : nullptr);
+    if (internal::Crc32c(footer_bytes) != trailer.footer_checksum) {
+      return arrow::Status::Invalid("[sniffer.format.checksum] footer CRC32C mismatch");
+    }
+    ARROW_ASSIGN_OR_RAISE(footer, internal::ParseFooter(footer_bytes));
+  }
   auto impl = std::make_unique<Impl>(std::move(path), file_size, trailer, std::move(footer),
-                                     std::vector<internal::RowGroupIndex>{});
-  ARROW_RETURN_NOT_OK(impl->ValidateDirectory());
+                                     std::vector<internal::RowGroupIndex>{}, metrics);
+  {
+    internal::NanosecondTimer timer(metrics ? &metrics->directory_validation_nanoseconds : nullptr);
+    ARROW_RETURN_NOT_OK(impl->ValidateDirectory());
+  }
   ARROW_RETURN_NOT_OK(impl->LoadIndexes());
   return std::unique_ptr<SegmentReader>(new SegmentReader(std::move(impl)));
 }

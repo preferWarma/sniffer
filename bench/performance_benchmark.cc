@@ -99,10 +99,36 @@ struct Measurement {
   uint64_t file_bytes = 0;
   uint64_t output_rows = 0;
   uint64_t record_groups = 0;
+  sniffer::WriterMetrics writer_metrics;
+  sniffer::ReaderMetrics reader_metrics;
   sniffer::ScanMetrics metrics;
   sniffer::benchmark::SampleStats write_stats;
   sniffer::benchmark::SampleStats scan_stats;
   sniffer::benchmark::SampleStats total_stats;
+  struct WriterPhaseStats {
+    sniffer::benchmark::SampleStats validation;
+    sniffer::benchmark::SampleStats index;
+    sniffer::benchmark::SampleStats encoding_selection;
+    sniffer::benchmark::SampleStats encoding;
+    sniffer::benchmark::SampleStats checksum;
+    sniffer::benchmark::SampleStats file_write;
+    sniffer::benchmark::SampleStats footer;
+  } writer_phases;
+  struct ReaderPhaseStats {
+    sniffer::benchmark::SampleStats envelope_io;
+    sniffer::benchmark::SampleStats metadata_parse;
+    sniffer::benchmark::SampleStats directory_validation;
+    sniffer::benchmark::SampleStats index_io;
+    sniffer::benchmark::SampleStats index_checksum;
+    sniffer::benchmark::SampleStats index_parse;
+    sniffer::benchmark::SampleStats pruning;
+    sniffer::benchmark::SampleStats chunk_io;
+    sniffer::benchmark::SampleStats chunk_checksum;
+    sniffer::benchmark::SampleStats decode;
+    sniffer::benchmark::SampleStats predicate;
+    sniffer::benchmark::SampleStats projection;
+    sniffer::benchmark::SampleStats batch_materialization;
+  } reader_phases;
 };
 
 arrow::Result<uint64_t> FileSize(const std::filesystem::path& path) {
@@ -120,12 +146,15 @@ arrow::Result<Measurement> RunSnifferOnce(const std::filesystem::path& path,
                                           const std::shared_ptr<arrow::RecordBatch>& batch,
                                           const Options& options) {
   const auto start = std::chrono::steady_clock::now();
-  ARROW_ASSIGN_OR_RAISE(auto writer, sniffer::SegmentWriter::Open(path.string(), schema, policy));
+  auto writer_metrics = std::make_shared<sniffer::WriterMetrics>();
+  ARROW_ASSIGN_OR_RAISE(
+      auto writer, sniffer::SegmentWriter::Open(path.string(), schema, policy, writer_metrics));
   ARROW_RETURN_NOT_OK(writer->Append(batch));
   ARROW_RETURN_NOT_OK(writer->Finish());
   const auto write_end = std::chrono::steady_clock::now();
 
-  ARROW_ASSIGN_OR_RAISE(auto reader, sniffer::SegmentReader::Open(path.string()));
+  auto reader_metrics = std::make_shared<sniffer::ReaderMetrics>();
+  ARROW_ASSIGN_OR_RAISE(auto reader, sniffer::SegmentReader::Open(path.string(), reader_metrics));
   sniffer::IOPlan plan;
   plan.projection_field_ids = {1, 3};
   plan.conjunctive_predicates = {{1, sniffer::Predicate::Op::kGe,
@@ -152,6 +181,8 @@ arrow::Result<Measurement> RunSnifferOnce(const std::filesystem::path& path,
   ARROW_ASSIGN_OR_RAISE(measurement.file_bytes, FileSize(path));
   measurement.output_rows = output_rows;
   measurement.record_groups = reader->num_row_groups();
+  measurement.writer_metrics = *writer_metrics;
+  measurement.reader_metrics = *reader_metrics;
   measurement.metrics = *metrics;
   return measurement;
 }
@@ -251,6 +282,56 @@ arrow::Result<Measurement> MedianMeasurement(int iterations, Runner&& runner) {
   result.write_stats = sniffer::benchmark::SummarizeSamples(std::move(writes));
   result.scan_stats = sniffer::benchmark::SummarizeSamples(std::move(scans));
   result.total_stats = sniffer::benchmark::SummarizeSamples(std::move(totals));
+
+  const auto summarize_phase = [&measurements](auto getter) {
+    std::vector<double> samples;
+    samples.reserve(measurements.size());
+    for (const auto& measurement : measurements) {
+      samples.push_back(static_cast<double>(getter(measurement)) / 1'000'000.0);
+    }
+    return sniffer::benchmark::SummarizeSamples(std::move(samples));
+  };
+  result.writer_phases.validation = summarize_phase(
+      [](const Measurement& value) { return value.writer_metrics.validation_nanoseconds; });
+  result.writer_phases.index = summarize_phase(
+      [](const Measurement& value) { return value.writer_metrics.index_nanoseconds; });
+  result.writer_phases.encoding_selection = summarize_phase(
+      [](const Measurement& value) { return value.writer_metrics.encoding_selection_nanoseconds; });
+  result.writer_phases.encoding = summarize_phase(
+      [](const Measurement& value) { return value.writer_metrics.encoding_nanoseconds; });
+  result.writer_phases.checksum = summarize_phase(
+      [](const Measurement& value) { return value.writer_metrics.checksum_nanoseconds; });
+  result.writer_phases.file_write = summarize_phase(
+      [](const Measurement& value) { return value.writer_metrics.file_write_nanoseconds; });
+  result.writer_phases.footer = summarize_phase(
+      [](const Measurement& value) { return value.writer_metrics.footer_nanoseconds; });
+  result.reader_phases.envelope_io = summarize_phase(
+      [](const Measurement& value) { return value.reader_metrics.envelope_io_nanoseconds; });
+  result.reader_phases.metadata_parse = summarize_phase(
+      [](const Measurement& value) { return value.reader_metrics.metadata_parse_nanoseconds; });
+  result.reader_phases.directory_validation = summarize_phase([](const Measurement& value) {
+    return value.reader_metrics.directory_validation_nanoseconds;
+  });
+  result.reader_phases.index_io = summarize_phase(
+      [](const Measurement& value) { return value.reader_metrics.index_io_nanoseconds; });
+  result.reader_phases.index_checksum = summarize_phase(
+      [](const Measurement& value) { return value.reader_metrics.index_checksum_nanoseconds; });
+  result.reader_phases.index_parse = summarize_phase(
+      [](const Measurement& value) { return value.reader_metrics.index_parse_nanoseconds; });
+  result.reader_phases.pruning =
+      summarize_phase([](const Measurement& value) { return value.metrics.pruning_nanoseconds; });
+  result.reader_phases.chunk_io =
+      summarize_phase([](const Measurement& value) { return value.metrics.chunk_io_nanoseconds; });
+  result.reader_phases.chunk_checksum = summarize_phase(
+      [](const Measurement& value) { return value.metrics.chunk_checksum_nanoseconds; });
+  result.reader_phases.decode =
+      summarize_phase([](const Measurement& value) { return value.metrics.decode_nanoseconds; });
+  result.reader_phases.predicate =
+      summarize_phase([](const Measurement& value) { return value.metrics.predicate_nanoseconds; });
+  result.reader_phases.projection = summarize_phase(
+      [](const Measurement& value) { return value.metrics.projection_nanoseconds; });
+  result.reader_phases.batch_materialization = summarize_phase(
+      [](const Measurement& value) { return value.metrics.batch_materialization_nanoseconds; });
   result.write_milliseconds = result.write_stats.p50;
   result.scan_milliseconds = result.scan_stats.p50;
   result.total_milliseconds = result.total_stats.p50;
@@ -259,6 +340,72 @@ arrow::Result<Measurement> MedianMeasurement(int iterations, Runner&& runner) {
 
 double RowsPerSecond(double milliseconds, int64_t input_rows) {
   return milliseconds > 0 ? static_cast<double>(input_rows) / (milliseconds / 1000.0) : 0.0;
+}
+
+void PrintTextPhase(std::string_view name, const sniffer::benchmark::SampleStats& stats) {
+  sniffer::benchmark::PrintSampleStats(std::cout, name, stats);
+}
+
+void PrintJsonPhase(std::string_view name, const sniffer::benchmark::SampleStats& stats,
+                    bool* first) {
+  if (!*first) {
+    std::cout << ',';
+  }
+  *first = false;
+  sniffer::benchmark::PrintJsonString(std::cout, name);
+  std::cout << ':';
+  sniffer::benchmark::PrintJsonSampleStats(std::cout, stats);
+}
+
+void PrintTextPhases(const Measurement& measurement) {
+  PrintTextPhase("writer_validation", measurement.writer_phases.validation);
+  PrintTextPhase("writer_index", measurement.writer_phases.index);
+  PrintTextPhase("writer_encoding_selection", measurement.writer_phases.encoding_selection);
+  PrintTextPhase("writer_encoding", measurement.writer_phases.encoding);
+  PrintTextPhase("writer_checksum", measurement.writer_phases.checksum);
+  PrintTextPhase("writer_file_write", measurement.writer_phases.file_write);
+  PrintTextPhase("writer_footer", measurement.writer_phases.footer);
+  PrintTextPhase("reader_envelope_io", measurement.reader_phases.envelope_io);
+  PrintTextPhase("reader_metadata_parse", measurement.reader_phases.metadata_parse);
+  PrintTextPhase("reader_directory_validation", measurement.reader_phases.directory_validation);
+  PrintTextPhase("reader_index_io", measurement.reader_phases.index_io);
+  PrintTextPhase("reader_index_checksum", measurement.reader_phases.index_checksum);
+  PrintTextPhase("reader_index_parse", measurement.reader_phases.index_parse);
+  PrintTextPhase("reader_pruning", measurement.reader_phases.pruning);
+  PrintTextPhase("reader_chunk_io", measurement.reader_phases.chunk_io);
+  PrintTextPhase("reader_chunk_checksum", measurement.reader_phases.chunk_checksum);
+  PrintTextPhase("reader_decode", measurement.reader_phases.decode);
+  PrintTextPhase("reader_predicate", measurement.reader_phases.predicate);
+  PrintTextPhase("reader_projection", measurement.reader_phases.projection);
+  PrintTextPhase("reader_batch_materialization", measurement.reader_phases.batch_materialization);
+}
+
+void PrintJsonPhases(const Measurement& measurement) {
+  std::cout << ",\"phase_stats\":{";
+  bool first = true;
+  PrintJsonPhase("writer_validation", measurement.writer_phases.validation, &first);
+  PrintJsonPhase("writer_index", measurement.writer_phases.index, &first);
+  PrintJsonPhase("writer_encoding_selection", measurement.writer_phases.encoding_selection, &first);
+  PrintJsonPhase("writer_encoding", measurement.writer_phases.encoding, &first);
+  PrintJsonPhase("writer_checksum", measurement.writer_phases.checksum, &first);
+  PrintJsonPhase("writer_file_write", measurement.writer_phases.file_write, &first);
+  PrintJsonPhase("writer_footer", measurement.writer_phases.footer, &first);
+  PrintJsonPhase("reader_envelope_io", measurement.reader_phases.envelope_io, &first);
+  PrintJsonPhase("reader_metadata_parse", measurement.reader_phases.metadata_parse, &first);
+  PrintJsonPhase("reader_directory_validation", measurement.reader_phases.directory_validation,
+                 &first);
+  PrintJsonPhase("reader_index_io", measurement.reader_phases.index_io, &first);
+  PrintJsonPhase("reader_index_checksum", measurement.reader_phases.index_checksum, &first);
+  PrintJsonPhase("reader_index_parse", measurement.reader_phases.index_parse, &first);
+  PrintJsonPhase("reader_pruning", measurement.reader_phases.pruning, &first);
+  PrintJsonPhase("reader_chunk_io", measurement.reader_phases.chunk_io, &first);
+  PrintJsonPhase("reader_chunk_checksum", measurement.reader_phases.chunk_checksum, &first);
+  PrintJsonPhase("reader_decode", measurement.reader_phases.decode, &first);
+  PrintJsonPhase("reader_predicate", measurement.reader_phases.predicate, &first);
+  PrintJsonPhase("reader_projection", measurement.reader_phases.projection, &first);
+  PrintJsonPhase("reader_batch_materialization", measurement.reader_phases.batch_materialization,
+                 &first);
+  std::cout << '}';
 }
 
 void PrintMeasurement(std::string_view format, const Measurement& measurement, int64_t input_rows) {
@@ -280,6 +427,7 @@ void PrintMeasurement(std::string_view format, const Measurement& measurement, i
               << " row_groups_pruned=" << measurement.metrics.row_groups_pruned
               << " chunks_read=" << measurement.metrics.column_chunks_read
               << " chunk_bytes_read=" << measurement.metrics.chunk_bytes_read;
+    PrintTextPhases(measurement);
   }
   std::cout << '\n';
 }
@@ -309,6 +457,7 @@ void PrintJsonMeasurement(std::string_view format, const Measurement& measuremen
               << ",\"row_groups_pruned\":" << measurement.metrics.row_groups_pruned
               << ",\"column_chunks_read\":" << measurement.metrics.column_chunks_read
               << ",\"chunk_bytes_read\":" << measurement.metrics.chunk_bytes_read << '}';
+    PrintJsonPhases(measurement);
   }
   std::cout << '}';
 }

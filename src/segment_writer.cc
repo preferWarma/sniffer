@@ -13,6 +13,7 @@
 #include "codec_internal.h"
 #include "format_internal.h"
 #include "index_internal.h"
+#include "metrics_internal.h"
 
 namespace sniffer {
 namespace {
@@ -230,10 +231,12 @@ arrow::Result<std::vector<uint8_t>> EncodePlain(const FieldSpec& field, const ar
 
 class SegmentWriter::Impl {
  public:
-  Impl(std::string path, TableSchema schema, LayoutPolicy layout_policy)
+  Impl(std::string path, TableSchema schema, LayoutPolicy layout_policy,
+       std::shared_ptr<WriterMetrics> metrics)
       : path_(std::move(path)),
         schema_(std::move(schema)),
         layout_policy_(std::move(layout_policy)),
+        metrics_(std::move(metrics)),
         stream_(path_, std::ios::binary | std::ios::trunc) {}
 
   arrow::Status Initialize() {
@@ -251,10 +254,13 @@ class SegmentWriter::Impl {
     if (!batch) {
       return arrow::Status::Invalid("[sniffer.writer.input] null RecordBatch");
     }
-    ARROW_RETURN_NOT_OK(batch->ValidateFull());
-    ARROW_RETURN_NOT_OK(schema_.ValidateBatch(*batch));
-    ARROW_RETURN_NOT_OK(
-        internal::ValidateAndUpdateSortOrder(schema_, layout_policy_, *batch, &previous_sort_key_));
+    {
+      internal::NanosecondTimer timer(metrics_ ? &metrics_->validation_nanoseconds : nullptr);
+      ARROW_RETURN_NOT_OK(batch->ValidateFull());
+      ARROW_RETURN_NOT_OK(schema_.ValidateBatch(*batch));
+      ARROW_RETURN_NOT_OK(internal::ValidateAndUpdateSortOrder(schema_, layout_policy_, *batch,
+                                                               &previous_sort_key_));
+    }
     int64_t offset = 0;
     while (offset < batch->num_rows()) {
       const int64_t remaining = batch->num_rows() - offset;
@@ -270,13 +276,21 @@ class SegmentWriter::Impl {
     if (finished_) {
       return arrow::Status::Invalid("[sniffer.writer.state] Finish called more than once");
     }
-    internal::FooterData footer;
-    footer.schema = schema_;
-    footer.row_groups = row_groups_;
-    footer.layout_policy = layout_policy_;
-    ARROW_ASSIGN_OR_RAISE(auto footer_bytes, internal::SerializeFooter(footer));
+    std::vector<uint8_t> footer_bytes;
+    {
+      internal::NanosecondTimer timer(metrics_ ? &metrics_->footer_nanoseconds : nullptr);
+      internal::FooterData footer;
+      footer.schema = schema_;
+      footer.row_groups = row_groups_;
+      footer.layout_policy = layout_policy_;
+      ARROW_ASSIGN_OR_RAISE(footer_bytes, internal::SerializeFooter(footer));
+    }
     const uint64_t footer_offset = position_;
-    const uint32_t footer_checksum = internal::Crc32c(footer_bytes);
+    uint32_t footer_checksum = 0;
+    {
+      internal::NanosecondTimer timer(metrics_ ? &metrics_->checksum_nanoseconds : nullptr);
+      footer_checksum = internal::Crc32c(footer_bytes);
+    }
     ARROW_RETURN_NOT_OK(WriteTracked(footer_bytes));
 
     internal::FooterTrailer trailer;
@@ -284,37 +298,54 @@ class SegmentWriter::Impl {
     trailer.footer_length = static_cast<uint64_t>(footer_bytes.size());
     trailer.footer_checksum = footer_checksum;
     trailer.file_checksum = file_checksum_;
-    const auto trailer_bytes = internal::SerializeTrailer(trailer);
-    ARROW_RETURN_NOT_OK(WriteUntracked(trailer_bytes));
-    stream_.flush();
-    if (!stream_) {
-      return IoError("cannot flush segment", path_);
+    std::vector<uint8_t> trailer_bytes;
+    {
+      internal::NanosecondTimer timer(metrics_ ? &metrics_->footer_nanoseconds : nullptr);
+      trailer_bytes = internal::SerializeTrailer(trailer);
     }
-    stream_.close();
+    ARROW_RETURN_NOT_OK(WriteUntracked(trailer_bytes));
+    {
+      internal::NanosecondTimer timer(metrics_ ? &metrics_->file_write_nanoseconds : nullptr);
+      stream_.flush();
+      if (!stream_) {
+        return IoError("cannot flush segment", path_);
+      }
+      stream_.close();
+    }
     finished_ = true;
     return arrow::Status::OK();
   }
 
  private:
   arrow::Status WriteRowGroup(const std::shared_ptr<arrow::RecordBatch>& batch) {
-    ARROW_ASSIGN_OR_RAISE(auto indexes,
-                          internal::BuildRowGroupIndex(schema_, layout_policy_, *batch));
+    internal::RowGroupIndex indexes;
+    {
+      internal::NanosecondTimer timer(metrics_ ? &metrics_->index_nanoseconds : nullptr);
+      ARROW_ASSIGN_OR_RAISE(indexes, internal::BuildRowGroupIndex(schema_, layout_policy_, *batch));
+    }
     internal::RowGroupMeta row_group;
     row_group.row_count = static_cast<uint64_t>(batch->num_rows());
     row_group.chunks.reserve(schema_.fields.size());
     for (int column_index = 0; column_index < batch->num_columns(); ++column_index) {
       const auto& field = schema_.fields[static_cast<size_t>(column_index)];
       const auto& array = batch->column(column_index);
-      ARROW_ASSIGN_OR_RAISE(const uint16_t encoding_id,
-                            internal::SelectEncoding(field, *array, layout_policy_));
+      uint16_t encoding_id = 0;
+      {
+        internal::NanosecondTimer timer(metrics_ ? &metrics_->encoding_selection_nanoseconds
+                                                 : nullptr);
+        ARROW_ASSIGN_OR_RAISE(encoding_id, internal::SelectEncoding(field, *array, layout_policy_));
+      }
       std::vector<uint8_t> payload;
       uint64_t uncompressed_length = 0;
-      if (encoding_id == internal::kPlainEncodingId) {
-        ARROW_ASSIGN_OR_RAISE(payload, internal::EncodePlain(field, *array));
-        uncompressed_length = static_cast<uint64_t>(payload.size());
-      } else {
-        ARROW_ASSIGN_OR_RAISE(uncompressed_length, internal::PlainEncodedSize(field, *array));
-        ARROW_ASSIGN_OR_RAISE(payload, internal::EncodeNonPlain(encoding_id, field, *array));
+      {
+        internal::NanosecondTimer timer(metrics_ ? &metrics_->encoding_nanoseconds : nullptr);
+        if (encoding_id == internal::kPlainEncodingId) {
+          ARROW_ASSIGN_OR_RAISE(payload, internal::EncodePlain(field, *array));
+          uncompressed_length = static_cast<uint64_t>(payload.size());
+        } else {
+          ARROW_ASSIGN_OR_RAISE(uncompressed_length, internal::PlainEncodedSize(field, *array));
+          ARROW_ASSIGN_OR_RAISE(payload, internal::EncodeNonPlain(encoding_id, field, *array));
+        }
       }
       ARROW_ASSIGN_OR_RAISE(const auto physical_type, internal::PhysicalTypeFor(*field.type));
 
@@ -327,14 +358,20 @@ class SegmentWriter::Impl {
       chunk.offset = position_;
       chunk.length = static_cast<uint64_t>(payload.size());
       chunk.uncompressed_length = uncompressed_length;
-      chunk.checksum = internal::Crc32c(payload);
+      {
+        internal::NanosecondTimer timer(metrics_ ? &metrics_->checksum_nanoseconds : nullptr);
+        chunk.checksum = internal::Crc32c(payload);
+      }
       ARROW_RETURN_NOT_OK(WriteTracked(payload));
       row_group.chunks.push_back(chunk);
     }
     ARROW_ASSIGN_OR_RAISE(auto index_bytes, internal::SerializeIndexBlock(schema_, indexes));
     row_group.index_block.offset = position_;
     row_group.index_block.length = static_cast<uint64_t>(index_bytes.size());
-    row_group.index_block.checksum = internal::Crc32c(index_bytes);
+    {
+      internal::NanosecondTimer timer(metrics_ ? &metrics_->checksum_nanoseconds : nullptr);
+      row_group.index_block.checksum = internal::Crc32c(index_bytes);
+    }
     ARROW_RETURN_NOT_OK(WriteTracked(index_bytes));
     row_groups_.push_back(std::move(row_group));
     return arrow::Status::OK();
@@ -342,11 +379,15 @@ class SegmentWriter::Impl {
 
   arrow::Status WriteTracked(std::span<const uint8_t> bytes) {
     ARROW_RETURN_NOT_OK(WriteUntracked(bytes));
-    file_checksum_ = internal::Crc32c(bytes, file_checksum_);
+    {
+      internal::NanosecondTimer timer(metrics_ ? &metrics_->checksum_nanoseconds : nullptr);
+      file_checksum_ = internal::Crc32c(bytes, file_checksum_);
+    }
     return arrow::Status::OK();
   }
 
   arrow::Status WriteUntracked(std::span<const uint8_t> bytes) {
+    internal::NanosecondTimer timer(metrics_ ? &metrics_->file_write_nanoseconds : nullptr);
     if (bytes.size() > static_cast<size_t>(std::numeric_limits<std::streamsize>::max())) {
       return arrow::Status::Invalid("[sniffer.format.limit] write exceeds streamsize");
     }
@@ -363,6 +404,7 @@ class SegmentWriter::Impl {
   std::string path_;
   TableSchema schema_;
   LayoutPolicy layout_policy_;
+  std::shared_ptr<WriterMetrics> metrics_;
   std::ofstream stream_;
   uint64_t position_ = 0;
   uint32_t file_checksum_ = 0;
@@ -371,12 +413,16 @@ class SegmentWriter::Impl {
   bool finished_ = false;
 };
 
-arrow::Result<std::unique_ptr<SegmentWriter>> SegmentWriter::Open(std::string path,
-                                                                  TableSchema schema,
-                                                                  LayoutPolicy layout_policy) {
+arrow::Result<std::unique_ptr<SegmentWriter>> SegmentWriter::Open(
+    std::string path, TableSchema schema, LayoutPolicy layout_policy,
+    std::shared_ptr<WriterMetrics> metrics) {
   ARROW_RETURN_NOT_OK(schema.Validate());
   ARROW_RETURN_NOT_OK(layout_policy.Validate(schema));
-  auto impl = std::make_unique<Impl>(std::move(path), std::move(schema), std::move(layout_policy));
+  if (metrics) {
+    *metrics = {};
+  }
+  auto impl = std::make_unique<Impl>(std::move(path), std::move(schema), std::move(layout_policy),
+                                     std::move(metrics));
   ARROW_RETURN_NOT_OK(impl->Initialize());
   return std::unique_ptr<SegmentWriter>(new SegmentWriter(std::move(impl)));
 }

@@ -3,6 +3,7 @@
 #include <arrow/api.h>
 #include <arrow/util/iterator.h>
 
+#include <cstdint>
 #include <memory>
 #include <string>
 #include <vector>
@@ -12,9 +13,20 @@
 
 namespace sniffer {
 
+struct ReaderMetrics {
+  uint64_t envelope_io_nanoseconds = 0;
+  uint64_t metadata_parse_nanoseconds = 0;
+  uint64_t directory_validation_nanoseconds = 0;
+  uint64_t index_io_nanoseconds = 0;
+  uint64_t index_checksum_nanoseconds = 0;
+  uint64_t index_parse_nanoseconds = 0;
+  uint64_t file_checksum_nanoseconds = 0;
+};
+
 class SegmentReader {
  public:
-  [[nodiscard]] static arrow::Result<std::unique_ptr<SegmentReader>> Open(std::string path);
+  [[nodiscard]] static arrow::Result<std::unique_ptr<SegmentReader>> Open(
+      std::string path, std::shared_ptr<ReaderMetrics> metrics = nullptr);
 
   SegmentReader(const SegmentReader&) = delete;
   SegmentReader& operator=(const SegmentReader&) = delete;

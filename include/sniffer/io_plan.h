@@ -39,6 +39,13 @@ struct ScanMetrics {
   uint64_t predicate_chunks_decoded = 0;
   uint64_t projection_chunks_decoded = 0;
   uint64_t chunk_bytes_read = 0;
+  uint64_t pruning_nanoseconds = 0;
+  uint64_t chunk_io_nanoseconds = 0;
+  uint64_t chunk_checksum_nanoseconds = 0;
+  uint64_t decode_nanoseconds = 0;
+  uint64_t predicate_nanoseconds = 0;
+  uint64_t projection_nanoseconds = 0;
+  uint64_t batch_materialization_nanoseconds = 0;
 };
 
 }  // namespace sniffer

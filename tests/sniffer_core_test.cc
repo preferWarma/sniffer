@@ -1237,6 +1237,117 @@ void TestAllPredicateOperationsAndNulls() {
          "IS NOT NULL predicate");
 }
 
+void TestTypedPredicatesAndProjectionAllTypes() {
+  const auto data = MakeAllTypesBatch();
+  TempFile file("typed_predicates_all_types.seg");
+  sniffer::LayoutPolicy policy;
+  policy.target_row_group_rows = 2;
+  WriteSegmentWithPolicy(file.path(), data.table_schema, {data.batch}, policy);
+  auto reader =
+      ValueOrThrow(sniffer::SegmentReader::Open(file.path().string()), "open typed predicates");
+
+  for (size_t column = 0; column < data.table_schema.fields.size(); ++column) {
+    const auto& field = data.table_schema.fields[column];
+    const auto& source = data.batch->column(static_cast<int>(column));
+    const auto target = ValueOrThrow(source->GetScalar(0), "typed predicate target");
+    sniffer::IOPlan equal;
+    equal.projection_field_ids = {field.field_id};
+    equal.conjunctive_predicates = {{field.field_id, sniffer::Predicate::Op::kEq, target}};
+    equal.output_batch_rows = 2;
+    const auto batches =
+        CollectScan(ValueOrThrow(reader->Scan(equal), "scan typed equality predicate"));
+    arrow::ArrayVector actual_chunks;
+    for (const auto& batch : batches) {
+      actual_chunks.push_back(batch->column(0));
+    }
+    const auto actual =
+        ValueOrThrow(arrow::Concatenate(actual_chunks), "concatenate typed predicate result");
+
+    auto expected_builder = ValueOrThrow(arrow::MakeBuilder(field.type), "make reference builder");
+    for (int64_t row = 0; row < source->length(); ++row) {
+      if (source->IsNull(row)) {
+        continue;
+      }
+      const auto value = ValueOrThrow(source->GetScalar(row), "get reference predicate value");
+      if (ValueOrThrow(sniffer::internal::CompareScalars(*value, *target),
+                       "compare reference predicate value") == 0) {
+        RequireOk(expected_builder->AppendScalar(*value), "append reference predicate value");
+      }
+    }
+    std::shared_ptr<arrow::Array> expected;
+    RequireOk(expected_builder->Finish(&expected), "finish reference predicate result");
+    Expect(actual->Equals(expected), "typed equality predicate and projection match reference");
+
+    sniffer::IOPlan nulls;
+    nulls.projection_field_ids = {field.field_id};
+    nulls.conjunctive_predicates = {{field.field_id, sniffer::Predicate::Op::kIsNull, nullptr}};
+    const auto null_batches =
+        CollectScan(ValueOrThrow(reader->Scan(nulls), "scan typed null predicate"));
+    Expect(null_batches.size() == 1 && null_batches[0]->num_rows() == source->null_count() &&
+               null_batches[0]->column(0)->null_count() == source->null_count(),
+           "typed projection preserves selected null values");
+  }
+
+  sniffer::TableSchema nan_schema{1, {{1, "value", arrow::float64(), true, nullptr}}};
+  const auto nan_arrow_schema = ValueOrThrow(nan_schema.ToArrowSchema(), "NaN predicate schema");
+  const auto nan_values = BuildArray<arrow::DoubleBuilder, double>(
+      {std::numeric_limits<double>::quiet_NaN(), 1.0, std::nullopt});
+  TempFile nan_file("typed_nan_predicate.seg");
+  WriteSegment(nan_file.path(), nan_schema,
+               {arrow::RecordBatch::Make(nan_arrow_schema, 3, {nan_values})});
+  auto nan_reader =
+      ValueOrThrow(sniffer::SegmentReader::Open(nan_file.path().string()), "open NaN predicate");
+  sniffer::IOPlan nan_not_equal;
+  nan_not_equal.projection_field_ids = {1};
+  nan_not_equal.conjunctive_predicates = {
+      {1, sniffer::Predicate::Op::kNe,
+       std::make_shared<arrow::DoubleScalar>(std::numeric_limits<double>::quiet_NaN())}};
+  const auto nan_batches =
+      CollectScan(ValueOrThrow(nan_reader->Scan(nan_not_equal), "scan NaN not-equal"));
+  Expect(nan_batches.size() == 1 && nan_batches[0]->num_rows() == 2,
+         "typed predicate preserves NaN not-equal semantics");
+}
+
+void TestOptionalPhaseMetrics() {
+  const auto data = MakeScanBatch();
+  TempFile file("phase_metrics.seg");
+  auto writer_metrics = std::make_shared<sniffer::WriterMetrics>();
+  writer_metrics->encoding_nanoseconds = std::numeric_limits<uint64_t>::max();
+  auto writer = ValueOrThrow(sniffer::SegmentWriter::Open(file.path().string(), data.table_schema,
+                                                          ScanLayout(), writer_metrics),
+                             "open metrics writer");
+  RequireOk(writer->Append(data.batch), "append metrics batch");
+  RequireOk(writer->Finish(), "finish metrics writer");
+  Expect(writer_metrics->encoding_nanoseconds != std::numeric_limits<uint64_t>::max() &&
+             writer_metrics->encoding_nanoseconds + writer_metrics->index_nanoseconds +
+                     writer_metrics->checksum_nanoseconds + writer_metrics->file_write_nanoseconds >
+                 0,
+         "optional writer metrics reset and record phase timings");
+
+  auto reader_metrics = std::make_shared<sniffer::ReaderMetrics>();
+  reader_metrics->metadata_parse_nanoseconds = std::numeric_limits<uint64_t>::max();
+  auto reader = ValueOrThrow(sniffer::SegmentReader::Open(file.path().string(), reader_metrics),
+                             "open metrics reader");
+  Expect(reader_metrics->metadata_parse_nanoseconds != std::numeric_limits<uint64_t>::max() &&
+             reader_metrics->envelope_io_nanoseconds + reader_metrics->metadata_parse_nanoseconds +
+                     reader_metrics->index_parse_nanoseconds >
+                 0,
+         "optional reader metrics reset and record open timings");
+
+  sniffer::IOPlan plan;
+  plan.projection_field_ids = {1};
+  plan.conjunctive_predicates = {
+      {1, sniffer::Predicate::Op::kGe, std::make_shared<arrow::Int64Scalar>(10)}};
+  auto scan_metrics = std::make_shared<sniffer::ScanMetrics>();
+  const auto batches =
+      CollectScan(ValueOrThrow(reader->Scan(plan, scan_metrics), "scan with phase metrics"));
+  Expect(!batches.empty() && scan_metrics->predicate_nanoseconds +
+                                     scan_metrics->decode_nanoseconds +
+                                     scan_metrics->chunk_io_nanoseconds >
+                                 0,
+         "scan metrics record execution phase timings");
+}
+
 void TestSequentialFallbackAndPlanValidation() {
   const auto data = MakeScanBatch();
   TempFile file("scan_fallback.seg");
@@ -1836,6 +1947,8 @@ int main() {
       {"bloom_prunes_without_chunk_reads", TestBloomPrunesWithoutChunkReads},
       {"sort_key_range_and_empty_projection", TestSortKeyRangeAndEmptyProjection},
       {"all_predicate_operations_and_nulls", TestAllPredicateOperationsAndNulls},
+      {"typed_predicates_and_projection_all_types", TestTypedPredicatesAndProjectionAllTypes},
+      {"optional_phase_metrics", TestOptionalPhaseMetrics},
       {"sequential_fallback_and_plan_validation", TestSequentialFallbackAndPlanValidation},
       {"sort_order_and_index_corruption", TestSortOrderAndIndexCorruptionValidation},
       {"bloom_signed_zero_equality", TestBloomSignedZeroEquality},

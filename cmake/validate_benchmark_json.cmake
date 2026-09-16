@@ -34,6 +34,12 @@ endif()
 if(EXPECTED_BENCHMARK STREQUAL "performance")
   string(JSON sample_length LENGTH "${benchmark_output}" measurements 0 write_stats samples_ms)
   string(JSON p50 GET "${benchmark_output}" measurements 0 write_stats p50_ms)
+  string(JSON phase_sample_length LENGTH "${benchmark_output}" measurements 0 phase_stats
+         writer_encoding samples_ms)
+  string(JSON phase_p50 GET "${benchmark_output}" measurements 0 phase_stats writer_encoding p50_ms)
+  if(NOT phase_sample_length EQUAL 2 OR phase_p50 LESS_EQUAL 0)
+    message(FATAL_ERROR "performance benchmark JSON has invalid phase timing statistics")
+  endif()
 elseif(EXPECTED_BENCHMARK STREQUAL "compression")
   string(JSON sample_length LENGTH "${benchmark_output}" scenarios 0 formats 0 encode_write_stats
          samples_ms)
