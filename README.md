@@ -189,7 +189,7 @@ ARROW_ASSIGN_OR_RAISE(auto batches, reader->Scan(std::move(plan), metrics));
 的去重 buffer 总大小，不包含 schema 和文件级元数据。压缩 benchmark 会逐个场景回读并比较
 完整 Arrow batch。每种格式重复运行并报告压缩写入和解压读取的中位耗时，以及按逻辑数据量
 计算的吞吐；输入构造、文件大小查询和回读正确性比较不计时。每个数据分布与格式组合都是
-独立 case，例如可用 `--benchmark_filter='Compression/narrow_int64/.*'` 直接比较三种格式。
+独立 case，例如可用 `--benchmark_filter='Compression/narrow_int64_.*'` 直接比较三种格式。
 
 纯内存 codec benchmark 单独测量生产代码中的 Plain、Dictionary、RLE 和 FOR + Bitpack，排除
 文件 I/O、索引和 checksum：

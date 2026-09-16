@@ -203,7 +203,7 @@ void SetAverage(benchmark::State& state, std::string_view name, double total) {
   state.counters[std::string(name)] = total / static_cast<double>(state.iterations());
 }
 
-void RunPerformanceBenchmark(benchmark::State& state, Format format) {
+void Performance(benchmark::State& state, Format format) {
   const BenchmarkConfig config{state.range(0), static_cast<uint32_t>(state.range(1))};
   auto batch_result = MakeBenchmarkBatch(config.rows);
   if (!batch_result.ok()) {
@@ -333,17 +333,18 @@ void RunPerformanceBenchmark(benchmark::State& state, Format format) {
   state.SetItemsProcessed(state.iterations() * config.rows);
 }
 
-void RegisterBenchmarks() {
-  const auto add = [](std::string_view name, Format format) {
-    benchmark::RegisterBenchmark(std::string(name).c_str(), RunPerformanceBenchmark, format)
-        ->Args({kDefaultRows, kDefaultRowGroupRows})
-        ->UseManualTime()
-        ->Unit(benchmark::kMillisecond);
-  };
-  add("Performance/Sniffer", Format::kSniffer);
-  add("Performance/ArrowIPC", Format::kArrowIpc);
-  add("Performance/ArrowIPC_ZSTD", Format::kArrowIpcZstd);
-}
+BENCHMARK_CAPTURE(Performance, Sniffer, Format::kSniffer)
+    ->Args({kDefaultRows, kDefaultRowGroupRows})
+    ->UseManualTime()
+    ->Unit(benchmark::kMillisecond);
+BENCHMARK_CAPTURE(Performance, ArrowIPC, Format::kArrowIpc)
+    ->Args({kDefaultRows, kDefaultRowGroupRows})
+    ->UseManualTime()
+    ->Unit(benchmark::kMillisecond);
+BENCHMARK_CAPTURE(Performance, ArrowIPC_ZSTD, Format::kArrowIpcZstd)
+    ->Args({kDefaultRows, kDefaultRowGroupRows})
+    ->UseManualTime()
+    ->Unit(benchmark::kMillisecond);
 
 void AddBenchmarkContext() {
 #ifdef NDEBUG
@@ -362,7 +363,6 @@ void AddBenchmarkContext() {
 }  // namespace
 
 int main(int argc, char** argv) {
-  RegisterBenchmarks();
   AddBenchmarkContext();
   benchmark::Initialize(&argc, argv);
   if (benchmark::ReportUnrecognizedArguments(argc, argv)) {

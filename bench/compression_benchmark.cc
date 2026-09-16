@@ -142,6 +142,11 @@ arrow::Result<std::vector<Scenario>> MakeScenarios(int64_t rows) {
   return scenarios;
 }
 
+const arrow::Result<std::vector<Scenario>>& BenchmarkScenarios() {
+  static const auto scenarios = MakeScenarios(kDefaultRows);
+  return scenarios;
+}
+
 arrow::Result<uint64_t> FileSize(const std::filesystem::path& path) {
   std::error_code error;
   const uint64_t size = std::filesystem::file_size(path, error);
@@ -302,23 +307,69 @@ void RunCompressionBenchmark(benchmark::State& state, const Scenario& scenario, 
   state.SetItemsProcessed(state.iterations() * scenario.batch->num_rows());
 }
 
-arrow::Status RegisterBenchmarks() {
-  ARROW_ASSIGN_OR_RAISE(auto scenarios, MakeScenarios(kDefaultRows));
-  for (const auto& scenario : scenarios) {
-    for (const auto format : {Format::kSniffer, Format::kArrowIpc, Format::kArrowIpcZstd}) {
-      const std::string name =
-          "Compression/" + scenario.name + "/" + std::string(FormatName(format));
-      benchmark::RegisterBenchmark(name.c_str(),
-                                   [scenario, format](benchmark::State& state) {
-                                     RunCompressionBenchmark(state, scenario, format,
-                                                             kDefaultRowGroupRows);
-                                   })
-          ->UseManualTime()
-          ->Unit(benchmark::kMillisecond);
-    }
+void Compression(benchmark::State& state, size_t scenario_index, Format format) {
+  const auto& scenarios = BenchmarkScenarios();
+  if (!scenarios.ok()) {
+    state.SkipWithError(scenarios.status().ToString());
+    return;
   }
-  return arrow::Status::OK();
+  RunCompressionBenchmark(state, scenarios->at(scenario_index), format, kDefaultRowGroupRows);
 }
+
+BENCHMARK_CAPTURE(Compression, ascending_int64_Sniffer, 0U, Format::kSniffer)
+    ->UseManualTime()
+    ->Unit(benchmark::kMillisecond);
+BENCHMARK_CAPTURE(Compression, ascending_int64_ArrowIPC, 0U, Format::kArrowIpc)
+    ->UseManualTime()
+    ->Unit(benchmark::kMillisecond);
+BENCHMARK_CAPTURE(Compression, ascending_int64_ArrowIPC_ZSTD, 0U, Format::kArrowIpcZstd)
+    ->UseManualTime()
+    ->Unit(benchmark::kMillisecond);
+BENCHMARK_CAPTURE(Compression, narrow_int64_Sniffer, 1U, Format::kSniffer)
+    ->UseManualTime()
+    ->Unit(benchmark::kMillisecond);
+BENCHMARK_CAPTURE(Compression, narrow_int64_ArrowIPC, 1U, Format::kArrowIpc)
+    ->UseManualTime()
+    ->Unit(benchmark::kMillisecond);
+BENCHMARK_CAPTURE(Compression, narrow_int64_ArrowIPC_ZSTD, 1U, Format::kArrowIpcZstd)
+    ->UseManualTime()
+    ->Unit(benchmark::kMillisecond);
+BENCHMARK_CAPTURE(Compression, long_rle_int64_Sniffer, 2U, Format::kSniffer)
+    ->UseManualTime()
+    ->Unit(benchmark::kMillisecond);
+BENCHMARK_CAPTURE(Compression, long_rle_int64_ArrowIPC, 2U, Format::kArrowIpc)
+    ->UseManualTime()
+    ->Unit(benchmark::kMillisecond);
+BENCHMARK_CAPTURE(Compression, long_rle_int64_ArrowIPC_ZSTD, 2U, Format::kArrowIpcZstd)
+    ->UseManualTime()
+    ->Unit(benchmark::kMillisecond);
+BENCHMARK_CAPTURE(Compression, nullable_skewed_int64_Sniffer, 3U, Format::kSniffer)
+    ->UseManualTime()
+    ->Unit(benchmark::kMillisecond);
+BENCHMARK_CAPTURE(Compression, nullable_skewed_int64_ArrowIPC, 3U, Format::kArrowIpc)
+    ->UseManualTime()
+    ->Unit(benchmark::kMillisecond);
+BENCHMARK_CAPTURE(Compression, nullable_skewed_int64_ArrowIPC_ZSTD, 3U, Format::kArrowIpcZstd)
+    ->UseManualTime()
+    ->Unit(benchmark::kMillisecond);
+BENCHMARK_CAPTURE(Compression, low_cardinality_string_Sniffer, 4U, Format::kSniffer)
+    ->UseManualTime()
+    ->Unit(benchmark::kMillisecond);
+BENCHMARK_CAPTURE(Compression, low_cardinality_string_ArrowIPC, 4U, Format::kArrowIpc)
+    ->UseManualTime()
+    ->Unit(benchmark::kMillisecond);
+BENCHMARK_CAPTURE(Compression, low_cardinality_string_ArrowIPC_ZSTD, 4U, Format::kArrowIpcZstd)
+    ->UseManualTime()
+    ->Unit(benchmark::kMillisecond);
+BENCHMARK_CAPTURE(Compression, high_cardinality_string_Sniffer, 5U, Format::kSniffer)
+    ->UseManualTime()
+    ->Unit(benchmark::kMillisecond);
+BENCHMARK_CAPTURE(Compression, high_cardinality_string_ArrowIPC, 5U, Format::kArrowIpc)
+    ->UseManualTime()
+    ->Unit(benchmark::kMillisecond);
+BENCHMARK_CAPTURE(Compression, high_cardinality_string_ArrowIPC_ZSTD, 5U, Format::kArrowIpcZstd)
+    ->UseManualTime()
+    ->Unit(benchmark::kMillisecond);
 
 void AddBenchmarkContext() {
 #ifdef NDEBUG
@@ -337,11 +388,6 @@ void AddBenchmarkContext() {
 }  // namespace
 
 int main(int argc, char** argv) {
-  const auto status = RegisterBenchmarks();
-  if (!status.ok()) {
-    std::cerr << status.ToString() << '\n';
-    return 1;
-  }
   AddBenchmarkContext();
   benchmark::Initialize(&argc, argv);
   if (benchmark::ReportUnrecognizedArguments(argc, argv)) {

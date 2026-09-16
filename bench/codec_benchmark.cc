@@ -146,6 +146,11 @@ arrow::Result<std::vector<Scenario>> MakeScenarios(int64_t rows) {
   return scenarios;
 }
 
+const arrow::Result<std::vector<Scenario>>& BenchmarkScenarios() {
+  static const auto scenarios = MakeScenarios(kDefaultRows);
+  return scenarios;
+}
+
 arrow::Result<std::vector<uint8_t>> Encode(const Scenario& scenario) {
   if (scenario.encoding_id == sniffer::internal::kPlainEncodingId) {
     return sniffer::internal::EncodePlain(scenario.field, *scenario.array);
@@ -264,19 +269,31 @@ void RunDecodeBenchmark(benchmark::State& state, const Scenario& scenario) {
   SetCodecCounters(state, scenario, logical_bytes, static_cast<uint64_t>(payload->size()));
 }
 
-arrow::Status RegisterBenchmarks() {
-  ARROW_ASSIGN_OR_RAISE(auto scenarios, MakeScenarios(kDefaultRows));
-  for (const auto& scenario : scenarios) {
-    const std::string prefix = "Codec/" + scenario.name + "/";
-    benchmark::RegisterBenchmark((prefix + "Encode").c_str(), [scenario](benchmark::State& state) {
-      RunEncodeBenchmark(state, scenario);
-    })->Unit(benchmark::kMicrosecond);
-    benchmark::RegisterBenchmark((prefix + "Decode").c_str(), [scenario](benchmark::State& state) {
-      RunDecodeBenchmark(state, scenario);
-    })->Unit(benchmark::kMicrosecond);
+void Codec(benchmark::State& state, size_t scenario_index, bool encode) {
+  const auto& scenarios = BenchmarkScenarios();
+  if (!scenarios.ok()) {
+    state.SkipWithError(scenarios.status().ToString());
+    return;
   }
-  return arrow::Status::OK();
+  if (encode) {
+    RunEncodeBenchmark(state, scenarios->at(scenario_index));
+  } else {
+    RunDecodeBenchmark(state, scenarios->at(scenario_index));
+  }
 }
+
+BENCHMARK_CAPTURE(Codec, plain_random_int64_Encode, 0U, true)->Unit(benchmark::kMicrosecond);
+BENCHMARK_CAPTURE(Codec, plain_random_int64_Decode, 0U, false)->Unit(benchmark::kMicrosecond);
+BENCHMARK_CAPTURE(Codec, plain_selected_int64_50pct_Encode, 1U, true)
+    ->Unit(benchmark::kMicrosecond);
+BENCHMARK_CAPTURE(Codec, plain_selected_int64_50pct_Decode, 1U, false)
+    ->Unit(benchmark::kMicrosecond);
+BENCHMARK_CAPTURE(Codec, dictionary_string_32_Encode, 2U, true)->Unit(benchmark::kMicrosecond);
+BENCHMARK_CAPTURE(Codec, dictionary_string_32_Decode, 2U, false)->Unit(benchmark::kMicrosecond);
+BENCHMARK_CAPTURE(Codec, rle_128_runs_Encode, 3U, true)->Unit(benchmark::kMicrosecond);
+BENCHMARK_CAPTURE(Codec, rle_128_runs_Decode, 3U, false)->Unit(benchmark::kMicrosecond);
+BENCHMARK_CAPTURE(Codec, for_bitpack_128_range_Encode, 4U, true)->Unit(benchmark::kMicrosecond);
+BENCHMARK_CAPTURE(Codec, for_bitpack_128_range_Decode, 4U, false)->Unit(benchmark::kMicrosecond);
 
 void AddBenchmarkContext() {
 #ifdef NDEBUG
@@ -294,11 +311,6 @@ void AddBenchmarkContext() {
 }  // namespace
 
 int main(int argc, char** argv) {
-  const auto status = RegisterBenchmarks();
-  if (!status.ok()) {
-    std::cerr << status.ToString() << '\n';
-    return 1;
-  }
   AddBenchmarkContext();
   benchmark::Initialize(&argc, argv);
   if (benchmark::ReportUnrecognizedArguments(argc, argv)) {

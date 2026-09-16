@@ -28,27 +28,23 @@
 
 namespace {
 
-class TestFailure : public std::runtime_error {
+class ArrowAssertionFailure : public std::runtime_error {
  public:
   using std::runtime_error::runtime_error;
 };
 
-void Expect(bool condition, const std::string& message) {
-  if (!condition) {
-    throw TestFailure(message);
-  }
-}
-
 void RequireOk(const arrow::Status& status, const std::string& context) {
   if (!status.ok()) {
-    throw TestFailure(context + ": " + status.ToString());
+    ADD_FAILURE() << context << ": " << status.ToString();
+    throw ArrowAssertionFailure(context + ": " + status.ToString());
   }
 }
 
 template <typename T>
 T ValueOrThrow(arrow::Result<T> result, const std::string& context) {
   if (!result.ok()) {
-    throw TestFailure(context + ": " + result.status().ToString());
+    ADD_FAILURE() << context << ": " << result.status().ToString();
+    throw ArrowAssertionFailure(context + ": " + result.status().ToString());
   }
   return std::move(result).ValueUnsafe();
 }
@@ -475,7 +471,7 @@ TestData MakeAllTypesBatch() {
   return {std::move(table_schema), std::move(batch)};
 }
 
-void TestTypedArrayHashMatchesScalarReference() {
+TEST(SnifferCoreTest, TypedArrayHashMatchesScalarReference) {
   const auto data = MakeAllTypesBatch();
   constexpr std::array<uint64_t, 2> kSeeds = {0x243F6A8885A308D3ULL, 0x13198A2E03707344ULL};
   for (size_t column = 0; column < data.table_schema.fields.size(); ++column) {
@@ -494,18 +490,18 @@ void TestTypedArrayHashMatchesScalarReference() {
         expected_hashes[seed_index] = expected;
         const auto actual = ValueOrThrow(sniffer::internal::HashArrayValue(field, array, row, seed),
                                          "hash typed array value");
-        Expect(actual == expected, "typed array hash matches scalar byte format");
+        EXPECT_TRUE(actual == expected) << "typed array hash matches scalar byte format";
       }
       const auto pair = ValueOrThrow(
           sniffer::internal::HashArrayValuePair(field, array, row, kSeeds[0], kSeeds[1]),
           "hash typed array value pair");
-      Expect(pair.first == expected_hashes[0] && pair.second == expected_hashes[1],
-             "paired typed array hash matches independent scalar hashes");
+      EXPECT_TRUE(pair.first == expected_hashes[0] && pair.second == expected_hashes[1])
+          << "paired typed array hash matches independent scalar hashes";
     }
   }
 }
 
-void TestPlainVariableBulkCopyMatchesReference() {
+TEST(SnifferCoreTest, PlainVariableBulkCopyMatchesReference) {
   const auto strings = BuildStringArray({"discard", "alpha", "beta", "gamma", "tail"});
   const auto sliced = strings->Slice(1, 3);
   const sniffer::FieldSpec string_field{1, "text", arrow::utf8(), false, nullptr};
@@ -513,7 +509,7 @@ void TestPlainVariableBulkCopyMatchesReference() {
       ValueOrThrow(ReferenceEncodePlainVariable(*sliced), "reference sliced Plain string");
   const auto actual = ValueOrThrow(sniffer::internal::EncodePlain(string_field, *sliced),
                                    "bulk sliced Plain string");
-  Expect(actual == expected, "bulk Plain string bytes match row-wise reference");
+  EXPECT_TRUE(actual == expected) << "bulk Plain string bytes match row-wise reference";
 
   const auto binary = BuildBinaryArray(
       {std::vector<uint8_t>{0, 1}, std::nullopt,
@@ -524,11 +520,11 @@ void TestPlainVariableBulkCopyMatchesReference() {
       ValueOrThrow(ReferenceEncodePlainVariable(*binary), "reference nullable Plain binary");
   const auto nullable_actual =
       ValueOrThrow(sniffer::internal::EncodePlain(binary_field, *binary), "nullable Plain binary");
-  Expect(nullable_actual == nullable_expected,
-         "nullable Plain binary bytes match row-wise reference");
+  EXPECT_TRUE(nullable_actual == nullable_expected)
+      << "nullable Plain binary bytes match row-wise reference";
 }
 
-void TestPlainSelectedTypedDecodeMatchesReference() {
+TEST(SnifferCoreTest, PlainSelectedTypedDecodeMatchesReference) {
   const auto data = MakeAllTypesBatch();
   const std::vector<uint64_t> selection = {0, 2, 4};
   for (size_t column = 0; column < data.table_schema.fields.size(); ++column) {
@@ -557,12 +553,12 @@ void TestPlainSelectedTypedDecodeMatchesReference() {
     }
     std::shared_ptr<arrow::Array> expected;
     RequireOk(expected_builder->Finish(&expected), "finish selected Plain reference");
-    Expect(actual->Equals(expected),
-           "typed selected Plain decode matches scalar reference for " + field.name);
+    EXPECT_TRUE(actual->Equals(expected))
+        << "typed selected Plain decode matches scalar reference for " + field.name;
 
     const std::vector<uint64_t> duplicate = {1, 1};
-    Expect(!sniffer::internal::DecodePlainSelected(field, chunk, payload, duplicate).ok(),
-           "selected Plain decode rejects duplicate rows");
+    EXPECT_TRUE(!sniffer::internal::DecodePlainSelected(field, chunk, payload, duplicate).ok())
+        << "selected Plain decode rejects duplicate rows";
   }
 
   const auto& bool_field = data.table_schema.fields.front();
@@ -585,11 +581,12 @@ void TestPlainSelectedTypedDecodeMatchesReference() {
   bool_chunk.null_count = static_cast<uint64_t>(bool_source->null_count());
   bool_chunk.length = static_cast<uint64_t>(corrupted.size());
   const std::vector<uint64_t> first_row = {0};
-  Expect(!sniffer::internal::DecodePlainSelected(bool_field, bool_chunk, corrupted, first_row).ok(),
-         "selected Plain decode rejects non-canonical boolean values");
+  EXPECT_TRUE(
+      !sniffer::internal::DecodePlainSelected(bool_field, bool_chunk, corrupted, first_row).ok())
+      << "selected Plain decode rejects non-canonical boolean values";
 }
 
-void TestTypedRleMatchesScalarReference() {
+TEST(SnifferCoreTest, TypedRleMatchesScalarReference) {
   const auto data = MakeAllTypesBatch();
   for (size_t index = 0; index < 9; ++index) {
     const auto& field = data.table_schema.fields[index];
@@ -598,7 +595,7 @@ void TestTypedRleMatchesScalarReference() {
     const auto actual = ValueOrThrow(
         sniffer::internal::EncodeNonPlain(sniffer::internal::kRleEncodingId, field, array),
         "typed RLE encode");
-    Expect(actual == expected, "typed RLE bytes match scalar reference for " + field.name);
+    EXPECT_TRUE(actual == expected) << "typed RLE bytes match scalar reference for " + field.name;
   }
 
   sniffer::FieldSpec repeated_field{1, "repeated", arrow::int32(), true, nullptr};
@@ -610,10 +607,10 @@ void TestTypedRleMatchesScalarReference() {
       ValueOrThrow(sniffer::internal::EncodeNonPlain(sniffer::internal::kRleEncodingId,
                                                      repeated_field, *repeated),
                    "typed repeated RLE encode");
-  Expect(actual == expected, "typed RLE coalescing bytes match scalar reference");
+  EXPECT_TRUE(actual == expected) << "typed RLE coalescing bytes match scalar reference";
 }
 
-void TestTypedForMatchesScalarReference() {
+TEST(SnifferCoreTest, TypedForMatchesScalarReference) {
   const auto data = MakeAllTypesBatch();
   constexpr std::array<size_t, 9> kColumns = {1, 2, 3, 4, 5, 6, 7, 8, 11};
   for (const size_t index : kColumns) {
@@ -624,11 +621,11 @@ void TestTypedForMatchesScalarReference() {
         ValueOrThrow(sniffer::internal::EncodeNonPlain(
                          static_cast<uint16_t>(sniffer::EncodingKind::kForBitpack), field, array),
                      "typed FOR encode");
-    Expect(actual == expected, "typed FOR bytes match scalar reference");
+    EXPECT_TRUE(actual == expected) << "typed FOR bytes match scalar reference";
   }
 }
 
-void TestTypedDictionaryMatchesScalarReference() {
+TEST(SnifferCoreTest, TypedDictionaryMatchesScalarReference) {
   const auto data = MakeAllTypesBatch();
   const std::array<size_t, 10> field_indexes = {1, 2, 3, 4, 5, 6, 7, 8, 12, 13};
   for (const size_t index : field_indexes) {
@@ -639,11 +636,12 @@ void TestTypedDictionaryMatchesScalarReference() {
     const auto actual = ValueOrThrow(
         sniffer::internal::EncodeNonPlain(sniffer::internal::kDictionaryEncodingId, field, array),
         "typed Dictionary encode");
-    Expect(actual == expected, "typed Dictionary bytes match scalar reference for " + field.name);
+    EXPECT_TRUE(actual == expected)
+        << "typed Dictionary bytes match scalar reference for " + field.name;
   }
 }
 
-void TestNonPlainSelectionValidation() {
+TEST(SnifferCoreTest, NonPlainSelectionValidation) {
   const sniffer::FieldSpec field{1, "value", arrow::int64(), true, nullptr};
   const auto array =
       BuildArray<arrow::Int64Builder, int64_t>({7, 7, std::nullopt, 9, 10, 10, 10, 12});
@@ -664,12 +662,12 @@ void TestNonPlainSelectionValidation() {
     const std::vector<uint64_t> duplicate = {1, 1};
     const std::vector<uint64_t> descending = {3, 2};
     const std::vector<uint64_t> out_of_bounds = {0, chunk.row_count};
-    Expect(!sniffer::internal::DecodeNonPlain(field, chunk, payload, &duplicate).ok(),
-           "non-Plain decode rejects duplicate selection rows");
-    Expect(!sniffer::internal::DecodeNonPlain(field, chunk, payload, &descending).ok(),
-           "non-Plain decode rejects descending selection rows");
-    Expect(!sniffer::internal::DecodeNonPlain(field, chunk, payload, &out_of_bounds).ok(),
-           "non-Plain decode rejects out-of-bounds selection rows");
+    EXPECT_TRUE(!sniffer::internal::DecodeNonPlain(field, chunk, payload, &duplicate).ok())
+        << "non-Plain decode rejects duplicate selection rows";
+    EXPECT_TRUE(!sniffer::internal::DecodeNonPlain(field, chunk, payload, &descending).ok())
+        << "non-Plain decode rejects descending selection rows";
+    EXPECT_TRUE(!sniffer::internal::DecodeNonPlain(field, chunk, payload, &out_of_bounds).ok())
+        << "non-Plain decode rejects out-of-bounds selection rows";
   }
 }
 
@@ -715,7 +713,7 @@ std::vector<int64_t> CollectInt64Column(
   for (const auto& batch : batches) {
     const auto& array = static_cast<const arrow::Int64Array&>(*batch->column(column));
     for (int64_t row = 0; row < array.length(); ++row) {
-      Expect(array.IsValid(row), "collected int64 value is non-null");
+      EXPECT_TRUE(array.IsValid(row)) << "collected int64 value is non-null";
       values.push_back(array.Value(row));
     }
   }
@@ -771,24 +769,24 @@ sniffer::LayoutPolicy ScanLayout() {
 
 std::vector<uint8_t> ReadFile(const std::filesystem::path& path) {
   std::ifstream stream(path, std::ios::binary | std::ios::ate);
-  Expect(stream.is_open(), "open test file for reading");
+  EXPECT_TRUE(stream.is_open()) << "open test file for reading";
   const auto length = stream.tellg();
-  Expect(length >= 0, "determine test file length");
+  EXPECT_TRUE(length >= 0) << "determine test file length";
   stream.seekg(0);
   std::vector<uint8_t> bytes(static_cast<size_t>(length));
   if (!bytes.empty()) {
     stream.read(reinterpret_cast<char*>(bytes.data()), length);
-    Expect(static_cast<bool>(stream), "read test file");
+    EXPECT_TRUE(static_cast<bool>(stream)) << "read test file";
   }
   return bytes;
 }
 
 void WriteFile(const std::filesystem::path& path, std::span<const uint8_t> bytes) {
   std::ofstream stream(path, std::ios::binary | std::ios::trunc);
-  Expect(stream.is_open(), "open test file for writing");
+  EXPECT_TRUE(stream.is_open()) << "open test file for writing";
   stream.write(reinterpret_cast<const char*>(bytes.data()),
                static_cast<std::streamsize>(bytes.size()));
-  Expect(static_cast<bool>(stream), "write test file");
+  EXPECT_TRUE(static_cast<bool>(stream)) << "write test file";
 }
 
 uint32_t Crc32c(std::span<const uint8_t> bytes, uint32_t previous = 0) {
@@ -859,45 +857,45 @@ void RefreshFooterChecksums(std::vector<uint8_t>* bytes) {
            Crc32c(std::span<const uint8_t>(bytes->data() + trailer_offset, 32)));
 }
 
-void TestRoundTripAllTypesAndMultipleRowGroups() {
+TEST(SnifferCoreTest, RoundTripAllTypesAndMultipleRowGroups) {
   const auto data = MakeAllTypesBatch();
   TempFile file("all_types.seg");
   WriteSegment(file.path(), data.table_schema, {data.batch}, 2);
 
   auto reader = ValueOrThrow(sniffer::SegmentReader::Open(file.path().string()), "open reader");
-  Expect(reader->num_row_groups() == 3, "expected three row groups");
-  Expect(reader->schema().schema_version == 7, "schema version round-trip");
-  Expect(reader->schema().fields.size() == data.table_schema.fields.size(),
-         "field count round-trip");
+  EXPECT_TRUE(reader->num_row_groups() == 3) << "expected three row groups";
+  EXPECT_TRUE(reader->schema().schema_version == 7) << "schema version round-trip";
+  EXPECT_TRUE(reader->schema().fields.size() == data.table_schema.fields.size())
+      << "field count round-trip";
   for (size_t index = 0; index < data.table_schema.fields.size(); ++index) {
     const auto& expected = data.table_schema.fields[index];
     const auto& actual = reader->schema().fields[index];
-    Expect(actual.field_id == expected.field_id, "field ID round-trip");
-    Expect(actual.name == expected.name, "field name round-trip");
-    Expect(actual.nullable == expected.nullable, "nullable round-trip");
-    Expect(actual.type->Equals(expected.type), "field type round-trip");
+    EXPECT_TRUE(actual.field_id == expected.field_id) << "field ID round-trip";
+    EXPECT_TRUE(actual.name == expected.name) << "field name round-trip";
+    EXPECT_TRUE(actual.nullable == expected.nullable) << "nullable round-trip";
+    EXPECT_TRUE(actual.type->Equals(expected.type)) << "field type round-trip";
   }
   auto batches = ValueOrThrow(reader->ReadAll(), "read all row groups");
-  Expect(batches.size() == 3, "read three batches");
+  EXPECT_TRUE(batches.size() == 3) << "read three batches";
   int64_t offset = 0;
   for (const auto& batch : batches) {
-    Expect(batch->Equals(*data.batch->Slice(offset, batch->num_rows())),
-           "row-group batch equals input slice");
+    EXPECT_TRUE(batch->Equals(*data.batch->Slice(offset, batch->num_rows())))
+        << "row-group batch equals input slice";
     for (int column = 0; column < batch->num_columns(); ++column) {
       const auto metadata = batch->schema()->field(column)->metadata();
-      Expect(metadata != nullptr, "field ID metadata exists");
+      EXPECT_TRUE(metadata != nullptr) << "field ID metadata exists";
       auto field_id = metadata->Get(sniffer::kFieldIdMetadataKey);
-      Expect(field_id.ok(), "field ID metadata lookup succeeds");
-      Expect(field_id.ValueUnsafe() ==
-                 std::to_string(data.table_schema.fields[static_cast<size_t>(column)].field_id),
-             "field ID metadata value round-trip");
+      EXPECT_TRUE(field_id.ok()) << "field ID metadata lookup succeeds";
+      EXPECT_TRUE(field_id.ValueUnsafe() ==
+                  std::to_string(data.table_schema.fields[static_cast<size_t>(column)].field_id))
+          << "field ID metadata value round-trip";
     }
     offset += batch->num_rows();
   }
   RequireOk(reader->VerifyFileChecksum(), "verify whole-file checksum");
 }
 
-void TestEmptyBatchRoundTrip() {
+TEST(SnifferCoreTest, EmptyBatchRoundTrip) {
   sniffer::TableSchema schema{1, {{1, "value", arrow::int32(), false, nullptr}}};
   auto arrow_schema = ValueOrThrow(schema.ToArrowSchema(), "empty schema");
   auto values = BuildArray<arrow::Int32Builder, int32_t>({});
@@ -907,25 +905,25 @@ void TestEmptyBatchRoundTrip() {
 
   auto reader =
       ValueOrThrow(sniffer::SegmentReader::Open(file.path().string()), "open empty reader");
-  Expect(reader->num_row_groups() == 0, "empty segment has no physical row group");
+  EXPECT_TRUE(reader->num_row_groups() == 0) << "empty segment has no physical row group";
   auto batches = ValueOrThrow(reader->ReadAll(), "read empty segment");
-  Expect(batches.size() == 1 && batches[0]->num_rows() == 0,
-         "empty segment yields one schema-bearing empty batch");
-  Expect(batches[0]->schema()->field(0)->type()->Equals(arrow::int32()),
-         "empty batch schema is retained");
+  EXPECT_TRUE(batches.size() == 1 && batches[0]->num_rows() == 0)
+      << "empty segment yields one schema-bearing empty batch";
+  EXPECT_TRUE(batches[0]->schema()->field(0)->type()->Equals(arrow::int32()))
+      << "empty batch schema is retained";
 }
 
-void TestDeterministicOutput() {
+TEST(SnifferCoreTest, DeterministicOutput) {
   const auto data = MakeAllTypesBatch();
   TempFile first("deterministic_a.seg");
   TempFile second("deterministic_b.seg");
   WriteSegment(first.path(), data.table_schema, {data.batch}, 3);
   WriteSegment(second.path(), data.table_schema, {data.batch}, 3);
-  Expect(ReadFile(first.path()) == ReadFile(second.path()),
-         "same input and policy produce identical files");
+  EXPECT_TRUE(ReadFile(first.path()) == ReadFile(second.path()))
+      << "same input and policy produce identical files";
 }
 
-void TestDeterministicRandomizedRoundTrip() {
+TEST(SnifferCoreTest, DeterministicRandomizedRoundTrip) {
   sniffer::TableSchema schema{11,
                               {{101, "number", arrow::int64(), true, nullptr},
                                {102, "label", arrow::utf8(), true, nullptr},
@@ -987,14 +985,14 @@ void TestDeterministicRandomizedRoundTrip() {
   auto batches = ValueOrThrow(reader->ReadAll(), "read randomized segment");
   int64_t offset = 0;
   for (const auto& output : batches) {
-    Expect(output->Equals(*batch->Slice(offset, output->num_rows())),
-           "randomized output equals input slice");
+    EXPECT_TRUE(output->Equals(*batch->Slice(offset, output->num_rows())))
+        << "randomized output equals input slice";
     offset += output->num_rows();
   }
-  Expect(offset == kRows, "randomized round-trip preserves every row");
+  EXPECT_TRUE(offset == kRows) << "randomized round-trip preserves every row";
 }
 
-void TestHeaderCorruptionFailsOpen() {
+TEST(SnifferCoreTest, HeaderCorruptionFailsOpen) {
   const auto data = MakeAllTypesBatch();
   TempFile file("bad_header.seg");
   WriteSegment(file.path(), data.table_schema, {data.batch});
@@ -1002,10 +1000,10 @@ void TestHeaderCorruptionFailsOpen() {
   bytes[0] ^= 0x01U;
   WriteFile(file.path(), bytes);
   auto reader = sniffer::SegmentReader::Open(file.path().string());
-  Expect(!reader.ok(), "bad header magic must fail Open");
+  EXPECT_TRUE(!reader.ok()) << "bad header magic must fail Open";
 }
 
-void TestUnsupportedVersionFailsOpen() {
+TEST(SnifferCoreTest, UnsupportedVersionFailsOpen) {
   const auto data = MakeAllTypesBatch();
   TempFile file("unsupported_version.seg");
   WriteSegment(file.path(), data.table_schema, {data.batch});
@@ -1014,11 +1012,11 @@ void TestUnsupportedVersionFailsOpen() {
   WriteU32(&bytes, 28, Crc32c(std::span<const uint8_t>(bytes.data(), 28)));
   WriteFile(file.path(), bytes);
   auto reader = sniffer::SegmentReader::Open(file.path().string());
-  Expect(!reader.ok() && reader.status().IsNotImplemented(),
-         "unsupported format major version must fail explicitly");
+  EXPECT_TRUE(!reader.ok() && reader.status().IsNotImplemented())
+      << "unsupported format major version must fail explicitly";
 }
 
-void TestFooterCorruptionFailsOpen() {
+TEST(SnifferCoreTest, FooterCorruptionFailsOpen) {
   const auto data = MakeAllTypesBatch();
   TempFile file("bad_footer.seg");
   WriteSegment(file.path(), data.table_schema, {data.batch});
@@ -1028,10 +1026,10 @@ void TestFooterCorruptionFailsOpen() {
   bytes[footer_offset] ^= 0x01U;
   WriteFile(file.path(), bytes);
   auto reader = sniffer::SegmentReader::Open(file.path().string());
-  Expect(!reader.ok(), "bad footer checksum must fail Open");
+  EXPECT_TRUE(!reader.ok()) << "bad footer checksum must fail Open";
 }
 
-void TestChunkCorruptionFailsLazyReadAndFileVerify() {
+TEST(SnifferCoreTest, ChunkCorruptionFailsLazyReadAndFileVerify) {
   const auto data = MakeAllTypesBatch();
   TempFile file("bad_chunk.seg");
   WriteSegment(file.path(), data.table_schema, {data.batch});
@@ -1041,11 +1039,12 @@ void TestChunkCorruptionFailsLazyReadAndFileVerify() {
 
   auto reader = ValueOrThrow(sniffer::SegmentReader::Open(file.path().string()),
                              "metadata-only open after chunk corruption");
-  Expect(!reader->ReadAll().ok(), "chunk corruption must fail when chunk is read");
-  Expect(!reader->VerifyFileChecksum().ok(), "chunk corruption must fail whole-file verification");
+  EXPECT_TRUE(!reader->ReadAll().ok()) << "chunk corruption must fail when chunk is read";
+  EXPECT_TRUE(!reader->VerifyFileChecksum().ok())
+      << "chunk corruption must fail whole-file verification";
 }
 
-void TestInvalidChunkOffsetFailsOpen() {
+TEST(SnifferCoreTest, InvalidChunkOffsetFailsOpen) {
   sniffer::TableSchema schema{1, {{77, "x", arrow::int32(), true, nullptr}}};
   auto arrow_schema = ValueOrThrow(schema.ToArrowSchema(), "single schema");
   auto array = BuildArray<arrow::Int32Builder, int32_t>({1, std::nullopt, 3});
@@ -1067,10 +1066,10 @@ void TestInvalidChunkOffsetFailsOpen() {
   RefreshFooterChecksums(&bytes);
   WriteFile(file.path(), bytes);
   auto reader = sniffer::SegmentReader::Open(file.path().string());
-  Expect(!reader.ok(), "overflowing chunk offset must fail Open");
+  EXPECT_TRUE(!reader.ok()) << "overflowing chunk offset must fail Open";
 }
 
-void TestUnknownEncodingFailsOpen() {
+TEST(SnifferCoreTest, UnknownEncodingFailsOpen) {
   sniffer::TableSchema schema{1, {{77, "x", arrow::int32(), true, nullptr}}};
   auto arrow_schema = ValueOrThrow(schema.ToArrowSchema(), "single schema");
   auto array = BuildArray<arrow::Int32Builder, int32_t>({1, 2, 3});
@@ -1092,11 +1091,11 @@ void TestUnknownEncodingFailsOpen() {
   RefreshFooterChecksums(&bytes);
   WriteFile(file.path(), bytes);
   auto reader = sniffer::SegmentReader::Open(file.path().string());
-  Expect(!reader.ok() && reader.status().IsNotImplemented(),
-         "unknown encoding must fail explicitly");
+  EXPECT_TRUE(!reader.ok() && reader.status().IsNotImplemented())
+      << "unknown encoding must fail explicitly";
 }
 
-void TestUnknownPhysicalTypeFailsOpen() {
+TEST(SnifferCoreTest, UnknownPhysicalTypeFailsOpen) {
   sniffer::TableSchema schema{1, {{77, "x", arrow::int32(), true, nullptr}}};
   auto arrow_schema = ValueOrThrow(schema.ToArrowSchema(), "single schema");
   auto array = BuildArray<arrow::Int32Builder, int32_t>({1, 2, 3});
@@ -1112,11 +1111,11 @@ void TestUnknownPhysicalTypeFailsOpen() {
   RefreshFooterChecksums(&bytes);
   WriteFile(file.path(), bytes);
   auto reader = sniffer::SegmentReader::Open(file.path().string());
-  Expect(!reader.ok() && reader.status().IsNotImplemented(),
-         "unknown physical type must fail explicitly");
+  EXPECT_TRUE(!reader.ok() && reader.status().IsNotImplemented())
+      << "unknown physical type must fail explicitly";
 }
 
-void TestTruncationFailsOpen() {
+TEST(SnifferCoreTest, TruncationFailsOpen) {
   const auto data = MakeAllTypesBatch();
   TempFile file("truncated.seg");
   WriteSegment(file.path(), data.table_schema, {data.batch});
@@ -1124,16 +1123,17 @@ void TestTruncationFailsOpen() {
   bytes.resize(bytes.size() - 7);
   WriteFile(file.path(), bytes);
   auto reader = sniffer::SegmentReader::Open(file.path().string());
-  Expect(!reader.ok(), "truncated metadata must fail Open");
+  EXPECT_TRUE(!reader.ok()) << "truncated metadata must fail Open";
 }
 
-void TestSchemaAndWriterStateValidation() {
+TEST(SnifferCoreTest, SchemaAndWriterStateValidation) {
   sniffer::TableSchema duplicate{
       1, {{1, "a", arrow::int32(), true, nullptr}, {1, "b", arrow::int64(), true, nullptr}}};
-  Expect(!duplicate.Validate().ok(), "duplicate field IDs must fail");
+  EXPECT_TRUE(!duplicate.Validate().ok()) << "duplicate field IDs must fail";
 
   sniffer::TableSchema nested{1, {{1, "nested", arrow::list(arrow::int32()), true, nullptr}}};
-  Expect(nested.Validate().IsNotImplemented(), "nested type must fail explicitly in phase one");
+  EXPECT_TRUE(nested.Validate().IsNotImplemented())
+      << "nested type must fail explicitly in phase one";
 
   sniffer::TableSchema schema{1, {{1, "x", arrow::int32(), true, nullptr}}};
   auto arrow_schema = ValueOrThrow(schema.ToArrowSchema(), "writer schema");
@@ -1144,11 +1144,11 @@ void TestSchemaAndWriterStateValidation() {
       ValueOrThrow(sniffer::SegmentWriter::Open(file.path().string(), schema), "open state writer");
   RequireOk(writer->Append(batch), "append state batch");
   RequireOk(writer->Finish(), "finish state writer");
-  Expect(!writer->Append(batch).ok(), "Append after Finish must fail");
-  Expect(!writer->Finish().ok(), "second Finish must fail");
+  EXPECT_TRUE(!writer->Append(batch).ok()) << "Append after Finish must fail";
+  EXPECT_TRUE(!writer->Finish().ok()) << "second Finish must fail";
 }
 
-void TestIOPlanProjectionPredicatesLimitAndBatching() {
+TEST(SnifferCoreTest, IOPlanProjectionPredicatesLimitAndBatching) {
   const auto data = MakeScanBatch();
   TempFile file("scan_projection.seg");
   WriteSegmentWithPolicy(file.path(), data.table_schema, {data.batch}, ScanLayout());
@@ -1164,21 +1164,21 @@ void TestIOPlanProjectionPredicatesLimitAndBatching() {
   auto metrics = std::make_shared<sniffer::ScanMetrics>();
   auto iterator = ValueOrThrow(reader->Scan(plan, metrics), "create projected scan");
   const auto batches = CollectScan(std::move(iterator));
-  Expect(batches.size() == 2, "limit output is split into two batches");
-  Expect(CollectInt64Column(batches, 1) == std::vector<int64_t>({10, 16, 20, 22}),
-         "AND predicates and limit preserve logical row order");
+  EXPECT_TRUE(batches.size() == 2) << "limit output is split into two batches";
+  EXPECT_TRUE(CollectInt64Column(batches, 1) == std::vector<int64_t>({10, 16, 20, 22}))
+      << "AND predicates and limit preserve logical row order";
   std::vector<std::string> payloads;
   for (const auto& batch : batches) {
-    Expect(batch->schema()->field(0)->name() == "payload" &&
-               batch->schema()->field(1)->name() == "key",
-           "projection order is caller-defined");
+    EXPECT_TRUE(batch->schema()->field(0)->name() == "payload" &&
+                batch->schema()->field(1)->name() == "key")
+        << "projection order is caller-defined";
     const auto& payload = static_cast<const arrow::BinaryArray&>(*batch->column(0));
     for (int64_t row = 0; row < payload.length(); ++row) {
       payloads.emplace_back(payload.GetView(row));
     }
   }
-  Expect(payloads == std::vector<std::string>({"p10", "p16", "p20", "p22"}),
-         "projection-only binary values are decoded for selected rows");
+  EXPECT_TRUE(payloads == std::vector<std::string>({"p10", "p16", "p20", "p22"}))
+      << "projection-only binary values are decoded for selected rows";
 
   arrow::BinaryBuilder reference_payload_builder;
   arrow::Int64Builder reference_key_builder;
@@ -1205,16 +1205,16 @@ void TestIOPlanProjectionPredicatesLimitAndBatching() {
   RequireOk(reference_key_builder.Finish(&expected_key), "finish Arrow reference key");
   auto actual = ValueOrThrow(arrow::ConcatenateRecordBatches(batches), "concatenate scan result");
   auto expected = arrow::RecordBatch::Make(actual->schema(), 4, {expected_payload, expected_key});
-  Expect(actual->Equals(*expected),
-         "IOPlan result equals full decode plus Arrow reference filtering");
-  Expect(metrics->row_groups_considered == 5 && metrics->row_groups_pruned == 2,
-         "statistics prune early row groups before the limit is reached");
-  Expect(metrics->predicate_chunks_decoded == 6 && metrics->projection_chunks_decoded == 6 &&
-             metrics->column_chunks_read == 12,
-         "predicate and projection chunks follow separate decode paths");
+  EXPECT_TRUE(actual->Equals(*expected))
+      << "IOPlan result equals full decode plus Arrow reference filtering";
+  EXPECT_TRUE(metrics->row_groups_considered == 5 && metrics->row_groups_pruned == 2)
+      << "statistics prune early row groups before the limit is reached";
+  EXPECT_TRUE(metrics->predicate_chunks_decoded == 6 && metrics->projection_chunks_decoded == 6 &&
+              metrics->column_chunks_read == 12)
+      << "predicate and projection chunks follow separate decode paths";
 }
 
-void TestBloomPrunesWithoutChunkReads() {
+TEST(SnifferCoreTest, BloomPrunesWithoutChunkReads) {
   const auto data = MakeScanBatch();
   TempFile file("scan_bloom.seg");
   WriteSegmentWithPolicy(file.path(), data.table_schema, {data.batch}, ScanLayout());
@@ -1227,14 +1227,14 @@ void TestBloomPrunesWithoutChunkReads() {
   plan.output_batch_rows = 3;
   auto metrics = std::make_shared<sniffer::ScanMetrics>();
   auto batches = CollectScan(ValueOrThrow(reader->Scan(plan, metrics), "create Bloom scan"));
-  Expect(batches.empty(), "absent Bloom value produces no rows");
-  Expect(metrics->row_groups_considered == 6 && metrics->row_groups_pruned == 6,
-         "Bloom prunes every row group");
-  Expect(metrics->column_chunks_read == 0 && metrics->chunk_bytes_read == 0,
-         "Bloom pruning reads no data ColumnChunk");
+  EXPECT_TRUE(batches.empty()) << "absent Bloom value produces no rows";
+  EXPECT_TRUE(metrics->row_groups_considered == 6 && metrics->row_groups_pruned == 6)
+      << "Bloom prunes every row group";
+  EXPECT_TRUE(metrics->column_chunks_read == 0 && metrics->chunk_bytes_read == 0)
+      << "Bloom pruning reads no data ColumnChunk";
 }
 
-void TestSortKeyRangeAndEmptyProjection() {
+TEST(SnifferCoreTest, SortKeyRangeAndEmptyProjection) {
   const auto data = MakeScanBatch();
   TempFile file("scan_sort_range.seg");
   WriteSegmentWithPolicy(file.path(), data.table_schema, {data.batch}, ScanLayout());
@@ -1252,13 +1252,13 @@ void TestSortKeyRangeAndEmptyProjection() {
   auto metrics = std::make_shared<sniffer::ScanMetrics>();
   auto batches =
       CollectScan(ValueOrThrow(reader->Scan(range_plan, metrics), "create sort-key range scan"));
-  Expect(CollectInt64Column(batches, 0) == std::vector<int64_t>({12, 13, 14, 15, 16, 17}),
-         "half-open sort-key range filters row boundaries exactly");
-  Expect(batches.size() == 2 && batches[0]->num_rows() == 4 && batches[1]->num_rows() == 2,
-         "sort-key range output obeys batch size across row groups");
-  Expect(metrics->row_groups_pruned == 4 && metrics->column_chunks_read == 2 &&
-             metrics->predicate_chunks_decoded == 2 && metrics->projection_chunks_decoded == 0,
-         "sort-key index prunes four groups and reuses decoded key columns");
+  EXPECT_TRUE(CollectInt64Column(batches, 0) == std::vector<int64_t>({12, 13, 14, 15, 16, 17}))
+      << "half-open sort-key range filters row boundaries exactly";
+  EXPECT_TRUE(batches.size() == 2 && batches[0]->num_rows() == 4 && batches[1]->num_rows() == 2)
+      << "sort-key range output obeys batch size across row groups";
+  EXPECT_TRUE(metrics->row_groups_pruned == 4 && metrics->column_chunks_read == 2 &&
+              metrics->predicate_chunks_decoded == 2 && metrics->projection_chunks_decoded == 0)
+      << "sort-key index prunes four groups and reuses decoded key columns";
 
   sniffer::IOPlan empty_projection;
   empty_projection.conjunctive_predicates = {
@@ -1266,12 +1266,12 @@ void TestSortKeyRangeAndEmptyProjection() {
   empty_projection.output_batch_rows = 2;
   auto empty_batches =
       CollectScan(ValueOrThrow(reader->Scan(empty_projection), "create empty-projection scan"));
-  Expect(empty_batches.size() == 2 && empty_batches[0]->num_columns() == 0 &&
-             empty_batches[0]->num_rows() == 2 && empty_batches[1]->num_rows() == 1,
-         "empty projection retains filtered row counts and batching");
+  EXPECT_TRUE(empty_batches.size() == 2 && empty_batches[0]->num_columns() == 0 &&
+              empty_batches[0]->num_rows() == 2 && empty_batches[1]->num_rows() == 1)
+      << "empty projection retains filtered row counts and batching";
 }
 
-void TestAllPredicateOperationsAndNulls() {
+TEST(SnifferCoreTest, AllPredicateOperationsAndNulls) {
   const auto data = MakeScanBatch();
   TempFile file("scan_operators.seg");
   WriteSegmentWithPolicy(file.path(), data.table_schema, {data.batch}, ScanLayout());
@@ -1286,22 +1286,23 @@ void TestAllPredicateOperationsAndNulls() {
         CollectScan(ValueOrThrow(reader->Scan(std::move(plan)), "create operator scan")), 0);
   };
   const auto key_value = [] { return std::make_shared<arrow::Int64Scalar>(10); };
-  Expect(scan_keys({1, sniffer::Predicate::Op::kEq, key_value()}) == std::vector<int64_t>({10}),
-         "equality predicate");
+  EXPECT_TRUE(scan_keys({1, sniffer::Predicate::Op::kEq, key_value()}) ==
+              std::vector<int64_t>({10}))
+      << "equality predicate";
   std::vector<int64_t> not_equal;
   for (int64_t value = 0; value < 30; ++value) {
     if (value != 10) {
       not_equal.push_back(value);
     }
   }
-  Expect(scan_keys({1, sniffer::Predicate::Op::kNe, key_value()}) == not_equal,
-         "not-equal predicate");
-  Expect(scan_keys({1, sniffer::Predicate::Op::kLt, key_value()}) ==
-             std::vector<int64_t>({0, 1, 2, 3, 4, 5, 6, 7, 8, 9}),
-         "less-than predicate");
-  Expect(scan_keys({1, sniffer::Predicate::Op::kLe, key_value()}) ==
-             std::vector<int64_t>({0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10}),
-         "less-or-equal predicate");
+  EXPECT_TRUE(scan_keys({1, sniffer::Predicate::Op::kNe, key_value()}) == not_equal)
+      << "not-equal predicate";
+  EXPECT_TRUE(scan_keys({1, sniffer::Predicate::Op::kLt, key_value()}) ==
+              std::vector<int64_t>({0, 1, 2, 3, 4, 5, 6, 7, 8, 9}))
+      << "less-than predicate";
+  EXPECT_TRUE(scan_keys({1, sniffer::Predicate::Op::kLe, key_value()}) ==
+              std::vector<int64_t>({0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10}))
+      << "less-or-equal predicate";
   std::vector<int64_t> greater;
   std::vector<int64_t> greater_equal;
   for (int64_t value = 10; value < 30; ++value) {
@@ -1310,24 +1311,24 @@ void TestAllPredicateOperationsAndNulls() {
       greater.push_back(value);
     }
   }
-  Expect(scan_keys({1, sniffer::Predicate::Op::kGt, key_value()}) == greater,
-         "greater-than predicate");
-  Expect(scan_keys({1, sniffer::Predicate::Op::kGe, key_value()}) == greater_equal,
-         "greater-or-equal predicate");
-  Expect(scan_keys({3, sniffer::Predicate::Op::kIsNull, nullptr}) ==
-             std::vector<int64_t>({0, 7, 14, 21, 28}),
-         "IS NULL predicate");
+  EXPECT_TRUE(scan_keys({1, sniffer::Predicate::Op::kGt, key_value()}) == greater)
+      << "greater-than predicate";
+  EXPECT_TRUE(scan_keys({1, sniffer::Predicate::Op::kGe, key_value()}) == greater_equal)
+      << "greater-or-equal predicate";
+  EXPECT_TRUE(scan_keys({3, sniffer::Predicate::Op::kIsNull, nullptr}) ==
+              std::vector<int64_t>({0, 7, 14, 21, 28}))
+      << "IS NULL predicate";
   std::vector<int64_t> not_null;
   for (int64_t value = 0; value < 30; ++value) {
     if (value % 7 != 0) {
       not_null.push_back(value);
     }
   }
-  Expect(scan_keys({3, sniffer::Predicate::Op::kIsNotNull, nullptr}) == not_null,
-         "IS NOT NULL predicate");
+  EXPECT_TRUE(scan_keys({3, sniffer::Predicate::Op::kIsNotNull, nullptr}) == not_null)
+      << "IS NOT NULL predicate";
 }
 
-void TestTypedPredicatesAndProjectionAllTypes() {
+TEST(SnifferCoreTest, TypedPredicatesAndProjectionAllTypes) {
   const auto data = MakeAllTypesBatch();
   TempFile file("typed_predicates_all_types.seg");
   sniffer::LayoutPolicy policy;
@@ -1366,16 +1367,17 @@ void TestTypedPredicatesAndProjectionAllTypes() {
     }
     std::shared_ptr<arrow::Array> expected;
     RequireOk(expected_builder->Finish(&expected), "finish reference predicate result");
-    Expect(actual->Equals(expected), "typed equality predicate and projection match reference");
+    EXPECT_TRUE(actual->Equals(expected))
+        << "typed equality predicate and projection match reference";
 
     sniffer::IOPlan nulls;
     nulls.projection_field_ids = {field.field_id};
     nulls.conjunctive_predicates = {{field.field_id, sniffer::Predicate::Op::kIsNull, nullptr}};
     const auto null_batches =
         CollectScan(ValueOrThrow(reader->Scan(nulls), "scan typed null predicate"));
-    Expect(null_batches.size() == 1 && null_batches[0]->num_rows() == source->null_count() &&
-               null_batches[0]->column(0)->null_count() == source->null_count(),
-           "typed projection preserves selected null values");
+    EXPECT_TRUE(null_batches.size() == 1 && null_batches[0]->num_rows() == source->null_count() &&
+                null_batches[0]->column(0)->null_count() == source->null_count())
+        << "typed projection preserves selected null values";
   }
 
   sniffer::TableSchema nan_schema{1, {{1, "value", arrow::float64(), true, nullptr}}};
@@ -1394,11 +1396,11 @@ void TestTypedPredicatesAndProjectionAllTypes() {
        std::make_shared<arrow::DoubleScalar>(std::numeric_limits<double>::quiet_NaN())}};
   const auto nan_batches =
       CollectScan(ValueOrThrow(nan_reader->Scan(nan_not_equal), "scan NaN not-equal"));
-  Expect(nan_batches.size() == 1 && nan_batches[0]->num_rows() == 2,
-         "typed predicate preserves NaN not-equal semantics");
+  EXPECT_TRUE(nan_batches.size() == 1 && nan_batches[0]->num_rows() == 2)
+      << "typed predicate preserves NaN not-equal semantics";
 }
 
-void TestOptionalPhaseMetrics() {
+TEST(SnifferCoreTest, OptionalPhaseMetrics) {
   const auto data = MakeScanBatch();
   TempFile file("phase_metrics.seg");
   auto writer_metrics = std::make_shared<sniffer::WriterMetrics>();
@@ -1408,22 +1410,23 @@ void TestOptionalPhaseMetrics() {
                              "open metrics writer");
   RequireOk(writer->Append(data.batch), "append metrics batch");
   RequireOk(writer->Finish(), "finish metrics writer");
-  Expect(writer_metrics->encoding_nanoseconds != std::numeric_limits<uint64_t>::max() &&
-             writer_metrics->encoding_nanoseconds + writer_metrics->index_nanoseconds +
-                     writer_metrics->checksum_nanoseconds + writer_metrics->file_write_nanoseconds >
-                 0,
-         "optional writer metrics reset and record phase timings");
+  EXPECT_TRUE(writer_metrics->encoding_nanoseconds != std::numeric_limits<uint64_t>::max() &&
+              writer_metrics->encoding_nanoseconds + writer_metrics->index_nanoseconds +
+                      writer_metrics->checksum_nanoseconds +
+                      writer_metrics->file_write_nanoseconds >
+                  0)
+      << "optional writer metrics reset and record phase timings";
 
   auto reader_metrics = std::make_shared<sniffer::ReaderMetrics>();
   reader_metrics->metadata_parse_nanoseconds = std::numeric_limits<uint64_t>::max();
   auto reader = ValueOrThrow(sniffer::SegmentReader::Open(file.path().string(), reader_metrics),
                              "open metrics reader");
-  Expect(reader_metrics->metadata_parse_nanoseconds != std::numeric_limits<uint64_t>::max() &&
-             reader_metrics->envelope_io_nanoseconds + reader_metrics->metadata_parse_nanoseconds +
-                     reader_metrics->index_parse_nanoseconds >
-                 0 &&
-             reader_metrics->file_handles_opened == 1,
-         "optional reader metrics reset and record open timings");
+  EXPECT_TRUE(reader_metrics->metadata_parse_nanoseconds != std::numeric_limits<uint64_t>::max() &&
+              reader_metrics->envelope_io_nanoseconds + reader_metrics->metadata_parse_nanoseconds +
+                      reader_metrics->index_parse_nanoseconds >
+                  0 &&
+              reader_metrics->file_handles_opened == 1)
+      << "optional reader metrics reset and record open timings";
 
   sniffer::IOPlan plan;
   plan.projection_field_ids = {1};
@@ -1432,18 +1435,18 @@ void TestOptionalPhaseMetrics() {
   auto scan_metrics = std::make_shared<sniffer::ScanMetrics>();
   const auto batches =
       CollectScan(ValueOrThrow(reader->Scan(plan, scan_metrics), "scan with phase metrics"));
-  Expect(!batches.empty() && scan_metrics->predicate_nanoseconds +
-                                     scan_metrics->decode_nanoseconds +
-                                     scan_metrics->chunk_io_nanoseconds >
-                                 0,
-         "scan metrics record execution phase timings");
+  EXPECT_TRUE(!batches.empty() && scan_metrics->predicate_nanoseconds +
+                                          scan_metrics->decode_nanoseconds +
+                                          scan_metrics->chunk_io_nanoseconds >
+                                      0)
+      << "scan metrics record execution phase timings";
   const auto all_batches = ValueOrThrow(reader->ReadAll(), "read all with retained file handle");
   RequireOk(reader->VerifyFileChecksum(), "verify with retained file handle");
-  Expect(!all_batches.empty() && reader_metrics->file_handles_opened == 1,
-         "reader reuses one file handle across open, scan, read-all, and checksum verification");
+  EXPECT_TRUE(!all_batches.empty() && reader_metrics->file_handles_opened == 1)
+      << "reader reuses one file handle across open, scan, read-all, and checksum verification";
 }
 
-void TestSequentialFallbackAndPlanValidation() {
+TEST(SnifferCoreTest, SequentialFallbackAndPlanValidation) {
   const auto data = MakeScanBatch();
   TempFile file("scan_fallback.seg");
   sniffer::LayoutPolicy policy;
@@ -1457,63 +1460,64 @@ void TestSequentialFallbackAndPlanValidation() {
       {2, sniffer::Predicate::Op::kEq, std::make_shared<arrow::StringScalar>("absent")}};
   auto metrics = std::make_shared<sniffer::ScanMetrics>();
   auto batches = CollectScan(ValueOrThrow(reader->Scan(fallback, metrics), "create fallback scan"));
-  Expect(batches.empty() && metrics->row_groups_pruned == 0 &&
-             metrics->predicate_chunks_decoded == 6 && metrics->column_chunks_read == 6,
-         "missing indexes safely degrade to predicate-column sequential scan");
+  EXPECT_TRUE(batches.empty() && metrics->row_groups_pruned == 0 &&
+              metrics->predicate_chunks_decoded == 6 && metrics->column_chunks_read == 6)
+      << "missing indexes safely degrade to predicate-column sequential scan";
 
   sniffer::IOPlan wrong_type;
   wrong_type.projection_field_ids = {1};
   wrong_type.conjunctive_predicates = {
       {1, sniffer::Predicate::Op::kEq, std::make_shared<arrow::Int32Scalar>(1)}};
-  Expect(!reader->Scan(wrong_type).ok(), "implicit predicate type conversion is rejected");
+  EXPECT_TRUE(!reader->Scan(wrong_type).ok()) << "implicit predicate type conversion is rejected";
 
   sniffer::IOPlan duplicate_projection;
   duplicate_projection.projection_field_ids = {1, 1};
-  Expect(!reader->Scan(duplicate_projection).ok(), "duplicate projection field is rejected");
+  EXPECT_TRUE(!reader->Scan(duplicate_projection).ok()) << "duplicate projection field is rejected";
 
   sniffer::IOPlan bad_batch_size;
   bad_batch_size.output_batch_rows = 0;
-  Expect(!reader->Scan(bad_batch_size).ok(), "zero output batch size is rejected");
+  EXPECT_TRUE(!reader->Scan(bad_batch_size).ok()) << "zero output batch size is rejected";
 
   sniffer::IOPlan zero_limit;
   zero_limit.projection_field_ids = {1};
   zero_limit.limit = 0;
   auto zero_metrics = std::make_shared<sniffer::ScanMetrics>();
-  Expect(CollectScan(ValueOrThrow(reader->Scan(zero_limit, zero_metrics), "scan zero limit"))
-                 .empty() &&
-             zero_metrics->row_groups_considered == 0,
-         "zero limit reads no row groups");
+  EXPECT_TRUE(CollectScan(ValueOrThrow(reader->Scan(zero_limit, zero_metrics), "scan zero limit"))
+                  .empty() &&
+              zero_metrics->row_groups_considered == 0)
+      << "zero limit reads no row groups";
 
   sniffer::IOPlan unknown_projection;
   unknown_projection.projection_field_ids = {999};
-  Expect(!reader->Scan(unknown_projection).ok(), "unknown projection field is rejected");
+  EXPECT_TRUE(!reader->Scan(unknown_projection).ok()) << "unknown projection field is rejected";
 
   sniffer::IOPlan missing_value;
   missing_value.conjunctive_predicates = {{1, sniffer::Predicate::Op::kEq, nullptr}};
-  Expect(!reader->Scan(missing_value).ok(), "comparison predicate requires a value");
+  EXPECT_TRUE(!reader->Scan(missing_value).ok()) << "comparison predicate requires a value";
 
   sniffer::IOPlan null_test_value;
   null_test_value.conjunctive_predicates = {
       {1, sniffer::Predicate::Op::kIsNull, std::make_shared<arrow::Int64Scalar>(1)}};
-  Expect(!reader->Scan(null_test_value).ok(), "null predicate rejects a comparison value");
+  EXPECT_TRUE(!reader->Scan(null_test_value).ok()) << "null predicate rejects a comparison value";
 
   sniffer::IOPlan missing_sort_key;
   sniffer::SortKeyRange range;
   range.lower =
       std::vector<std::shared_ptr<arrow::Scalar>>{std::make_shared<arrow::Int64Scalar>(1)};
   missing_sort_key.sort_key_range = std::move(range);
-  Expect(!reader->Scan(missing_sort_key).ok(), "sort-key range on an unsorted segment is rejected");
+  EXPECT_TRUE(!reader->Scan(missing_sort_key).ok())
+      << "sort-key range on an unsorted segment is rejected";
 }
 
-void TestSortOrderAndIndexCorruptionValidation() {
+TEST(SnifferCoreTest, SortOrderAndIndexCorruptionValidation) {
   sniffer::TableSchema nullable_sort_schema{1, {{1, "key", arrow::int64(), true, nullptr}}};
   sniffer::LayoutPolicy invalid_layout;
   invalid_layout.sort_key_field_ids = {1};
   TempFile invalid_file("nullable_sort.seg");
-  Expect(!sniffer::SegmentWriter::Open(invalid_file.path().string(), nullable_sort_schema,
-                                       invalid_layout)
-              .ok(),
-         "nullable sort-key configuration is rejected");
+  EXPECT_TRUE(!sniffer::SegmentWriter::Open(invalid_file.path().string(), nullable_sort_schema,
+                                            invalid_layout)
+                   .ok())
+      << "nullable sort-key configuration is rejected";
 
   sniffer::TableSchema schema{1, {{1, "key", arrow::int64(), false, nullptr}}};
   auto arrow_schema = ValueOrThrow(schema.ToArrowSchema(), "sort validation schema");
@@ -1526,7 +1530,8 @@ void TestSortOrderAndIndexCorruptionValidation() {
   auto writer = ValueOrThrow(
       sniffer::SegmentWriter::Open(unsorted_file.path().string(), schema, sorted_layout),
       "open unsorted writer");
-  Expect(!writer->Append(batch).ok(), "unsorted input is rejected before row groups are written");
+  EXPECT_TRUE(!writer->Append(batch).ok())
+      << "unsorted input is rejected before row groups are written";
 
   TempFile cross_append_file("cross_append_unsorted.seg");
   auto cross_writer = ValueOrThrow(
@@ -1536,8 +1541,9 @@ void TestSortOrderAndIndexCorruptionValidation() {
   auto second_values = BuildArray<arrow::Int64Builder, int64_t>({2, 4});
   RequireOk(cross_writer->Append(arrow::RecordBatch::Make(arrow_schema, 2, {first_values})),
             "append first sorted batch");
-  Expect(!cross_writer->Append(arrow::RecordBatch::Make(arrow_schema, 2, {second_values})).ok(),
-         "global sort order is checked across Append calls");
+  EXPECT_TRUE(
+      !cross_writer->Append(arrow::RecordBatch::Make(arrow_schema, 2, {second_values})).ok())
+      << "global sort order is checked across Append calls";
 
   sniffer::TableSchema corruption_schema{1, {{7, "x", arrow::int32(), false, nullptr}}};
   auto corruption_arrow_schema =
@@ -1564,11 +1570,11 @@ void TestSortOrderAndIndexCorruptionValidation() {
   const size_t index_offset = static_cast<size_t>(chunk_offset + chunk_length);
   bytes[index_offset + 4] ^= 0x01U;
   WriteFile(corruption_file.path(), bytes);
-  Expect(!sniffer::SegmentReader::Open(corruption_file.path().string()).ok(),
-         "index checksum corruption fails Open before scanning");
+  EXPECT_TRUE(!sniffer::SegmentReader::Open(corruption_file.path().string()).ok())
+      << "index checksum corruption fails Open before scanning";
 }
 
-void TestBloomSignedZeroEquality() {
+TEST(SnifferCoreTest, BloomSignedZeroEquality) {
   sniffer::TableSchema schema{1, {{1, "value", arrow::float64(), false, nullptr}}};
   auto arrow_schema = ValueOrThrow(schema.ToArrowSchema(), "signed-zero schema");
   auto values = BuildArray<arrow::DoubleBuilder, double>({0.0});
@@ -1584,11 +1590,11 @@ void TestBloomSignedZeroEquality() {
   plan.conjunctive_predicates = {
       {1, sniffer::Predicate::Op::kEq, std::make_shared<arrow::DoubleScalar>(-0.0)}};
   auto batches = CollectScan(ValueOrThrow(reader->Scan(plan), "scan signed zero"));
-  Expect(batches.size() == 1 && batches[0]->num_rows() == 1,
-         "Bloom hashing preserves +0 == -0 predicate semantics");
+  EXPECT_TRUE(batches.size() == 1 && batches[0]->num_rows() == 1)
+      << "Bloom hashing preserves +0 == -0 predicate semantics";
 }
 
-void TestLegacyFooterScanFallback() {
+TEST(SnifferCoreTest, LegacyFooterScanFallback) {
   const auto data = MakeScanBatch();
   TempFile file("legacy_footer.seg");
   sniffer::LayoutPolicy policy;
@@ -1601,7 +1607,7 @@ void TestLegacyFooterScanFallback() {
   const uint64_t footer_length = ReadU64(bytes, trailer_offset + 16);
   constexpr uint64_t kLayoutBytes = 16;
   const uint64_t tail_length = kLayoutBytes + 24U * 5U;
-  Expect(footer_length > tail_length, "phase-two footer has a removable index tail");
+  EXPECT_TRUE(footer_length > tail_length) << "phase-two footer has a removable index tail";
   const uint64_t legacy_footer_length = footer_length - tail_length;
   bytes.erase(bytes.begin() + static_cast<std::ptrdiff_t>(footer_offset + legacy_footer_length),
               bytes.begin() + static_cast<std::ptrdiff_t>(footer_offset + footer_length));
@@ -1619,13 +1625,13 @@ void TestLegacyFooterScanFallback() {
       {1, sniffer::Predicate::Op::kGe, std::make_shared<arrow::Int64Scalar>(27)}};
   auto metrics = std::make_shared<sniffer::ScanMetrics>();
   auto batches = CollectScan(ValueOrThrow(reader->Scan(plan, metrics), "scan legacy footer"));
-  Expect(CollectInt64Column(batches, 0) == std::vector<int64_t>({27, 28, 29}),
-         "footer v1 remains scan-compatible");
-  Expect(metrics->row_groups_considered == 5 && metrics->row_groups_pruned == 0,
-         "footer v1 safely uses sequential fallback");
+  EXPECT_TRUE(CollectInt64Column(batches, 0) == std::vector<int64_t>({27, 28, 29}))
+      << "footer v1 remains scan-compatible";
+  EXPECT_TRUE(metrics->row_groups_considered == 5 && metrics->row_groups_pruned == 0)
+      << "footer v1 safely uses sequential fallback";
 }
 
-void TestUnknownIndexVersionFailsExplicitly() {
+TEST(SnifferCoreTest, UnknownIndexVersionFailsExplicitly) {
   sniffer::TableSchema schema{1, {{7, "x", arrow::int32(), false, nullptr}}};
   auto arrow_schema = ValueOrThrow(schema.ToArrowSchema(), "unknown index schema");
   auto values = BuildArray<arrow::Int32Builder, int32_t>({1, 2, 3});
@@ -1654,11 +1660,11 @@ void TestUnknownIndexVersionFailsExplicitly() {
   RefreshFooterChecksums(&bytes);
   WriteFile(file.path(), bytes);
   const auto reader = sniffer::SegmentReader::Open(file.path().string());
-  Expect(!reader.ok() && reader.status().IsNotImplemented(),
-         "unknown index block version fails as unsupported");
+  EXPECT_TRUE(!reader.ok() && reader.status().IsNotImplemented())
+      << "unknown index block version fails as unsupported";
 }
 
-void TestCompositeSortKeyRange() {
+TEST(SnifferCoreTest, CompositeSortKeyRange) {
   sniffer::TableSchema schema{1,
                               {{1, "major", arrow::int32(), false, nullptr},
                                {2, "minor", arrow::utf8(), false, nullptr},
@@ -1686,11 +1692,11 @@ void TestCompositeSortKeyRange() {
   plan.sort_key_range = std::move(range);
   plan.output_batch_rows = 8;
   auto batches = CollectScan(ValueOrThrow(reader->Scan(plan), "scan composite range"));
-  Expect(CollectInt64Column(batches, 0) == std::vector<int64_t>({11, 12}),
-         "composite sort-key range uses lexicographic half-open semantics");
+  EXPECT_TRUE(CollectInt64Column(batches, 0) == std::vector<int64_t>({11, 12}))
+      << "composite sort-key range uses lexicographic half-open semantics";
 }
 
-void TestForcedDictionaryRoundTripAndScan() {
+TEST(SnifferCoreTest, ForcedDictionaryRoundTripAndScan) {
   sniffer::TableSchema schema{1,
                               {{1, "number", arrow::int64(), true, nullptr},
                                {2, "label", arrow::utf8(), true, nullptr},
@@ -1725,19 +1731,19 @@ void TestForcedDictionaryRoundTripAndScan() {
                             {3, sniffer::EncodingKind::kDictionary}};
   TempFile file("forced_dictionary.seg");
   WriteSegmentWithPolicy(file.path(), schema, {batch}, policy);
-  Expect(FirstChunkEncoding(file.path(), 64) ==
-             static_cast<uint16_t>(sniffer::EncodingKind::kDictionary),
-         "forced Dictionary encoding ID is persisted");
+  EXPECT_TRUE(FirstChunkEncoding(file.path(), 64) ==
+              static_cast<uint16_t>(sniffer::EncodingKind::kDictionary))
+      << "forced Dictionary encoding ID is persisted";
   auto reader =
       ValueOrThrow(sniffer::SegmentReader::Open(file.path().string()), "open Dictionary segment");
   auto round_trip = ValueOrThrow(reader->ReadAll(), "read Dictionary segment");
   int64_t offset = 0;
   for (const auto& output : round_trip) {
-    Expect(output->Equals(*batch->Slice(offset, output->num_rows())),
-           "Dictionary round-trip equals input");
+    EXPECT_TRUE(output->Equals(*batch->Slice(offset, output->num_rows())))
+        << "Dictionary round-trip equals input";
     offset += output->num_rows();
   }
-  Expect(offset == 128, "Dictionary round-trip preserves all rows");
+  EXPECT_TRUE(offset == 128) << "Dictionary round-trip preserves all rows";
 
   sniffer::IOPlan plan;
   plan.projection_field_ids = {3, 2};
@@ -1748,14 +1754,14 @@ void TestForcedDictionaryRoundTripAndScan() {
   int64_t selected_rows = 0;
   for (const auto& output : scan) {
     selected_rows += output->num_rows();
-    Expect(output->schema()->field(0)->name() == "bytes" &&
-               output->schema()->field(1)->name() == "label",
-           "Dictionary selected projection order");
+    EXPECT_TRUE(output->schema()->field(0)->name() == "bytes" &&
+                output->schema()->field(1)->name() == "label")
+        << "Dictionary selected projection order";
   }
-  Expect(selected_rows == 23, "Dictionary predicate and selected decode preserve matches");
+  EXPECT_TRUE(selected_rows == 23) << "Dictionary predicate and selected decode preserve matches";
 }
 
-void TestForcedRleRoundTripAndScan() {
+TEST(SnifferCoreTest, ForcedRleRoundTripAndScan) {
   sniffer::TableSchema schema{1,
                               {{1, "group", arrow::int32(), true, nullptr},
                                {2, "flag", arrow::boolean(), true, nullptr},
@@ -1786,15 +1792,16 @@ void TestForcedRleRoundTripAndScan() {
                             {3, sniffer::EncodingKind::kRle}};
   TempFile file("forced_rle.seg");
   WriteSegmentWithPolicy(file.path(), schema, {batch}, policy);
-  Expect(FirstChunkEncoding(file.path(), 65) == static_cast<uint16_t>(sniffer::EncodingKind::kRle),
-         "forced RLE encoding ID is persisted");
+  EXPECT_TRUE(FirstChunkEncoding(file.path(), 65) ==
+              static_cast<uint16_t>(sniffer::EncodingKind::kRle))
+      << "forced RLE encoding ID is persisted";
   auto reader =
       ValueOrThrow(sniffer::SegmentReader::Open(file.path().string()), "open RLE segment");
   auto round_trip = ValueOrThrow(reader->ReadAll(), "read RLE segment");
   int64_t offset = 0;
   for (const auto& output : round_trip) {
-    Expect(output->Equals(*batch->Slice(offset, output->num_rows())),
-           "RLE round-trip equals input");
+    EXPECT_TRUE(output->Equals(*batch->Slice(offset, output->num_rows())))
+        << "RLE round-trip equals input";
     offset += output->num_rows();
   }
 
@@ -1807,13 +1814,13 @@ void TestForcedRleRoundTripAndScan() {
   int64_t selected_rows = 0;
   for (const auto& output : scan) {
     selected_rows += output->num_rows();
-    Expect(output->column(1)->null_count() == output->num_rows(),
-           "RLE selected all-null projection remains null");
+    EXPECT_TRUE(output->column(1)->null_count() == output->num_rows())
+        << "RLE selected all-null projection remains null";
   }
-  Expect(selected_rows == 25, "RLE predicate returns the full repeated run");
+  EXPECT_TRUE(selected_rows == 25) << "RLE predicate returns the full repeated run";
 }
 
-void TestForcedForBitpackRoundTripAndScan() {
+TEST(SnifferCoreTest, ForcedForBitpackRoundTripAndScan) {
   const auto timestamp_type = std::static_pointer_cast<arrow::TimestampType>(
       arrow::timestamp(arrow::TimeUnit::NANO, "UTC"));
   sniffer::TableSchema schema{1,
@@ -1867,16 +1874,16 @@ void TestForcedForBitpackRoundTripAndScan() {
   }
   TempFile file("forced_for.seg");
   WriteSegmentWithPolicy(file.path(), schema, {batch}, policy);
-  Expect(FirstChunkEncoding(file.path(), 106) ==
-             static_cast<uint16_t>(sniffer::EncodingKind::kForBitpack),
-         "forced FOR + Bitpack encoding ID is persisted");
+  EXPECT_TRUE(FirstChunkEncoding(file.path(), 106) ==
+              static_cast<uint16_t>(sniffer::EncodingKind::kForBitpack))
+      << "forced FOR + Bitpack encoding ID is persisted";
   auto reader =
       ValueOrThrow(sniffer::SegmentReader::Open(file.path().string()), "open FOR segment");
   auto round_trip = ValueOrThrow(reader->ReadAll(), "read FOR segment");
   int64_t offset = 0;
   for (const auto& output : round_trip) {
-    Expect(output->Equals(*batch->Slice(offset, output->num_rows())),
-           "FOR round-trip equals input");
+    EXPECT_TRUE(output->Equals(*batch->Slice(offset, output->num_rows())))
+        << "FOR round-trip equals input";
     offset += output->num_rows();
   }
 
@@ -1890,11 +1897,11 @@ void TestForcedForBitpackRoundTripAndScan() {
   for (const auto& output : scan) {
     selected_rows += output->num_rows();
   }
-  Expect(selected_rows == 48,
-         "FOR predicate and selected projection decode preserve null semantics");
+  EXPECT_TRUE(selected_rows == 48)
+      << "FOR predicate and selected projection decode preserve null semantics";
 }
 
-void TestForcedEncodingRandomizedProperty() {
+TEST(SnifferCoreTest, ForcedEncodingRandomizedProperty) {
   std::mt19937_64 random(0xC0DEC0DEULL);
   std::vector<std::optional<int64_t>> filter_values;
   std::vector<std::optional<int64_t>> projected_values;
@@ -1935,8 +1942,8 @@ void TestForcedEncodingRandomizedProperty() {
     auto round_trip = ValueOrThrow(reader->ReadAll(), "randomized codec round-trip");
     int64_t offset = 0;
     for (const auto& output : round_trip) {
-      Expect(output->Equals(*batch->Slice(offset, output->num_rows())),
-             "randomized forced codec round-trip");
+      EXPECT_TRUE(output->Equals(*batch->Slice(offset, output->num_rows())))
+          << "randomized forced codec round-trip";
       offset += output->num_rows();
     }
 
@@ -1966,11 +1973,11 @@ void TestForcedEncodingRandomizedProperty() {
       actual_chunks.push_back(output->column(0));
     }
     auto actual = ValueOrThrow(arrow::Concatenate(actual_chunks), "concatenate codec scan");
-    Expect(actual->Equals(expected), "randomized codec IOPlan equals reference filtering");
+    EXPECT_TRUE(actual->Equals(expected)) << "randomized codec IOPlan equals reference filtering";
   }
 }
 
-void TestDeterministicEncodingSelector() {
+TEST(SnifferCoreTest, DeterministicEncodingSelector) {
   sniffer::TableSchema integer_schema{1, {{1, "x", arrow::int64(), false, nullptr}}};
   auto integer_arrow_schema = ValueOrThrow(integer_schema.ToArrowSchema(), "selector int schema");
 
@@ -1979,9 +1986,9 @@ void TestDeterministicEncodingSelector() {
   TempFile rle_file("selector_rle.seg");
   WriteSegmentWithPolicy(rle_file.path(), integer_schema,
                          {arrow::RecordBatch::Make(integer_arrow_schema, 100, {repeated})}, {});
-  Expect(
-      FirstChunkEncoding(rle_file.path(), 17) == static_cast<uint16_t>(sniffer::EncodingKind::kRle),
-      "selector chooses RLE for a long run");
+  EXPECT_TRUE(FirstChunkEncoding(rle_file.path(), 17) ==
+              static_cast<uint16_t>(sniffer::EncodingKind::kRle))
+      << "selector chooses RLE for a long run";
 
   std::vector<std::optional<int64_t>> ascending_values;
   for (int64_t value = 0; value < 100; ++value) {
@@ -1991,9 +1998,9 @@ void TestDeterministicEncodingSelector() {
   TempFile for_file("selector_for.seg");
   WriteSegmentWithPolicy(for_file.path(), integer_schema,
                          {arrow::RecordBatch::Make(integer_arrow_schema, 100, {ascending})}, {});
-  Expect(FirstChunkEncoding(for_file.path(), 17) ==
-             static_cast<uint16_t>(sniffer::EncodingKind::kForBitpack),
-         "selector chooses FOR + Bitpack for a narrow ascending range");
+  EXPECT_TRUE(FirstChunkEncoding(for_file.path(), 17) ==
+              static_cast<uint16_t>(sniffer::EncodingKind::kForBitpack))
+      << "selector chooses FOR + Bitpack for a narrow ascending range";
 
   sniffer::TableSchema string_schema{1, {{1, "x", arrow::utf8(), false, nullptr}}};
   auto string_arrow_schema = ValueOrThrow(string_schema.ToArrowSchema(), "selector string schema");
@@ -2008,62 +2015,17 @@ void TestDeterministicEncodingSelector() {
       dictionary_file.path(), string_schema,
       {arrow::RecordBatch::Make(string_arrow_schema, 100, {BuildStringArray(repeated_strings)})},
       {});
-  Expect(FirstChunkEncoding(dictionary_file.path(), 17) ==
-             static_cast<uint16_t>(sniffer::EncodingKind::kDictionary),
-         "selector chooses Dictionary for low-cardinality strings");
+  EXPECT_TRUE(FirstChunkEncoding(dictionary_file.path(), 17) ==
+              static_cast<uint16_t>(sniffer::EncodingKind::kDictionary))
+      << "selector chooses Dictionary for low-cardinality strings";
 
   TempFile plain_file("selector_plain.seg");
   WriteSegmentWithPolicy(
       plain_file.path(), string_schema,
       {arrow::RecordBatch::Make(string_arrow_schema, 100, {BuildStringArray(unique_strings)})}, {});
-  Expect(FirstChunkEncoding(plain_file.path(), 17) ==
-             static_cast<uint16_t>(sniffer::EncodingKind::kPlain),
-         "selector retains Plain for high-cardinality strings");
+  EXPECT_TRUE(FirstChunkEncoding(plain_file.path(), 17) ==
+              static_cast<uint16_t>(sniffer::EncodingKind::kPlain))
+      << "selector retains Plain for high-cardinality strings";
 }
 
 }  // namespace
-
-#define SNIFFER_TEST(name, function) \
-  TEST(SnifferCoreTest, name) { function(); }
-
-SNIFFER_TEST(RoundTripAllTypesAndMultipleRowGroups, TestRoundTripAllTypesAndMultipleRowGroups)
-SNIFFER_TEST(EmptyBatchRoundTrip, TestEmptyBatchRoundTrip)
-SNIFFER_TEST(DeterministicOutput, TestDeterministicOutput)
-SNIFFER_TEST(DeterministicRandomizedRoundTrip, TestDeterministicRandomizedRoundTrip)
-SNIFFER_TEST(HeaderCorruptionFailsOpen, TestHeaderCorruptionFailsOpen)
-SNIFFER_TEST(UnsupportedVersionFailsOpen, TestUnsupportedVersionFailsOpen)
-SNIFFER_TEST(FooterCorruptionFailsOpen, TestFooterCorruptionFailsOpen)
-SNIFFER_TEST(ChunkCorruptionFailsLazyReadAndFileVerify,
-             TestChunkCorruptionFailsLazyReadAndFileVerify)
-SNIFFER_TEST(InvalidChunkOffsetFailsOpen, TestInvalidChunkOffsetFailsOpen)
-SNIFFER_TEST(UnknownEncodingFailsOpen, TestUnknownEncodingFailsOpen)
-SNIFFER_TEST(UnknownPhysicalTypeFailsOpen, TestUnknownPhysicalTypeFailsOpen)
-SNIFFER_TEST(TruncationFailsOpen, TestTruncationFailsOpen)
-SNIFFER_TEST(SchemaAndWriterStateValidation, TestSchemaAndWriterStateValidation)
-SNIFFER_TEST(IOPlanProjectionPredicatesLimitAndBatching,
-             TestIOPlanProjectionPredicatesLimitAndBatching)
-SNIFFER_TEST(BloomPrunesWithoutChunkReads, TestBloomPrunesWithoutChunkReads)
-SNIFFER_TEST(SortKeyRangeAndEmptyProjection, TestSortKeyRangeAndEmptyProjection)
-SNIFFER_TEST(AllPredicateOperationsAndNulls, TestAllPredicateOperationsAndNulls)
-SNIFFER_TEST(TypedPredicatesAndProjectionAllTypes, TestTypedPredicatesAndProjectionAllTypes)
-SNIFFER_TEST(OptionalPhaseMetrics, TestOptionalPhaseMetrics)
-SNIFFER_TEST(SequentialFallbackAndPlanValidation, TestSequentialFallbackAndPlanValidation)
-SNIFFER_TEST(SortOrderAndIndexCorruptionValidation, TestSortOrderAndIndexCorruptionValidation)
-SNIFFER_TEST(BloomSignedZeroEquality, TestBloomSignedZeroEquality)
-SNIFFER_TEST(LegacyFooterScanFallback, TestLegacyFooterScanFallback)
-SNIFFER_TEST(UnknownIndexVersionFailsExplicitly, TestUnknownIndexVersionFailsExplicitly)
-SNIFFER_TEST(CompositeSortKeyRange, TestCompositeSortKeyRange)
-SNIFFER_TEST(ForcedDictionaryRoundTripAndScan, TestForcedDictionaryRoundTripAndScan)
-SNIFFER_TEST(TypedArrayHashMatchesScalarReference, TestTypedArrayHashMatchesScalarReference)
-SNIFFER_TEST(PlainVariableBulkCopyMatchesReference, TestPlainVariableBulkCopyMatchesReference)
-SNIFFER_TEST(PlainSelectedTypedDecodeMatchesReference, TestPlainSelectedTypedDecodeMatchesReference)
-SNIFFER_TEST(TypedDictionaryMatchesScalarReference, TestTypedDictionaryMatchesScalarReference)
-SNIFFER_TEST(NonPlainSelectionValidation, TestNonPlainSelectionValidation)
-SNIFFER_TEST(ForcedRleRoundTripAndScan, TestForcedRleRoundTripAndScan)
-SNIFFER_TEST(TypedRleMatchesScalarReference, TestTypedRleMatchesScalarReference)
-SNIFFER_TEST(ForcedForBitpackRoundTripAndScan, TestForcedForBitpackRoundTripAndScan)
-SNIFFER_TEST(TypedForMatchesScalarReference, TestTypedForMatchesScalarReference)
-SNIFFER_TEST(ForcedEncodingRandomizedProperty, TestForcedEncodingRandomizedProperty)
-SNIFFER_TEST(DeterministicEncodingSelector, TestDeterministicEncodingSelector)
-
-#undef SNIFFER_TEST
