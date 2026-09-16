@@ -596,6 +596,34 @@ TEST(SnifferCoreTest, TypedRleMatchesScalarReference) {
         sniffer::internal::EncodeNonPlain(sniffer::internal::kRleEncodingId, field, array),
         "typed RLE encode");
     EXPECT_TRUE(actual == expected) << "typed RLE bytes match scalar reference for " + field.name;
+
+    sniffer::internal::ColumnChunkMeta chunk;
+    chunk.field_id = field.field_id;
+    chunk.physical_type =
+        ValueOrThrow(sniffer::internal::PhysicalTypeFor(*field.type), "RLE physical type");
+    chunk.encoding_id = sniffer::internal::kRleEncodingId;
+    chunk.row_count = static_cast<uint64_t>(array.length());
+    chunk.null_count = static_cast<uint64_t>(array.null_count());
+    chunk.length = static_cast<uint64_t>(actual.size());
+    const auto decoded = ValueOrThrow(sniffer::internal::DecodeNonPlain(field, chunk, actual),
+                                      "typed RLE full decode");
+    EXPECT_TRUE(decoded->Equals(array)) << "typed RLE full decode matches source for " + field.name;
+
+    const std::vector<uint64_t> selection = {0, 2, 4};
+    const auto selected =
+        ValueOrThrow(sniffer::internal::DecodeNonPlain(field, chunk, actual, &selection),
+                     "typed RLE selected decode");
+    auto expected_builder =
+        ValueOrThrow(arrow::MakeBuilder(field.type), "make RLE selection reference");
+    for (const uint64_t row : selection) {
+      const auto value =
+          ValueOrThrow(array.GetScalar(static_cast<int64_t>(row)), "RLE reference scalar");
+      RequireOk(expected_builder->AppendScalar(*value), "append RLE reference scalar");
+    }
+    std::shared_ptr<arrow::Array> selected_expected;
+    RequireOk(expected_builder->Finish(&selected_expected), "finish RLE reference");
+    EXPECT_TRUE(selected->Equals(selected_expected))
+        << "typed RLE selected decode matches scalar reference for " + field.name;
   }
 
   sniffer::FieldSpec repeated_field{1, "repeated", arrow::int32(), true, nullptr};

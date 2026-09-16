@@ -79,7 +79,7 @@ v0.2 聚焦现有 Segment writer、reader、codec、scan 和文件 I/O 路径的
 
 - [x] Dictionary decode 直接向 typed Arrow builder/buffer 写入，不构造
       `vector<shared_ptr<arrow::Scalar>>`。
-- [ ] RLE decode 使用 run-aware 批量 append；selection 路径按 run 跳过未命中范围，不展开所有行。
+- [x] RLE decode 使用 run-aware 批量 append；selection 路径按 run 跳过未命中范围，不展开所有行。
 - [x] FOR decode 使用 typed base/delta 和按字/批量 bit unpack，移除每值 `ScalarFromBits()`。
 - [x] Plain selected decode 按物理类型直接 append，移除每个命中行的 `ParseScalar()` 和
       `AppendScalar()` 动态分派。
@@ -160,6 +160,25 @@ v0.2 聚焦现有 Segment writer、reader、codec、scan 和文件 I/O 路径的
 - [ ] 更新 README 的性能状态，不把合成 benchmark 结果表述为通用生产性能。
 
 ## 11. 执行记录
+
+### 2026-09-16：RLE typed/run-aware decode
+
+- RLE decoder 先完整校验 run header、count、reserved bytes、bool 规范值、null value bytes 和总行数，
+  再直接写入对应的 Arrow typed builder；不再为每个 run 和输出行构造 `arrow::Scalar`。
+- 全量路径按 run 追加值或批量追加 null；selection 路径利用严格递增的 row id 单向跳过未命中 run，
+  只 materialize 命中行。RLE v1 payload、checksum 和错误语义保持不变。
+- GTest 覆盖 bool 和全部 8 种整数类型的全量/selected decode、null、负数与极值，并继续通过强制
+  RLE round-trip、scan 和随机 property 测试。codec benchmark 新增 10 万输入行、1% selection 场景。
+
+同机 Release、10 万个 int64、128 个近似等长 run、7 次 P50：
+
+| 场景 | Before | After | 变化 | payload 字节 |
+|---|---:|---:|---:|---:|
+| RLE 全量 decode | 1.031 ms / 739.8 MiB/s | 0.210 ms / 3,554.8 MiB/s | 约 4.9x | 3,112 -> 3,112 |
+| RLE 1% selected decode | 未单独测量 | 0.00534 ms / 1,000 输出行 | 新增基线 | 3,112 |
+
+selected 场景仍会解析并验证全部 run metadata，因此 5.34 us 只表示该合成 payload 的内存内解码
+延迟，不代表文件 I/O 吞吐。最终结论仍需纳入 Row Group、选择率和 cold/warm cache 完整矩阵。
 
 ### 2026-09-16：Dictionary typed decode
 

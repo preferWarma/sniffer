@@ -91,7 +91,7 @@ uint64_t Mix(uint64_t value) {
 
 arrow::Result<std::vector<Scenario>> MakeScenarios(int64_t rows) {
   std::vector<Scenario> scenarios;
-  scenarios.reserve(5);
+  scenarios.reserve(6);
   ARROW_ASSIGN_OR_RAISE(
       auto plain,
       MakeInt64Scenario("plain_random_int64", "plain", sniffer::internal::kPlainEncodingId, rows,
@@ -134,7 +134,19 @@ arrow::Result<std::vector<Scenario>> MakeScenarios(int64_t rows) {
                                   false, [run_length](int64_t row) {
                                     return std::optional<int64_t>(row / run_length);
                                   }));
+  Scenario rle_selected = rle;
+  rle_selected.name = "rle_selected_int64_1pct";
+  rle_selected.selection.reserve(static_cast<size_t>((rows + 99) / 100));
+  arrow::Int64Builder rle_selected_builder;
+  ARROW_RETURN_NOT_OK(rle_selected_builder.Reserve((rows + 99) / 100));
+  const auto& rle_array = static_cast<const arrow::Int64Array&>(*rle.array);
+  for (int64_t row = 0; row < rows; row += 100) {
+    rle_selected.selection.push_back(static_cast<uint64_t>(row));
+    ARROW_RETURN_NOT_OK(rle_selected_builder.Append(rle_array.Value(row)));
+  }
+  ARROW_RETURN_NOT_OK(rle_selected_builder.Finish(&rle_selected.expected));
   scenarios.push_back(std::move(rle));
+  scenarios.push_back(std::move(rle_selected));
   ARROW_ASSIGN_OR_RAISE(
       auto for_bitpack,
       MakeInt64Scenario("for_bitpack_128_range", "for_bitpack",
@@ -182,7 +194,8 @@ arrow::Result<std::shared_ptr<arrow::Array>> Decode(const Scenario& scenario,
     }
     return sniffer::internal::DecodePlain(scenario.field, chunk, payload);
   }
-  return sniffer::internal::DecodeNonPlain(scenario.field, chunk, payload);
+  const auto* selection = scenario.selection.empty() ? nullptr : &scenario.selection;
+  return sniffer::internal::DecodeNonPlain(scenario.field, chunk, payload, selection);
 }
 
 arrow::Status ValidateRoundTrip(const Scenario& scenario, std::span<const uint8_t> payload) {
@@ -292,8 +305,9 @@ BENCHMARK_CAPTURE(Codec, dictionary_string_32_Encode, 2U, true)->Unit(benchmark:
 BENCHMARK_CAPTURE(Codec, dictionary_string_32_Decode, 2U, false)->Unit(benchmark::kMicrosecond);
 BENCHMARK_CAPTURE(Codec, rle_128_runs_Encode, 3U, true)->Unit(benchmark::kMicrosecond);
 BENCHMARK_CAPTURE(Codec, rle_128_runs_Decode, 3U, false)->Unit(benchmark::kMicrosecond);
-BENCHMARK_CAPTURE(Codec, for_bitpack_128_range_Encode, 4U, true)->Unit(benchmark::kMicrosecond);
-BENCHMARK_CAPTURE(Codec, for_bitpack_128_range_Decode, 4U, false)->Unit(benchmark::kMicrosecond);
+BENCHMARK_CAPTURE(Codec, rle_selected_int64_1pct_Decode, 4U, false)->Unit(benchmark::kMicrosecond);
+BENCHMARK_CAPTURE(Codec, for_bitpack_128_range_Encode, 5U, true)->Unit(benchmark::kMicrosecond);
+BENCHMARK_CAPTURE(Codec, for_bitpack_128_range_Decode, 5U, false)->Unit(benchmark::kMicrosecond);
 
 void AddBenchmarkContext() {
 #ifdef NDEBUG

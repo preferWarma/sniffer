@@ -224,26 +224,6 @@ arrow::Status ValidateRowsToDecode(uint64_t row_count, const std::vector<uint64_
   return arrow::Status::OK();
 }
 
-arrow::Result<std::shared_ptr<arrow::Array>> FinishScalars(
-    const FieldSpec& field, const std::vector<std::shared_ptr<arrow::Scalar>>& values) {
-  ARROW_ASSIGN_OR_RAISE(auto builder, arrow::MakeBuilder(field.type));
-  if (values.size() > static_cast<size_t>(std::numeric_limits<int64_t>::max())) {
-    return InvalidCodec("decoded array exceeds Arrow limit");
-  }
-  ARROW_RETURN_NOT_OK(builder->Reserve(static_cast<int64_t>(values.size())));
-  for (const auto& value : values) {
-    if (value) {
-      ARROW_RETURN_NOT_OK(builder->AppendScalar(*value));
-    } else {
-      ARROW_RETURN_NOT_OK(builder->AppendNull());
-    }
-  }
-  std::shared_ptr<arrow::Array> result;
-  ARROW_RETURN_NOT_OK(builder->Finish(&result));
-  ARROW_RETURN_NOT_OK(result->ValidateFull());
-  return result;
-}
-
 template <typename Unsigned>
 Unsigned ReadLittleEndianValue(const uint8_t* bytes) {
   Unsigned value = 0;
@@ -640,6 +620,59 @@ arrow::Result<std::shared_ptr<arrow::Array>> DecodeDictionary(
   }
 }
 
+struct DecodedRleRun {
+  uint64_t end = 0;
+  bool valid = false;
+  uint64_t value = 0;
+};
+
+template <typename Builder, typename Convert>
+arrow::Result<std::shared_ptr<arrow::Array>> DecodeRleValues(const std::vector<DecodedRleRun>& runs,
+                                                             uint64_t row_count,
+                                                             const std::vector<uint64_t>* selection,
+                                                             Builder* builder, Convert convert) {
+  const size_t output_rows = selection ? selection->size() : static_cast<size_t>(row_count);
+  if (output_rows > static_cast<size_t>(std::numeric_limits<int64_t>::max())) {
+    return InvalidCodec("decoded RLE array exceeds Arrow limit");
+  }
+  ARROW_RETURN_NOT_OK(builder->Reserve(static_cast<int64_t>(output_rows)));
+  if (selection) {
+    size_t run_index = 0;
+    for (const uint64_t row : *selection) {
+      while (run_index < runs.size() && row >= runs[run_index].end) {
+        ++run_index;
+      }
+      if (run_index == runs.size()) {
+        return InvalidCodec("RLE row is outside runs");
+      }
+      const auto& run = runs[run_index];
+      if (run.valid) {
+        builder->UnsafeAppend(convert(run.value));
+      } else {
+        builder->UnsafeAppendNull();
+      }
+    }
+  } else {
+    uint64_t previous_end = 0;
+    for (const auto& run : runs) {
+      const uint64_t count = run.end - previous_end;
+      if (run.valid) {
+        const auto value = convert(run.value);
+        for (uint64_t row = 0; row < count; ++row) {
+          builder->UnsafeAppend(value);
+        }
+      } else {
+        ARROW_RETURN_NOT_OK(builder->AppendNulls(static_cast<int64_t>(count)));
+      }
+      previous_end = run.end;
+    }
+  }
+  std::shared_ptr<arrow::Array> result;
+  ARROW_RETURN_NOT_OK(builder->Finish(&result));
+  ARROW_RETURN_NOT_OK(result->ValidateFull());
+  return result;
+}
+
 arrow::Result<std::shared_ptr<arrow::Array>> DecodeRle(const FieldSpec& field,
                                                        const ColumnChunkMeta& chunk,
                                                        std::span<const uint8_t> payload,
@@ -653,11 +686,7 @@ arrow::Result<std::shared_ptr<arrow::Array>> DecodeRle(const FieldSpec& field,
       run_count > std::numeric_limits<size_t>::max()) {
     return InvalidCodec("invalid RLE header");
   }
-  struct DecodedRun {
-    uint64_t end = 0;
-    std::shared_ptr<arrow::Scalar> value;
-  };
-  std::vector<DecodedRun> runs;
+  std::vector<DecodedRleRun> runs;
   runs.reserve(static_cast<size_t>(run_count));
   uint64_t total_rows = 0;
   uint64_t null_rows = 0;
@@ -673,50 +702,76 @@ arrow::Result<std::shared_ptr<arrow::Array>> DecodeRle(const FieldSpec& field,
         return InvalidCodec("non-zero RLE reserved byte");
       }
     }
-    ARROW_ASSIGN_OR_RAISE(auto value_bytes, reader.ReadBytes(width));
-    std::shared_ptr<arrow::Scalar> value;
+    ARROW_ASSIGN_OR_RAISE(const uint64_t value, ReadWidth(&reader, width));
     if (valid != 0) {
-      ARROW_ASSIGN_OR_RAISE(value, ParseScalar(field, value_bytes));
+      if (field.type->id() == arrow::Type::BOOL && value > 1U) {
+        return InvalidCodec("non-canonical RLE boolean value");
+      }
     } else {
-      if (std::any_of(value_bytes.begin(), value_bytes.end(),
-                      [](uint8_t value) { return value != 0; })) {
+      if (value != 0) {
         return InvalidCodec("null RLE run has non-zero value bytes");
       }
       ARROW_ASSIGN_OR_RAISE(null_rows, CheckedAdd(null_rows, count));
     }
     ARROW_ASSIGN_OR_RAISE(total_rows, CheckedAdd(total_rows, count));
-    runs.push_back({total_rows, std::move(value)});
+    runs.push_back({total_rows, valid != 0, value});
   }
   if (reader.remaining() != 0 || total_rows != chunk.row_count || null_rows != chunk.null_count) {
     return InvalidCodec("RLE runs do not match chunk counts");
   }
   ARROW_RETURN_NOT_OK(ValidateRowsToDecode(chunk.row_count, selection));
-  std::vector<std::shared_ptr<arrow::Scalar>> output;
-  output.reserve(selection ? selection->size() : static_cast<size_t>(chunk.row_count));
-  if (selection) {
-    size_t run = 0;
-    for (const uint64_t row : *selection) {
-      while (run < runs.size() && row >= runs[run].end) {
-        ++run;
-      }
-      if (run == runs.size()) {
-        return InvalidCodec("RLE row is outside runs");
-      }
-      output.push_back(runs[run].value);
+  switch (field.type->id()) {
+    case arrow::Type::BOOL: {
+      arrow::BooleanBuilder builder;
+      return DecodeRleValues(runs, chunk.row_count, selection, &builder,
+                             [](uint64_t value) { return value != 0; });
     }
-  } else {
-    size_t run = 0;
-    for (uint64_t row = 0; row < chunk.row_count; ++row) {
-      while (run < runs.size() && row >= runs[run].end) {
-        ++run;
-      }
-      if (run == runs.size()) {
-        return InvalidCodec("RLE row is outside runs");
-      }
-      output.push_back(runs[run].value);
+    case arrow::Type::INT8: {
+      arrow::Int8Builder builder;
+      return DecodeRleValues(runs, chunk.row_count, selection, &builder, [](uint64_t value) {
+        return std::bit_cast<int8_t>(static_cast<uint8_t>(value));
+      });
     }
+    case arrow::Type::INT16: {
+      arrow::Int16Builder builder;
+      return DecodeRleValues(runs, chunk.row_count, selection, &builder, [](uint64_t value) {
+        return std::bit_cast<int16_t>(static_cast<uint16_t>(value));
+      });
+    }
+    case arrow::Type::INT32: {
+      arrow::Int32Builder builder;
+      return DecodeRleValues(runs, chunk.row_count, selection, &builder, [](uint64_t value) {
+        return std::bit_cast<int32_t>(static_cast<uint32_t>(value));
+      });
+    }
+    case arrow::Type::INT64: {
+      arrow::Int64Builder builder;
+      return DecodeRleValues(runs, chunk.row_count, selection, &builder,
+                             [](uint64_t value) { return std::bit_cast<int64_t>(value); });
+    }
+    case arrow::Type::UINT8: {
+      arrow::UInt8Builder builder;
+      return DecodeRleValues(runs, chunk.row_count, selection, &builder,
+                             [](uint64_t value) { return static_cast<uint8_t>(value); });
+    }
+    case arrow::Type::UINT16: {
+      arrow::UInt16Builder builder;
+      return DecodeRleValues(runs, chunk.row_count, selection, &builder,
+                             [](uint64_t value) { return static_cast<uint16_t>(value); });
+    }
+    case arrow::Type::UINT32: {
+      arrow::UInt32Builder builder;
+      return DecodeRleValues(runs, chunk.row_count, selection, &builder,
+                             [](uint64_t value) { return static_cast<uint32_t>(value); });
+    }
+    case arrow::Type::UINT64: {
+      arrow::UInt64Builder builder;
+      return DecodeRleValues(runs, chunk.row_count, selection, &builder,
+                             [](uint64_t value) { return value; });
+    }
+    default:
+      return InvalidCodec("RLE type is not supported");
   }
-  return FinishScalars(field, output);
 }
 
 template <typename Rows, typename Builder, typename Convert>
