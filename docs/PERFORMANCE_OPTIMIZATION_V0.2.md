@@ -92,6 +92,8 @@ v0.2 聚焦现有 Segment writer、reader、codec、scan 和文件 I/O 路径的
       重复线性调用 `FindFieldIndex()`。
 - [x] 为各基础类型实现 typed predicate kernel，直接读取 Arrow values/validity；避免逐行
       `GetScalar()`、虚调用和临时对象。
+- [x] 在计划校验时为 predicate 绑定 typed evaluator，并按 predicate 顺序对齐已解码列指针；
+      逐行判断不再执行类型 switch 或 `unordered_map` 查找。
 - [ ] 将多个 AND predicate 融合到同一次 selection 构建，优先执行成本低、选择性高的谓词。
 - [ ] 比较 index vector、bitmap 和连续 range 表示在 1%/10%/50%/100% 选择率下的成本，使用
       确定性阈值选择表示。
@@ -160,6 +162,28 @@ v0.2 聚焦现有 Segment writer、reader、codec、scan 和文件 I/O 路径的
 - [ ] 更新 README 的性能状态，不把合成 benchmark 结果表述为通用生产性能。
 
 ## 11. 执行记录
+
+### 2026-09-17：预绑定 typed predicate evaluator
+
+- 计划校验为每个比较谓词按 Arrow 类型绑定 evaluator；null predicate 使用独立通用 evaluator。
+  Row Group 解码后按 predicate 顺序建立非 owning 列指针视图，逐行 AND 短路不再查哈希表或进行
+  Arrow 类型 switch。
+- Google Benchmark 新增 `SnifferThreePredicates`：10 万行、`id >= 50000 AND group = group-0 AND
+  value IS NOT NULL`，输出 1,470 行；原单 predicate 和 Arrow IPC 对照保持独立 case。
+- GTest 增加同字段重复 predicate、int64/string/nullable int32 混合 evaluator 和 null 比较语义覆盖；
+  既有全部基础类型、NaN、null、sort-key 与 Bloom 测试继续覆盖语义非回归。
+
+同机 Release、Row Group 4,096、21 次 P50：
+
+| 场景 | 指标 | Before | After | 变化 |
+|---|---|---:|---:|---:|
+| 单 predicate | predicate 阶段 | 0.2168 ms | 0.1773 ms | -18.2% |
+| 单 predicate | scan | 1.9213 ms | 1.9101 ms | -0.6% |
+| 三 predicate | predicate 阶段 | 0.5141 ms | 0.4552 ms | -11.5% |
+| 三 predicate | scan | 2.9876 ms | 2.7823 ms | -6.9% |
+
+两种场景的 Row Group 剪枝数、ColumnChunk 读取数和读取字节均保持不变。三 predicate before 样本
+受系统噪声影响较大，因此阶段耗时与 scan 提升只作为当前方向证据；最终数字仍以完整隔离矩阵为准。
 
 ### 2026-09-17：IOPlan field index 预解析
 

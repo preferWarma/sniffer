@@ -1283,13 +1283,14 @@ TEST(SnifferCoreTest, ResolvedPlanPreservesRepeatedPredicateAndProjectionOrder) 
   plan.conjunctive_predicates = {
       {1, sniffer::Predicate::Op::kGe, std::make_shared<arrow::Int64Scalar>(8)},
       {2, sniffer::Predicate::Op::kEq, std::make_shared<arrow::StringScalar>("even")},
-      {1, sniffer::Predicate::Op::kLt, std::make_shared<arrow::Int64Scalar>(15)}};
+      {1, sniffer::Predicate::Op::kLt, std::make_shared<arrow::Int64Scalar>(15)},
+      {3, sniffer::Predicate::Op::kGe, std::make_shared<arrow::Int32Scalar>(80)}};
   plan.output_batch_rows = 2;
   const auto batches =
       CollectScan(ValueOrThrow(reader->Scan(plan), "scan with pre-resolved field indices"));
 
-  EXPECT_TRUE(CollectInt64Column(batches, 1) == std::vector<int64_t>({8, 10, 14}))
-      << "multiple predicates retain their resolved field-index alignment";
+  EXPECT_TRUE(CollectInt64Column(batches, 1) == std::vector<int64_t>({8, 10}))
+      << "compiled predicates retain field alignment and null comparison semantics";
   EXPECT_TRUE(!batches.empty() && batches.front()->schema()->field(0)->name() == "payload" &&
               batches.front()->schema()->field(1)->name() == "key")
       << "pre-resolved projection indices retain caller order";

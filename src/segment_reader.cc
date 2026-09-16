@@ -759,10 +759,16 @@ arrow::Result<int> CompareKeyVectors(const std::vector<std::shared_ptr<arrow::Sc
 }
 
 struct ResolvedScanPlan {
+  using PredicateEvaluator = bool (*)(const arrow::Array&, uint64_t, const Predicate&);
+
   std::vector<size_t> projection_field_indices;
   std::vector<size_t> predicate_field_indices;
+  std::vector<PredicateEvaluator> predicate_evaluators;
   std::vector<size_t> sort_key_field_indices;
 };
+
+arrow::Result<ResolvedScanPlan::PredicateEvaluator> ResolvePredicateEvaluator(
+    const FieldSpec& field, Predicate::Op op);
 
 arrow::Result<ResolvedScanPlan> ValidatePlan(const internal::FooterData& footer,
                                              const IOPlan& plan) {
@@ -780,6 +786,7 @@ arrow::Result<ResolvedScanPlan> ValidatePlan(const internal::FooterData& footer,
     resolved.projection_field_indices.push_back(field_index);
   }
   resolved.predicate_field_indices.reserve(plan.conjunctive_predicates.size());
+  resolved.predicate_evaluators.reserve(plan.conjunctive_predicates.size());
   for (const auto& predicate : plan.conjunctive_predicates) {
     ARROW_ASSIGN_OR_RAISE(const size_t field_index,
                           FindFieldIndex(footer.schema, predicate.field_id));
@@ -795,6 +802,9 @@ arrow::Result<ResolvedScanPlan> ValidatePlan(const internal::FooterData& footer,
           "[sniffer.plan.predicate] comparison value must be non-null and exactly typed");
     }
     resolved.predicate_field_indices.push_back(field_index);
+    ARROW_ASSIGN_OR_RAISE(
+        auto evaluator, ResolvePredicateEvaluator(footer.schema.fields[field_index], predicate.op));
+    resolved.predicate_evaluators.push_back(evaluator);
   }
   if (!plan.sort_key_range) {
     return resolved;
@@ -862,9 +872,17 @@ bool EvaluateOrderedResult(int order, Predicate::Op op) {
   return false;
 }
 
+bool EvaluateNullPredicate(const arrow::Array& array, uint64_t row, const Predicate& predicate) {
+  const bool is_null = array.IsNull(static_cast<int64_t>(row));
+  return predicate.op == Predicate::Op::kIsNull ? is_null : !is_null;
+}
+
 template <typename ArrayType, typename ScalarType>
-arrow::Result<bool> EvaluatePrimitivePredicate(const arrow::Array& untyped, uint64_t row,
-                                               const Predicate& predicate) {
+bool EvaluatePrimitivePredicate(const arrow::Array& untyped, uint64_t row,
+                                const Predicate& predicate) {
+  if (untyped.IsNull(static_cast<int64_t>(row))) {
+    return false;
+  }
   const auto& array = static_cast<const ArrayType&>(untyped);
   const auto left = array.Value(static_cast<int64_t>(row));
   const auto right = static_cast<const ScalarType&>(*predicate.value).value;
@@ -893,66 +911,51 @@ int CompareBinaryViews(std::string_view left, std::string_view right) {
 }
 
 template <typename ArrayType>
-arrow::Result<bool> EvaluateBinaryPredicate(const arrow::Array& untyped, uint64_t row,
-                                            const Predicate& predicate) {
+bool EvaluateBinaryPredicate(const arrow::Array& untyped, uint64_t row,
+                             const Predicate& predicate) {
+  if (untyped.IsNull(static_cast<int64_t>(row))) {
+    return false;
+  }
   const auto& array = static_cast<const ArrayType&>(untyped);
   const auto left = array.GetView(static_cast<int64_t>(row));
   const auto right = static_cast<const arrow::BaseBinaryScalar&>(*predicate.value).view();
   return EvaluateOrderedResult(CompareBinaryViews(left, right), predicate.op);
 }
 
-arrow::Result<bool> EvaluatePredicate(const arrow::Array& array, uint64_t row,
-                                      const Predicate& predicate) {
-  const bool is_null = array.IsNull(static_cast<int64_t>(row));
-  if (predicate.op == Predicate::Op::kIsNull) {
-    return is_null;
+arrow::Result<ResolvedScanPlan::PredicateEvaluator> ResolvePredicateEvaluator(
+    const FieldSpec& field, Predicate::Op op) {
+  if (op == Predicate::Op::kIsNull || op == Predicate::Op::kIsNotNull) {
+    return &EvaluateNullPredicate;
   }
-  if (predicate.op == Predicate::Op::kIsNotNull) {
-    return !is_null;
-  }
-  if (is_null) {
-    return false;
-  }
-  switch (array.type_id()) {
+  switch (field.type->id()) {
     case arrow::Type::BOOL:
-      return EvaluatePrimitivePredicate<arrow::BooleanArray, arrow::BooleanScalar>(array, row,
-                                                                                   predicate);
+      return &EvaluatePrimitivePredicate<arrow::BooleanArray, arrow::BooleanScalar>;
     case arrow::Type::INT8:
-      return EvaluatePrimitivePredicate<arrow::Int8Array, arrow::Int8Scalar>(array, row, predicate);
+      return &EvaluatePrimitivePredicate<arrow::Int8Array, arrow::Int8Scalar>;
     case arrow::Type::INT16:
-      return EvaluatePrimitivePredicate<arrow::Int16Array, arrow::Int16Scalar>(array, row,
-                                                                               predicate);
+      return &EvaluatePrimitivePredicate<arrow::Int16Array, arrow::Int16Scalar>;
     case arrow::Type::INT32:
-      return EvaluatePrimitivePredicate<arrow::Int32Array, arrow::Int32Scalar>(array, row,
-                                                                               predicate);
+      return &EvaluatePrimitivePredicate<arrow::Int32Array, arrow::Int32Scalar>;
     case arrow::Type::INT64:
-      return EvaluatePrimitivePredicate<arrow::Int64Array, arrow::Int64Scalar>(array, row,
-                                                                               predicate);
+      return &EvaluatePrimitivePredicate<arrow::Int64Array, arrow::Int64Scalar>;
     case arrow::Type::UINT8:
-      return EvaluatePrimitivePredicate<arrow::UInt8Array, arrow::UInt8Scalar>(array, row,
-                                                                               predicate);
+      return &EvaluatePrimitivePredicate<arrow::UInt8Array, arrow::UInt8Scalar>;
     case arrow::Type::UINT16:
-      return EvaluatePrimitivePredicate<arrow::UInt16Array, arrow::UInt16Scalar>(array, row,
-                                                                                 predicate);
+      return &EvaluatePrimitivePredicate<arrow::UInt16Array, arrow::UInt16Scalar>;
     case arrow::Type::UINT32:
-      return EvaluatePrimitivePredicate<arrow::UInt32Array, arrow::UInt32Scalar>(array, row,
-                                                                                 predicate);
+      return &EvaluatePrimitivePredicate<arrow::UInt32Array, arrow::UInt32Scalar>;
     case arrow::Type::UINT64:
-      return EvaluatePrimitivePredicate<arrow::UInt64Array, arrow::UInt64Scalar>(array, row,
-                                                                                 predicate);
+      return &EvaluatePrimitivePredicate<arrow::UInt64Array, arrow::UInt64Scalar>;
     case arrow::Type::FLOAT:
-      return EvaluatePrimitivePredicate<arrow::FloatArray, arrow::FloatScalar>(array, row,
-                                                                               predicate);
+      return &EvaluatePrimitivePredicate<arrow::FloatArray, arrow::FloatScalar>;
     case arrow::Type::DOUBLE:
-      return EvaluatePrimitivePredicate<arrow::DoubleArray, arrow::DoubleScalar>(array, row,
-                                                                                 predicate);
+      return &EvaluatePrimitivePredicate<arrow::DoubleArray, arrow::DoubleScalar>;
     case arrow::Type::TIMESTAMP:
-      return EvaluatePrimitivePredicate<arrow::TimestampArray, arrow::TimestampScalar>(array, row,
-                                                                                       predicate);
+      return &EvaluatePrimitivePredicate<arrow::TimestampArray, arrow::TimestampScalar>;
     case arrow::Type::STRING:
-      return EvaluateBinaryPredicate<arrow::StringArray>(array, row, predicate);
+      return &EvaluateBinaryPredicate<arrow::StringArray>;
     case arrow::Type::BINARY:
-      return EvaluateBinaryPredicate<arrow::BinaryArray>(array, row, predicate);
+      return &EvaluateBinaryPredicate<arrow::BinaryArray>;
     default:
       return arrow::Status::NotImplemented("[sniffer.scan.type] unsupported predicate type");
   }
@@ -1193,6 +1196,16 @@ class ScanState {
           }
         }
       }
+      std::vector<const arrow::Array*> predicate_columns;
+      predicate_columns.reserve(resolved_plan_.predicate_field_indices.size());
+      for (const size_t field_index : resolved_plan_.predicate_field_indices) {
+        predicate_columns.push_back(filter_columns.at(field_index).get());
+      }
+      std::vector<const arrow::Array*> sort_key_columns;
+      sort_key_columns.reserve(resolved_plan_.sort_key_field_indices.size());
+      for (const size_t field_index : resolved_plan_.sort_key_field_indices) {
+        sort_key_columns.push_back(filter_columns.at(field_index).get());
+      }
 
       std::vector<uint64_t> selection;
       {
@@ -1202,7 +1215,8 @@ class ScanState {
         for (uint64_t row = 0;
              row < row_group.row_count && static_cast<uint64_t>(selection.size()) < remaining_limit;
              ++row) {
-          ARROW_ASSIGN_OR_RAISE(const bool matches, RowMatches(row, filter_columns));
+          ARROW_ASSIGN_OR_RAISE(const bool matches,
+                                RowMatches(row, predicate_columns, sort_key_columns));
           if (matches) {
             selection.push_back(row);
           }
@@ -1315,15 +1329,13 @@ class ScanState {
     return false;
   }
 
-  arrow::Result<bool> RowMatches(
-      uint64_t row,
-      const std::unordered_map<size_t, std::shared_ptr<arrow::Array>>& columns) const {
+  arrow::Result<bool> RowMatches(uint64_t row,
+                                 const std::vector<const arrow::Array*>& predicate_columns,
+                                 const std::vector<const arrow::Array*>& sort_key_columns) const {
     for (size_t position = 0; position < plan_.conjunctive_predicates.size(); ++position) {
       const auto& predicate = plan_.conjunctive_predicates[position];
-      const size_t field_index = resolved_plan_.predicate_field_indices[position];
-      ARROW_ASSIGN_OR_RAISE(const bool matches,
-                            EvaluatePredicate(*columns.at(field_index), row, predicate));
-      if (!matches) {
+      const auto evaluator = resolved_plan_.predicate_evaluators[position];
+      if (!evaluator(*predicate_columns[position], row, predicate)) {
         return false;
       }
     }
@@ -1331,10 +1343,9 @@ class ScanState {
       return true;
     }
     std::vector<std::shared_ptr<arrow::Scalar>> key;
-    key.reserve(resolved_plan_.sort_key_field_indices.size());
-    for (const size_t field_index : resolved_plan_.sort_key_field_indices) {
-      ARROW_ASSIGN_OR_RAISE(auto value,
-                            columns.at(field_index)->GetScalar(static_cast<int64_t>(row)));
+    key.reserve(sort_key_columns.size());
+    for (const auto* column : sort_key_columns) {
+      ARROW_ASSIGN_OR_RAISE(auto value, column->GetScalar(static_cast<int64_t>(row)));
       key.push_back(std::move(value));
     }
     const auto& range = *plan_.sort_key_range;

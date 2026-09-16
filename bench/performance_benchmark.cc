@@ -26,6 +26,7 @@ constexpr int64_t kDefaultRows = 100000;
 constexpr int64_t kDefaultRowGroupRows = 4096;
 
 enum class Format { kSniffer, kArrowIpc, kArrowIpcZstd };
+enum class Query { kSinglePredicate, kThreePredicates };
 
 struct BenchmarkConfig {
   int64_t rows;
@@ -85,7 +86,7 @@ arrow::Result<Measurement> RunSnifferOnce(const std::filesystem::path& path,
                                           const sniffer::TableSchema& schema,
                                           const sniffer::LayoutPolicy& policy,
                                           const std::shared_ptr<arrow::RecordBatch>& batch,
-                                          const BenchmarkConfig& config) {
+                                          const BenchmarkConfig& config, Query query) {
   const auto start = std::chrono::steady_clock::now();
   auto writer_metrics = std::make_shared<sniffer::WriterMetrics>();
   ARROW_ASSIGN_OR_RAISE(
@@ -100,6 +101,11 @@ arrow::Result<Measurement> RunSnifferOnce(const std::filesystem::path& path,
   plan.projection_field_ids = {1, 3};
   plan.conjunctive_predicates = {{1, sniffer::Predicate::Op::kGe,
                                   std::make_shared<arrow::Int64Scalar>(batch->num_rows() / 2)}};
+  if (query == Query::kThreePredicates) {
+    plan.conjunctive_predicates.push_back(
+        {2, sniffer::Predicate::Op::kEq, std::make_shared<arrow::StringScalar>("group-0")});
+    plan.conjunctive_predicates.push_back({3, sniffer::Predicate::Op::kIsNotNull, nullptr});
+  }
   plan.output_batch_rows = config.row_group_rows / 2 + 1;
   auto scan_metrics = std::make_shared<sniffer::ScanMetrics>();
   ARROW_ASSIGN_OR_RAISE(auto iterator, reader->Scan(std::move(plan), scan_metrics));
@@ -203,7 +209,7 @@ void SetAverage(benchmark::State& state, std::string_view name, double total) {
   state.counters[std::string(name)] = total / static_cast<double>(state.iterations());
 }
 
-void Performance(benchmark::State& state, Format format) {
+void Performance(benchmark::State& state, Format format, Query query) {
   const BenchmarkConfig config{state.range(0), static_cast<uint32_t>(state.range(1))};
   auto batch_result = MakeBenchmarkBatch(config.rows);
   if (!batch_result.ok()) {
@@ -230,7 +236,7 @@ void Performance(benchmark::State& state, Format format) {
     (void)_;
     arrow::Result<Measurement> result = arrow::Status::Invalid("uninitialized format");
     if (format == Format::kSniffer) {
-      result = RunSnifferOnce(path, schema, policy, batch, config);
+      result = RunSnifferOnce(path, schema, policy, batch, config, query);
     } else {
       result = RunArrowIpcOnce(path, batch, config,
                                format == Format::kArrowIpc ? arrow::Compression::UNCOMPRESSED
@@ -241,7 +247,15 @@ void Performance(benchmark::State& state, Format format) {
       break;
     }
     auto value = *result;
-    const uint64_t expected_rows = static_cast<uint64_t>(config.rows - config.rows / 2);
+    uint64_t expected_rows = static_cast<uint64_t>(config.rows - config.rows / 2);
+    if (query == Query::kThreePredicates) {
+      expected_rows = 0;
+      for (int64_t row = config.rows / 2; row < config.rows; ++row) {
+        if (row % 32 == 0 && row % 17 != 0) {
+          ++expected_rows;
+        }
+      }
+    }
     if (value.output_rows != expected_rows) {
       state.SkipWithError("benchmark result count mismatch");
       break;
@@ -333,15 +347,19 @@ void Performance(benchmark::State& state, Format format) {
   state.SetItemsProcessed(state.iterations() * config.rows);
 }
 
-BENCHMARK_CAPTURE(Performance, Sniffer, Format::kSniffer)
+BENCHMARK_CAPTURE(Performance, Sniffer, Format::kSniffer, Query::kSinglePredicate)
     ->Args({kDefaultRows, kDefaultRowGroupRows})
     ->UseManualTime()
     ->Unit(benchmark::kMillisecond);
-BENCHMARK_CAPTURE(Performance, ArrowIPC, Format::kArrowIpc)
+BENCHMARK_CAPTURE(Performance, SnifferThreePredicates, Format::kSniffer, Query::kThreePredicates)
     ->Args({kDefaultRows, kDefaultRowGroupRows})
     ->UseManualTime()
     ->Unit(benchmark::kMillisecond);
-BENCHMARK_CAPTURE(Performance, ArrowIPC_ZSTD, Format::kArrowIpcZstd)
+BENCHMARK_CAPTURE(Performance, ArrowIPC, Format::kArrowIpc, Query::kSinglePredicate)
+    ->Args({kDefaultRows, kDefaultRowGroupRows})
+    ->UseManualTime()
+    ->Unit(benchmark::kMillisecond);
+BENCHMARK_CAPTURE(Performance, ArrowIPC_ZSTD, Format::kArrowIpcZstd, Query::kSinglePredicate)
     ->Args({kDefaultRows, kDefaultRowGroupRows})
     ->UseManualTime()
     ->Unit(benchmark::kMillisecond);
@@ -357,6 +375,7 @@ void AddBenchmarkContext() {
   benchmark::AddCustomContext("arrow_version", ARROW_VERSION_STRING);
   benchmark::AddCustomContext("distribution", "grouped_id_linear_value_nullable");
   benchmark::AddCustomContext("predicate", "id_ge_half");
+  benchmark::AddCustomContext("query_variants", "single_predicate,three_predicates");
   benchmark::AddCustomContext("projection", "id,value");
 }
 
