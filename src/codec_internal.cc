@@ -244,6 +244,61 @@ arrow::Result<std::shared_ptr<arrow::Array>> FinishScalars(
   return result;
 }
 
+template <typename Unsigned>
+Unsigned ReadLittleEndianValue(const uint8_t* bytes) {
+  Unsigned value = 0;
+  for (size_t index = 0; index < sizeof(Unsigned); ++index) {
+    value |= static_cast<Unsigned>(bytes[index]) << (index * 8U);
+  }
+  return value;
+}
+
+template <typename Rows, typename Builder, typename AppendValue>
+arrow::Result<std::shared_ptr<arrow::Array>> DecodeDictionaryRows(
+    const Rows& rows, std::span<const uint8_t> validity, const std::vector<uint64_t>& indices,
+    Builder* builder, AppendValue append_value) {
+  const size_t output_rows = static_cast<size_t>(std::ranges::size(rows));
+  if (output_rows > static_cast<size_t>(std::numeric_limits<int64_t>::max())) {
+    return InvalidCodec("decoded Dictionary array exceeds Arrow limit");
+  }
+  ARROW_RETURN_NOT_OK(builder->Reserve(static_cast<int64_t>(output_rows)));
+  for (const uint64_t row : rows) {
+    if (!IsValid(validity, row)) {
+      ARROW_RETURN_NOT_OK(builder->AppendNull());
+      continue;
+    }
+    ARROW_RETURN_NOT_OK(append_value(builder, indices[static_cast<size_t>(row)]));
+  }
+  std::shared_ptr<arrow::Array> result;
+  ARROW_RETURN_NOT_OK(builder->Finish(&result));
+  ARROW_RETURN_NOT_OK(result->ValidateFull());
+  return result;
+}
+
+template <typename Builder, typename AppendValue>
+arrow::Result<std::shared_ptr<arrow::Array>> DecodeDictionaryValues(
+    uint64_t row_count, const std::vector<uint64_t>* selection, std::span<const uint8_t> validity,
+    const std::vector<uint64_t>& indices, Builder* builder, AppendValue append_value) {
+  if (selection) {
+    return DecodeDictionaryRows(*selection, validity, indices, builder, append_value);
+  }
+  const auto rows = std::views::iota(uint64_t{0}, row_count);
+  return DecodeDictionaryRows(rows, validity, indices, builder, append_value);
+}
+
+template <typename Builder, typename Unsigned, typename Convert>
+arrow::Result<std::shared_ptr<arrow::Array>> DecodeFixedDictionaryValues(
+    uint64_t row_count, const std::vector<uint64_t>* selection, std::span<const uint8_t> validity,
+    std::span<const uint8_t> dictionary_values, const std::vector<uint64_t>& indices,
+    Builder* builder, Convert convert) {
+  return DecodeDictionaryValues(
+      row_count, selection, validity, indices, builder,
+      [dictionary_values, convert](Builder* output, uint64_t index) {
+        const auto* bytes = dictionary_values.data() + index * sizeof(Unsigned);
+        return output->Append(convert(ReadLittleEndianValue<Unsigned>(bytes)));
+      });
+}
+
 arrow::Result<std::vector<uint8_t>> EncodeDictionary(const FieldSpec& field,
                                                      const arrow::Array& array) {
   const auto validity = EncodeValidity(array);
@@ -460,8 +515,7 @@ arrow::Result<std::shared_ptr<arrow::Array>> DecodeDictionary(
     return InvalidCodec("invalid Dictionary index buffer");
   }
 
-  std::vector<std::shared_ptr<arrow::Scalar>> dictionary;
-  dictionary.reserve(static_cast<size_t>(dictionary_count));
+  std::vector<uint64_t> positions;
   if (IsVariable(field.type->id())) {
     ARROW_ASSIGN_OR_RAISE(const uint64_t offset_count, CheckedAdd(dictionary_count, uint64_t{1}));
     ARROW_ASSIGN_OR_RAISE(const uint64_t expected_offsets,
@@ -470,7 +524,6 @@ arrow::Result<std::shared_ptr<arrow::Array>> DecodeDictionary(
       return InvalidCodec("invalid Dictionary offsets");
     }
     ByteReader offsets(offset_bytes);
-    std::vector<uint64_t> positions;
     positions.reserve(static_cast<size_t>(offset_count));
     for (uint64_t index = 0; index < offset_count; ++index) {
       ARROW_ASSIGN_OR_RAISE(const uint64_t offset, offsets.ReadU64());
@@ -482,26 +535,12 @@ arrow::Result<std::shared_ptr<arrow::Array>> DecodeDictionary(
     if (positions.front() != 0 || positions.back() != value_bytes.size()) {
       return InvalidCodec("Dictionary offsets are not normalized");
     }
-    for (uint64_t index = 0; index < dictionary_count; ++index) {
-      const uint64_t begin = positions[static_cast<size_t>(index)];
-      const uint64_t end = positions[static_cast<size_t>(index + 1U)];
-      ARROW_ASSIGN_OR_RAISE(
-          auto scalar, ParseScalar(field, value_bytes.subspan(static_cast<size_t>(begin),
-                                                              static_cast<size_t>(end - begin))));
-      dictionary.push_back(std::move(scalar));
-    }
   } else {
     ARROW_ASSIGN_OR_RAISE(const auto physical_type, PhysicalTypeFor(*field.type));
     const uint32_t width = FixedWidthBytes(physical_type);
     ARROW_ASSIGN_OR_RAISE(const uint64_t expected_values, CheckedMultiply(dictionary_count, width));
     if (!offset_bytes.empty() || value_bytes.size() != expected_values) {
       return InvalidCodec("invalid fixed-width Dictionary values");
-    }
-    for (uint64_t index = 0; index < dictionary_count; ++index) {
-      ARROW_ASSIGN_OR_RAISE(
-          auto scalar,
-          ParseScalar(field, value_bytes.subspan(static_cast<size_t>(index * width), width)));
-      dictionary.push_back(std::move(scalar));
     }
   }
 
@@ -520,20 +559,85 @@ arrow::Result<std::shared_ptr<arrow::Array>> DecodeDictionary(
     indices.push_back(index);
   }
   ARROW_RETURN_NOT_OK(ValidateRowsToDecode(chunk.row_count, selection));
-  std::vector<std::shared_ptr<arrow::Scalar>> output;
-  output.reserve(selection ? selection->size() : static_cast<size_t>(chunk.row_count));
-  const auto append_rows = [&]<typename Rows>(const Rows& rows) {
-    for (const uint64_t row : rows) {
-      output.push_back(IsValid(validity, row) ? dictionary[static_cast<size_t>(indices[row])]
-                                              : nullptr);
+  switch (field.type->id()) {
+    case arrow::Type::INT8: {
+      arrow::Int8Builder builder;
+      return DecodeFixedDictionaryValues<arrow::Int8Builder, uint8_t>(
+          chunk.row_count, selection, validity, value_bytes, indices, &builder,
+          [](uint8_t bits) { return std::bit_cast<int8_t>(bits); });
     }
-  };
-  if (selection) {
-    append_rows(*selection);
-  } else {
-    append_rows(std::views::iota(uint64_t{0}, chunk.row_count));
+    case arrow::Type::INT16: {
+      arrow::Int16Builder builder;
+      return DecodeFixedDictionaryValues<arrow::Int16Builder, uint16_t>(
+          chunk.row_count, selection, validity, value_bytes, indices, &builder,
+          [](uint16_t bits) { return std::bit_cast<int16_t>(bits); });
+    }
+    case arrow::Type::INT32: {
+      arrow::Int32Builder builder;
+      return DecodeFixedDictionaryValues<arrow::Int32Builder, uint32_t>(
+          chunk.row_count, selection, validity, value_bytes, indices, &builder,
+          [](uint32_t bits) { return std::bit_cast<int32_t>(bits); });
+    }
+    case arrow::Type::INT64: {
+      arrow::Int64Builder builder;
+      return DecodeFixedDictionaryValues<arrow::Int64Builder, uint64_t>(
+          chunk.row_count, selection, validity, value_bytes, indices, &builder,
+          [](uint64_t bits) { return std::bit_cast<int64_t>(bits); });
+    }
+    case arrow::Type::UINT8: {
+      arrow::UInt8Builder builder;
+      return DecodeFixedDictionaryValues<arrow::UInt8Builder, uint8_t>(
+          chunk.row_count, selection, validity, value_bytes, indices, &builder,
+          [](uint8_t value) { return value; });
+    }
+    case arrow::Type::UINT16: {
+      arrow::UInt16Builder builder;
+      return DecodeFixedDictionaryValues<arrow::UInt16Builder, uint16_t>(
+          chunk.row_count, selection, validity, value_bytes, indices, &builder,
+          [](uint16_t value) { return value; });
+    }
+    case arrow::Type::UINT32: {
+      arrow::UInt32Builder builder;
+      return DecodeFixedDictionaryValues<arrow::UInt32Builder, uint32_t>(
+          chunk.row_count, selection, validity, value_bytes, indices, &builder,
+          [](uint32_t value) { return value; });
+    }
+    case arrow::Type::UINT64: {
+      arrow::UInt64Builder builder;
+      return DecodeFixedDictionaryValues<arrow::UInt64Builder, uint64_t>(
+          chunk.row_count, selection, validity, value_bytes, indices, &builder,
+          [](uint64_t value) { return value; });
+    }
+    case arrow::Type::STRING: {
+      arrow::StringBuilder builder;
+      return DecodeDictionaryValues(
+          chunk.row_count, selection, validity, indices, &builder,
+          [&positions, value_bytes](arrow::StringBuilder* output, uint64_t index) {
+            const uint64_t begin = positions[static_cast<size_t>(index)];
+            const uint64_t length = positions[static_cast<size_t>(index + 1U)] - begin;
+            if (length > static_cast<uint64_t>(std::numeric_limits<int32_t>::max())) {
+              return InvalidCodec("Dictionary string value exceeds Arrow limit");
+            }
+            return output->Append(reinterpret_cast<const char*>(value_bytes.data() + begin),
+                                  static_cast<int32_t>(length));
+          });
+    }
+    case arrow::Type::BINARY: {
+      arrow::BinaryBuilder builder;
+      return DecodeDictionaryValues(
+          chunk.row_count, selection, validity, indices, &builder,
+          [&positions, value_bytes](arrow::BinaryBuilder* output, uint64_t index) {
+            const uint64_t begin = positions[static_cast<size_t>(index)];
+            const uint64_t length = positions[static_cast<size_t>(index + 1U)] - begin;
+            if (length > static_cast<uint64_t>(std::numeric_limits<int32_t>::max())) {
+              return InvalidCodec("Dictionary binary value exceeds Arrow limit");
+            }
+            return output->Append(value_bytes.data() + begin, static_cast<int32_t>(length));
+          });
+    }
+    default:
+      return InvalidCodec("Dictionary type is not supported");
   }
-  return FinishScalars(field, output);
 }
 
 arrow::Result<std::shared_ptr<arrow::Array>> DecodeRle(const FieldSpec& field,

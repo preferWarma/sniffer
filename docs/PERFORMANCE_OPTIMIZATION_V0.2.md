@@ -77,7 +77,7 @@ v0.2 聚焦现有 Segment writer、reader、codec、scan 和文件 I/O 路径的
 
 ### 4.2 Reader 与 codec
 
-- [ ] Dictionary decode 直接向 typed Arrow builder/buffer 写入，不构造
+- [x] Dictionary decode 直接向 typed Arrow builder/buffer 写入，不构造
       `vector<shared_ptr<arrow::Scalar>>`。
 - [ ] RLE decode 使用 run-aware 批量 append；selection 路径按 run 跳过未命中范围，不展开所有行。
 - [x] FOR decode 使用 typed base/delta 和按字/批量 bit unpack，移除每值 `ScalarFromBits()`。
@@ -160,6 +160,18 @@ v0.2 聚焦现有 Segment writer、reader、codec、scan 和文件 I/O 路径的
 - [ ] 更新 README 的性能状态，不把合成 benchmark 结果表述为通用生产性能。
 
 ## 11. 执行记录
+
+### 2026-09-16：Dictionary typed decode
+
+- Dictionary decoder 不再为 dictionary entries 和输出行构造 `arrow::Scalar` shared pointer；整数
+  直接 little-endian 读取到 typed builder，string/binary 直接按已验证 offset append。
+- 完整读取与 selection decode 共用 typed 路径，同时仍完整校验 validity、全部 index、offset、
+  null 行 canonical index 和 payload 边界。
+- GTest reference 覆盖全部 8 种整数、string、binary，以及 null、极值、空值和 `{0,2,4}` selected
+  decode；编码 payload 字节保持不变。
+- Release、10 万行、32 值字符串 dictionary 的短时 microbenchmark：decode 中位数从
+  `1.948 ms / 556.1 MiB/s`（3 次）降至 `1.108 ms / 977.8 MiB/s`（7 次），约 `1.76x`。两次
+  payload 均为 `113,058` 字节；这是定向 microbenchmark，不替代最终 v0.2 完整矩阵。
 
 ### 2026-09-16：GoogleTest 与 Google Benchmark 迁移
 

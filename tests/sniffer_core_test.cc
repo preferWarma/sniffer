@@ -638,6 +638,35 @@ TEST(SnifferCoreTest, TypedDictionaryMatchesScalarReference) {
         "typed Dictionary encode");
     EXPECT_TRUE(actual == expected)
         << "typed Dictionary bytes match scalar reference for " + field.name;
+
+    sniffer::internal::ColumnChunkMeta chunk;
+    chunk.field_id = field.field_id;
+    chunk.physical_type =
+        ValueOrThrow(sniffer::internal::PhysicalTypeFor(*field.type), "Dictionary physical type");
+    chunk.encoding_id = sniffer::internal::kDictionaryEncodingId;
+    chunk.row_count = static_cast<uint64_t>(array.length());
+    chunk.null_count = static_cast<uint64_t>(array.null_count());
+    chunk.length = static_cast<uint64_t>(actual.size());
+    const auto decoded = ValueOrThrow(sniffer::internal::DecodeNonPlain(field, chunk, actual),
+                                      "typed Dictionary full decode");
+    EXPECT_TRUE(decoded->Equals(array))
+        << "typed Dictionary full decode matches source for " + field.name;
+
+    const std::vector<uint64_t> selection = {0, 2, 4};
+    const auto selected =
+        ValueOrThrow(sniffer::internal::DecodeNonPlain(field, chunk, actual, &selection),
+                     "typed Dictionary selected decode");
+    auto expected_builder =
+        ValueOrThrow(arrow::MakeBuilder(field.type), "make Dictionary selection reference");
+    for (const uint64_t row : selection) {
+      const auto value =
+          ValueOrThrow(array.GetScalar(static_cast<int64_t>(row)), "Dictionary reference scalar");
+      RequireOk(expected_builder->AppendScalar(*value), "append Dictionary reference scalar");
+    }
+    std::shared_ptr<arrow::Array> selected_expected;
+    RequireOk(expected_builder->Finish(&selected_expected), "finish Dictionary reference");
+    EXPECT_TRUE(selected->Equals(selected_expected))
+        << "typed Dictionary selected decode matches scalar reference for " + field.name;
   }
 }
 
