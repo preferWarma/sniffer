@@ -36,6 +36,30 @@ foreach(index RANGE 0 ${benchmark_last})
     if(real_time LESS 0 OR time_unit STREQUAL "")
       message(FATAL_ERROR "Google Benchmark JSON contains an invalid timing result")
     endif()
+    if(EXPECT_MEMORY_COUNTERS)
+      foreach(
+        counter
+        IN ITEMS
+          arrow_total_allocated_bytes
+          arrow_allocations
+          arrow_bytes_per_input_row
+          arrow_allocations_per_input_row
+          arrow_pool_peak_bytes
+          process_peak_rss_bytes
+      )
+        string(
+          JSON counter_value
+          ERROR_VARIABLE counter_error
+          GET "${benchmark_output}" benchmarks ${index} ${counter}
+        )
+        if(NOT "${counter_error}" STREQUAL "NOTFOUND" OR counter_value LESS 0)
+          message(FATAL_ERROR "Google Benchmark JSON is missing valid ${counter}")
+        endif()
+        if(NOT "${counter}" STREQUAL "process_peak_rss_bytes" AND counter_value LESS_EQUAL 0)
+          message(FATAL_ERROR "Google Benchmark JSON contains empty ${counter}")
+        endif()
+      endforeach()
+    endif()
     set(found_expected_prefix TRUE)
     break()
   endif()

@@ -1,11 +1,17 @@
 #include <arrow/api.h>
 #include <arrow/io/api.h>
 #include <arrow/ipc/api.h>
+#include <arrow/memory_pool.h>
 #include <arrow/util/compression.h>
 #include <arrow/util/config.h>
 #include <benchmark/benchmark.h>
 
+#if defined(__APPLE__) || defined(__linux__)
+#include <sys/resource.h>
+#endif
+
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cstdint>
 #include <filesystem>
@@ -31,6 +37,8 @@ enum class Query { kSinglePredicate, kThreePredicates, kSortKeyRange };
 struct BenchmarkConfig {
   int64_t rows;
   uint32_t row_group_rows;
+  uint32_t selectivity_percent = 50;
+  uint32_t projection_columns = 2;
 };
 
 struct Measurement {
@@ -40,10 +48,58 @@ struct Measurement {
   uint64_t file_bytes = 0;
   uint64_t output_rows = 0;
   uint64_t record_groups = 0;
+  uint64_t arrow_total_allocated_bytes = 0;
+  uint64_t arrow_allocations = 0;
+  uint64_t arrow_pool_peak_bytes = 0;
+  uint64_t process_peak_rss_bytes = 0;
   sniffer::WriterMetrics writer_metrics;
   sniffer::ReaderMetrics reader_metrics;
   sniffer::ScanMetrics scan_metrics;
 };
+
+struct MemorySnapshot {
+  int64_t arrow_total_allocated_bytes = 0;
+  int64_t arrow_allocations = 0;
+  int64_t arrow_pool_peak_bytes = 0;
+  uint64_t process_peak_rss_bytes = 0;
+};
+
+uint64_t PeakResidentSetBytes() {
+#if defined(__APPLE__) || defined(__linux__)
+  rusage usage{};
+  if (getrusage(RUSAGE_SELF, &usage) != 0 || usage.ru_maxrss < 0) {
+    return 0;
+  }
+#if defined(__APPLE__)
+  return static_cast<uint64_t>(usage.ru_maxrss);
+#else
+  return static_cast<uint64_t>(usage.ru_maxrss) * 1024U;
+#endif
+#else
+  return 0;
+#endif
+}
+
+MemorySnapshot CaptureMemorySnapshot() {
+  const auto* pool = arrow::default_memory_pool();
+  return {pool->total_bytes_allocated(), pool->num_allocations(), pool->max_memory(),
+          PeakResidentSetBytes()};
+}
+
+uint64_t NonNegativeDelta(int64_t before, int64_t after) {
+  return after > before ? static_cast<uint64_t>(after - before) : 0;
+}
+
+void RecordMemory(const MemorySnapshot& before, const MemorySnapshot& after,
+                  Measurement* measurement) {
+  measurement->arrow_total_allocated_bytes =
+      NonNegativeDelta(before.arrow_total_allocated_bytes, after.arrow_total_allocated_bytes);
+  measurement->arrow_allocations =
+      NonNegativeDelta(before.arrow_allocations, after.arrow_allocations);
+  measurement->arrow_pool_peak_bytes =
+      after.arrow_pool_peak_bytes > 0 ? static_cast<uint64_t>(after.arrow_pool_peak_bytes) : 0;
+  measurement->process_peak_rss_bytes = after.process_peak_rss_bytes;
+}
 
 arrow::Result<std::shared_ptr<arrow::RecordBatch>> MakeBenchmarkBatch(int64_t rows) {
   auto schema = arrow::schema({arrow::field("id", arrow::int64(), false),
@@ -82,11 +138,33 @@ arrow::Result<uint64_t> FileSize(const std::filesystem::path& path) {
   return size;
 }
 
+uint64_t SelectedRows(const BenchmarkConfig& config) {
+  return static_cast<uint64_t>(config.rows) * config.selectivity_percent / 100U;
+}
+
+int64_t PredicateThreshold(const BenchmarkConfig& config) {
+  return config.rows - static_cast<int64_t>(SelectedRows(config));
+}
+
+std::vector<uint32_t> ProjectionFieldIds(uint32_t projection_columns) {
+  switch (projection_columns) {
+    case 1:
+      return {1};
+    case 2:
+      return {1, 3};
+    case 3:
+      return {1, 2, 3};
+    default:
+      return {};
+  }
+}
+
 arrow::Result<Measurement> RunSnifferOnce(const std::filesystem::path& path,
                                           const sniffer::TableSchema& schema,
                                           const sniffer::LayoutPolicy& policy,
                                           const std::shared_ptr<arrow::RecordBatch>& batch,
                                           const BenchmarkConfig& config, Query query) {
+  const MemorySnapshot memory_before = CaptureMemorySnapshot();
   const auto start = std::chrono::steady_clock::now();
   auto writer_metrics = std::make_shared<sniffer::WriterMetrics>();
   ARROW_ASSIGN_OR_RAISE(
@@ -98,7 +176,7 @@ arrow::Result<Measurement> RunSnifferOnce(const std::filesystem::path& path,
   auto reader_metrics = std::make_shared<sniffer::ReaderMetrics>();
   ARROW_ASSIGN_OR_RAISE(auto reader, sniffer::SegmentReader::Open(path.string(), reader_metrics));
   sniffer::IOPlan plan;
-  plan.projection_field_ids = {1, 3};
+  plan.projection_field_ids = ProjectionFieldIds(config.projection_columns);
   if (query == Query::kSortKeyRange) {
     sniffer::SortKeyRange range;
     range.lower = std::vector<std::shared_ptr<arrow::Scalar>>{
@@ -107,8 +185,9 @@ arrow::Result<Measurement> RunSnifferOnce(const std::filesystem::path& path,
         std::make_shared<arrow::Int64Scalar>(batch->num_rows() * 3 / 4)};
     plan.sort_key_range = std::move(range);
   } else {
-    plan.conjunctive_predicates = {{1, sniffer::Predicate::Op::kGe,
-                                    std::make_shared<arrow::Int64Scalar>(batch->num_rows() / 2)}};
+    plan.conjunctive_predicates = {
+        {1, sniffer::Predicate::Op::kGe,
+         std::make_shared<arrow::Int64Scalar>(PredicateThreshold(config))}};
   }
   if (query == Query::kThreePredicates) {
     plan.conjunctive_predicates.push_back(
@@ -140,6 +219,7 @@ arrow::Result<Measurement> RunSnifferOnce(const std::filesystem::path& path,
   measurement.writer_metrics = *writer_metrics;
   measurement.reader_metrics = *reader_metrics;
   measurement.scan_metrics = *scan_metrics;
+  RecordMemory(memory_before, CaptureMemorySnapshot(), &measurement);
   return measurement;
 }
 
@@ -147,6 +227,7 @@ arrow::Result<Measurement> RunArrowIpcOnce(const std::filesystem::path& path,
                                            const std::shared_ptr<arrow::RecordBatch>& batch,
                                            const BenchmarkConfig& config,
                                            arrow::Compression::type compression) {
+  const MemorySnapshot memory_before = CaptureMemorySnapshot();
   const auto start = std::chrono::steady_clock::now();
   ARROW_ASSIGN_OR_RAISE(auto output, arrow::io::FileOutputStream::Open(path.string()));
   auto write_options = arrow::ipc::IpcWriteOptions::Defaults();
@@ -211,6 +292,7 @@ arrow::Result<Measurement> RunArrowIpcOnce(const std::filesystem::path& path,
   ARROW_ASSIGN_OR_RAISE(measurement.file_bytes, FileSize(path));
   measurement.output_rows = output_rows;
   measurement.record_groups = static_cast<uint64_t>(reader->num_record_batches());
+  RecordMemory(memory_before, CaptureMemorySnapshot(), &measurement);
   return measurement;
 }
 
@@ -218,8 +300,8 @@ void SetAverage(benchmark::State& state, std::string_view name, double total) {
   state.counters[std::string(name)] = total / static_cast<double>(state.iterations());
 }
 
-void Performance(benchmark::State& state, Format format, Query query) {
-  const BenchmarkConfig config{state.range(0), static_cast<uint32_t>(state.range(1))};
+void RunPerformance(benchmark::State& state, Format format, Query query,
+                    const BenchmarkConfig& config) {
   auto batch_result = MakeBenchmarkBatch(config.rows);
   if (!batch_result.ok()) {
     state.SkipWithError(batch_result.status().ToString());
@@ -256,10 +338,13 @@ void Performance(benchmark::State& state, Format format, Query query) {
       break;
     }
     auto value = *result;
-    uint64_t expected_rows = static_cast<uint64_t>(config.rows - config.rows / 2);
+    uint64_t expected_rows = SelectedRows(config);
+    if (query == Query::kSortKeyRange) {
+      expected_rows = static_cast<uint64_t>(config.rows * 3 / 4 - config.rows / 4);
+    }
     if (query == Query::kThreePredicates) {
       expected_rows = 0;
-      for (int64_t row = config.rows / 2; row < config.rows; ++row) {
+      for (int64_t row = PredicateThreshold(config); row < config.rows; ++row) {
         if (row % 32 == 0 && row % 17 != 0) {
           ++expected_rows;
         }
@@ -276,6 +361,12 @@ void Performance(benchmark::State& state, Format format, Query query) {
     totals.file_bytes += value.file_bytes;
     totals.output_rows += value.output_rows;
     totals.record_groups += value.record_groups;
+    totals.arrow_total_allocated_bytes += value.arrow_total_allocated_bytes;
+    totals.arrow_allocations += value.arrow_allocations;
+    totals.arrow_pool_peak_bytes =
+        std::max(totals.arrow_pool_peak_bytes, value.arrow_pool_peak_bytes);
+    totals.process_peak_rss_bytes =
+        std::max(totals.process_peak_rss_bytes, value.process_peak_rss_bytes);
     totals.writer_metrics.validation_nanoseconds += value.writer_metrics.validation_nanoseconds;
     totals.writer_metrics.index_nanoseconds += value.writer_metrics.index_nanoseconds;
     totals.writer_metrics.encoding_selection_nanoseconds +=
@@ -319,6 +410,18 @@ void Performance(benchmark::State& state, Format format, Query query) {
   SetAverage(state, "file_bytes", static_cast<double>(totals.file_bytes));
   SetAverage(state, "output_rows", static_cast<double>(totals.output_rows));
   SetAverage(state, "record_groups", static_cast<double>(totals.record_groups));
+  SetAverage(state, "arrow_total_allocated_bytes",
+             static_cast<double>(totals.arrow_total_allocated_bytes));
+  SetAverage(state, "arrow_allocations", static_cast<double>(totals.arrow_allocations));
+  SetAverage(
+      state, "arrow_bytes_per_input_row",
+      static_cast<double>(totals.arrow_total_allocated_bytes) / static_cast<double>(config.rows));
+  SetAverage(state, "arrow_allocations_per_input_row",
+             static_cast<double>(totals.arrow_allocations) / static_cast<double>(config.rows));
+  state.counters["arrow_pool_peak_bytes"] = static_cast<double>(totals.arrow_pool_peak_bytes);
+  state.counters["process_peak_rss_bytes"] = static_cast<double>(totals.process_peak_rss_bytes);
+  state.counters["selectivity_percent"] = static_cast<double>(config.selectivity_percent);
+  state.counters["projection_columns"] = static_cast<double>(config.projection_columns);
   if (format == Format::kSniffer) {
     constexpr double kNanosecondsPerMillisecond = 1'000'000.0;
     const auto phase = [&](std::string_view name, uint64_t nanoseconds) {
@@ -356,6 +459,37 @@ void Performance(benchmark::State& state, Format format, Query query) {
   state.SetItemsProcessed(state.iterations() * config.rows);
 }
 
+void Performance(benchmark::State& state, Format format, Query query) {
+  const BenchmarkConfig config{state.range(0), static_cast<uint32_t>(state.range(1))};
+  RunPerformance(state, format, query, config);
+}
+
+void PerformanceMatrix(benchmark::State& state, Format format, Query query) {
+  const BenchmarkConfig config{state.range(0), static_cast<uint32_t>(state.range(1)),
+                               static_cast<uint32_t>(state.range(2)),
+                               static_cast<uint32_t>(state.range(3))};
+  if (config.rows <= 0 || config.row_group_rows == 0 || config.selectivity_percent == 0 ||
+      config.selectivity_percent > 100 || config.projection_columns == 0 ||
+      config.projection_columns > 3) {
+    state.SkipWithError("invalid performance matrix configuration");
+    return;
+  }
+  RunPerformance(state, format, query, config);
+}
+
+void ApplyPerformanceMatrix(benchmark::internal::Benchmark* benchmark) {
+  constexpr std::array<int64_t, 4> kRowGroupRows = {1024, 8192, 65536, 262144};
+  constexpr std::array<int64_t, 4> kSelectivityPercent = {1, 10, 50, 100};
+  constexpr std::array<int64_t, 3> kProjectionColumns = {1, 2, 3};
+  for (const int64_t row_group_rows : kRowGroupRows) {
+    for (const int64_t selectivity_percent : kSelectivityPercent) {
+      for (const int64_t projection_columns : kProjectionColumns) {
+        benchmark->Args({kDefaultRows, row_group_rows, selectivity_percent, projection_columns});
+      }
+    }
+  }
+}
+
 BENCHMARK_CAPTURE(Performance, Sniffer, Format::kSniffer, Query::kSinglePredicate)
     ->Args({kDefaultRows, kDefaultRowGroupRows})
     ->UseManualTime()
@@ -376,6 +510,11 @@ BENCHMARK_CAPTURE(Performance, ArrowIPC_ZSTD, Format::kArrowIpcZstd, Query::kSin
     ->Args({kDefaultRows, kDefaultRowGroupRows})
     ->UseManualTime()
     ->Unit(benchmark::kMillisecond);
+BENCHMARK_CAPTURE(PerformanceMatrix, Sniffer, Format::kSniffer, Query::kSinglePredicate)
+    ->Apply(ApplyPerformanceMatrix)
+    ->ArgNames({"rows", "row_group_rows", "selectivity_percent", "projection_columns"})
+    ->UseManualTime()
+    ->Unit(benchmark::kMillisecond);
 
 void AddBenchmarkContext() {
 #ifdef NDEBUG
@@ -390,6 +529,10 @@ void AddBenchmarkContext() {
   benchmark::AddCustomContext("predicate", "id_ge_half");
   benchmark::AddCustomContext("query_variants", "single_predicate,three_predicates,sort_key_range");
   benchmark::AddCustomContext("projection", "id,value");
+  benchmark::AddCustomContext("matrix_dimensions",
+                              "row_group_rows,selectivity_percent,projection_columns");
+  benchmark::AddCustomContext(
+      "memory_metrics", "Arrow allocation deltas per iteration; pool/RSS process high-water marks");
 }
 
 }  // namespace

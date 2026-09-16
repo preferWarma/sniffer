@@ -55,8 +55,8 @@ v0.2 聚焦现有 Segment writer、reader、codec、scan 和文件 I/O 路径的
       谓词、selection materialization、RecordBatch 拼接。
 - [ ] 使用 Instruments 或等价 profiler 保存 CPU flamegraph 摘要和 allocation hot spots；先证明
       热点，再修改实现。
-- [ ] 增加峰值 RSS、Arrow memory pool 峰值和每输入行分配次数指标。
-- [ ] 扩展固定矩阵：Row Group 1K/8K/64K/256K，选择率 1%/10%/50%/100%，单列/多列/全列投影。
+- [x] 增加峰值 RSS、Arrow memory pool 峰值和每输入行分配次数指标。
+- [x] 扩展固定矩阵：Row Group 1K/8K/64K/256K，选择率 1%/10%/50%/100%，单列/多列/全列投影。
 - [ ] 增加至少一个宽表和一个超过页缓存容量的数据集；分别报告 warm-cache 与 cold-cache 结果。
 
 ## 4. P0：消除已知重复工作和逐值对象开销
@@ -164,6 +164,44 @@ v0.2 聚焦现有 Segment writer、reader、codec、scan 和文件 I/O 路径的
 - [ ] 更新 README 的性能状态，不把合成 benchmark 结果表述为通用生产性能。
 
 ## 11. 执行记录
+
+### 2026-09-17：Arrow allocation 与峰值 RSS 指标
+
+- performance benchmark 在计时窗口外读取 Arrow default memory pool 和进程 high-water RSS；每轮
+  记录 Arrow 累计申请字节、allocation/reallocation 次数，并派生 bytes/input-row 与
+  allocations/input-row。采样不会进入 manual benchmark 时间。
+- `arrow_total_allocated_bytes` 和 `arrow_allocations` 是每轮前后差值，可在同一进程的多个 case 间
+  比较；`arrow_pool_peak_bytes` 与 `process_peak_rss_bytes` 是进程生命周期高水位。峰值比较必须让
+  每个目标 case 在独立进程中运行，不能直接比较同一进程内后续矩阵 case 的高水位。
+- RSS 使用 macOS/Linux `getrusage()`，macOS 按字节、Linux 从 KiB 转为字节；其他平台保留字段并
+  输出 0。JSON smoke 强制验证所有内存字段存在，并要求 Arrow 指标为正值。
+
+独立 Release dry-run、10 万行、Row Group 4,096、50% 选择率、2 列投影的观测值：
+
+| 指标 | 值 |
+|---|---:|
+| Arrow 累计申请字节 | 1,624,448 bytes |
+| Arrow allocations/reallocations | 114 |
+| Arrow bytes/input-row | 16.24448 |
+| Arrow allocations/input-row | 0.00114 |
+| Arrow pool 进程峰值 | 3,086,272 bytes |
+| 进程峰值 RSS | 10,567,680 bytes |
+
+这些数字用于验证指标管线，不是完整矩阵的内存结论；最终 `BENCHMARK_V2.md` 需要对选定 case 分别
+启动进程并重复采样。
+
+### 2026-09-17：Row Group、选择率与投影矩阵
+
+- performance benchmark 新增独立 `PerformanceMatrix/Sniffer`，覆盖 Row Group 1,024/8,192/
+  65,536/262,144，选择率 1%/10%/50%/100%，以及 1/2/3 列投影，共 48 个组合；既有 Sniffer、
+  三 predicate、sort-key range、Arrow IPC 和 Arrow IPC ZSTD case 名称保持不变。
+- 每个矩阵 case 在计时循环内验证输出行数，并将选择率、投影列数、Row Group 数、剪枝数、chunk
+  读取数/字节和各阶段耗时写入 Google Benchmark JSON；参数名称直接持久化在 benchmark 名称中。
+- Release dry-run 对 48 个组合逐项执行，输出行数严格匹配 1,000/10,000/50,000/100,000，未出现
+  skipped case。dry-run 只用于正确性验证，不作为性能结论；最终报告仍需按至少 7 次重复测量运行。
+
+该矩阵完成第 3 节的 Row Group、选择率和窄表投影维度；宽表、超过页缓存的数据集、warm/cold cache
+和峰值内存仍是独立待办，不能据此勾选完整 benchmark 验收项。
 
 ### 2026-09-17：预绑定 typed sort-key comparator
 

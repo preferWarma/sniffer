@@ -197,6 +197,7 @@ if(SNIFFER_BUILD_BENCHMARK)
         "${CMAKE_COMMAND}"
         "-DBENCHMARK_EXECUTABLE=$<TARGET_FILE:sniffer_core_performance_benchmark>"
         -DEXPECTED_PREFIX=Performance/
+        -DEXPECT_MEMORY_COUNTERS=ON
         -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/validate_google_benchmark_json.cmake"
     )
     add_test(
