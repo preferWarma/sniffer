@@ -758,18 +758,28 @@ arrow::Result<int> CompareKeyVectors(const std::vector<std::shared_ptr<arrow::Sc
   return 0;
 }
 
-arrow::Status ValidatePlan(const internal::FooterData& footer, const IOPlan& plan) {
+struct ResolvedScanPlan {
+  std::vector<size_t> projection_field_indices;
+  std::vector<size_t> predicate_field_indices;
+  std::vector<size_t> sort_key_field_indices;
+};
+
+arrow::Result<ResolvedScanPlan> ValidatePlan(const internal::FooterData& footer,
+                                             const IOPlan& plan) {
   if (plan.output_batch_rows == 0) {
     return arrow::Status::Invalid("[sniffer.plan.batch] output_batch_rows must be positive");
   }
+  ResolvedScanPlan resolved;
+  resolved.projection_field_indices.reserve(plan.projection_field_ids.size());
   std::unordered_set<uint32_t> projection_ids;
   for (const uint32_t field_id : plan.projection_field_ids) {
-    ARROW_ASSIGN_OR_RAISE(const size_t ignored, FindFieldIndex(footer.schema, field_id));
-    static_cast<void>(ignored);
+    ARROW_ASSIGN_OR_RAISE(const size_t field_index, FindFieldIndex(footer.schema, field_id));
     if (!projection_ids.insert(field_id).second) {
       return arrow::Status::Invalid("[sniffer.plan.projection] duplicate field ID ", field_id);
     }
+    resolved.projection_field_indices.push_back(field_index);
   }
+  resolved.predicate_field_indices.reserve(plan.conjunctive_predicates.size());
   for (const auto& predicate : plan.conjunctive_predicates) {
     ARROW_ASSIGN_OR_RAISE(const size_t field_index,
                           FindFieldIndex(footer.schema, predicate.field_id));
@@ -784,28 +794,32 @@ arrow::Status ValidatePlan(const internal::FooterData& footer, const IOPlan& pla
       return arrow::Status::Invalid(
           "[sniffer.plan.predicate] comparison value must be non-null and exactly typed");
     }
+    resolved.predicate_field_indices.push_back(field_index);
   }
   if (!plan.sort_key_range) {
-    return arrow::Status::OK();
+    return resolved;
   }
   const auto& sort_fields = footer.layout_policy.sort_key_field_ids;
   if (sort_fields.empty()) {
     return arrow::Status::Invalid(
         "[sniffer.plan.sort_key] range requires a configured segment sort key");
   }
+  resolved.sort_key_field_indices.reserve(sort_fields.size());
+  for (const uint32_t field_id : sort_fields) {
+    ARROW_ASSIGN_OR_RAISE(const size_t field_index, FindFieldIndex(footer.schema, field_id));
+    resolved.sort_key_field_indices.push_back(field_index);
+  }
   const auto validate_bound =
-      [&footer,
-       &sort_fields](const std::optional<std::vector<std::shared_ptr<arrow::Scalar>>>& bound)
+      [&footer, &resolved](const std::optional<std::vector<std::shared_ptr<arrow::Scalar>>>& bound)
       -> arrow::Status {
     if (!bound) {
       return arrow::Status::OK();
     }
-    if (bound->size() != sort_fields.size()) {
+    if (bound->size() != resolved.sort_key_field_indices.size()) {
       return arrow::Status::Invalid("[sniffer.plan.sort_key] bound arity mismatch");
     }
     for (size_t index = 0; index < bound->size(); ++index) {
-      ARROW_ASSIGN_OR_RAISE(const size_t field_index,
-                            FindFieldIndex(footer.schema, sort_fields[index]));
+      const size_t field_index = resolved.sort_key_field_indices[index];
       const auto& value = (*bound)[index];
       if (!value || !value->is_valid || internal::ScalarHasNaN(*value) ||
           !value->type->Equals(footer.schema.fields[field_index].type)) {
@@ -824,7 +838,7 @@ arrow::Status ValidatePlan(const internal::FooterData& footer, const IOPlan& pla
       return arrow::Status::Invalid("[sniffer.plan.sort_key] lower bound exceeds upper bound");
     }
   }
-  return arrow::Status::OK();
+  return resolved;
 }
 
 bool EvaluateOrderedResult(int order, Predicate::Op op) {
@@ -963,7 +977,7 @@ const internal::BloomMeta* FindBloom(const internal::RowGroupIndex& index, uint3
 arrow::Result<bool> PredicatePrunes(const TableSchema& schema,
                                     const internal::RowGroupMeta& row_group,
                                     const internal::RowGroupIndex& index,
-                                    const Predicate& predicate) {
+                                    const Predicate& predicate, size_t field_index) {
   const auto* statistics = FindStatistics(index, predicate.field_id);
   if (statistics) {
     if (predicate.op == Predicate::Op::kIsNull) {
@@ -1023,7 +1037,6 @@ arrow::Result<bool> PredicatePrunes(const TableSchema& schema,
   if (predicate.op == Predicate::Op::kEq) {
     const auto* bloom = FindBloom(index, predicate.field_id);
     if (bloom) {
-      ARROW_ASSIGN_OR_RAISE(const size_t field_index, FindFieldIndex(schema, predicate.field_id));
       ARROW_ASSIGN_OR_RAISE(
           const bool may_contain,
           internal::BloomMayContain(schema.fields[field_index], *bloom, *predicate.value));
@@ -1089,11 +1102,13 @@ class ScanState {
  public:
   ScanState(std::shared_ptr<RandomAccessFile> file, internal::FooterData footer,
             std::vector<internal::RowGroupIndex> indexes, IOPlan plan,
-            std::shared_ptr<ScanMetrics> metrics, std::shared_ptr<arrow::Schema> output_schema)
+            ResolvedScanPlan resolved_plan, std::shared_ptr<ScanMetrics> metrics,
+            std::shared_ptr<arrow::Schema> output_schema)
       : file_(std::move(file)),
         footer_(std::move(footer)),
         indexes_(std::move(indexes)),
         plan_(std::move(plan)),
+        resolved_plan_(std::move(resolved_plan)),
         metrics_(std::move(metrics)),
         output_schema_(std::move(output_schema)) {}
 
@@ -1164,17 +1179,14 @@ class ScanState {
       }
 
       std::unordered_map<size_t, std::shared_ptr<arrow::Array>> filter_columns;
-      for (const auto& predicate : plan_.conjunctive_predicates) {
-        ARROW_ASSIGN_OR_RAISE(const size_t field_index,
-                              FindFieldIndex(footer_.schema, predicate.field_id));
+      for (const size_t field_index : resolved_plan_.predicate_field_indices) {
         if (!filter_columns.contains(field_index)) {
           ARROW_ASSIGN_OR_RAISE(auto array, DecodePredicateChunk(row_group, field_index));
           filter_columns.emplace(field_index, std::move(array));
         }
       }
       if (plan_.sort_key_range) {
-        for (const uint32_t field_id : footer_.layout_policy.sort_key_field_ids) {
-          ARROW_ASSIGN_OR_RAISE(const size_t field_index, FindFieldIndex(footer_.schema, field_id));
+        for (const size_t field_index : resolved_plan_.sort_key_field_indices) {
           if (!filter_columns.contains(field_index)) {
             ARROW_ASSIGN_OR_RAISE(auto array, DecodePredicateChunk(row_group, field_index));
             filter_columns.emplace(field_index, std::move(array));
@@ -1201,9 +1213,8 @@ class ScanState {
       }
 
       std::vector<std::shared_ptr<arrow::Array>> projected_columns;
-      projected_columns.reserve(plan_.projection_field_ids.size());
-      for (const uint32_t field_id : plan_.projection_field_ids) {
-        ARROW_ASSIGN_OR_RAISE(const size_t field_index, FindFieldIndex(footer_.schema, field_id));
+      projected_columns.reserve(resolved_plan_.projection_field_indices.size());
+      for (const size_t field_index : resolved_plan_.projection_field_indices) {
         const auto decoded = filter_columns.find(field_index);
         if (decoded != filter_columns.end()) {
           std::shared_ptr<arrow::Array> selected;
@@ -1289,9 +1300,11 @@ class ScanState {
 
   arrow::Result<bool> IsPruned(const internal::RowGroupMeta& row_group,
                                const internal::RowGroupIndex& index) const {
-    for (const auto& predicate : plan_.conjunctive_predicates) {
-      ARROW_ASSIGN_OR_RAISE(const bool prunes,
-                            PredicatePrunes(footer_.schema, row_group, index, predicate));
+    for (size_t position = 0; position < plan_.conjunctive_predicates.size(); ++position) {
+      ARROW_ASSIGN_OR_RAISE(
+          const bool prunes,
+          PredicatePrunes(footer_.schema, row_group, index, plan_.conjunctive_predicates[position],
+                          resolved_plan_.predicate_field_indices[position]));
       if (prunes) {
         return true;
       }
@@ -1305,9 +1318,9 @@ class ScanState {
   arrow::Result<bool> RowMatches(
       uint64_t row,
       const std::unordered_map<size_t, std::shared_ptr<arrow::Array>>& columns) const {
-    for (const auto& predicate : plan_.conjunctive_predicates) {
-      ARROW_ASSIGN_OR_RAISE(const size_t field_index,
-                            FindFieldIndex(footer_.schema, predicate.field_id));
+    for (size_t position = 0; position < plan_.conjunctive_predicates.size(); ++position) {
+      const auto& predicate = plan_.conjunctive_predicates[position];
+      const size_t field_index = resolved_plan_.predicate_field_indices[position];
       ARROW_ASSIGN_OR_RAISE(const bool matches,
                             EvaluatePredicate(*columns.at(field_index), row, predicate));
       if (!matches) {
@@ -1318,9 +1331,8 @@ class ScanState {
       return true;
     }
     std::vector<std::shared_ptr<arrow::Scalar>> key;
-    key.reserve(footer_.layout_policy.sort_key_field_ids.size());
-    for (const uint32_t field_id : footer_.layout_policy.sort_key_field_ids) {
-      ARROW_ASSIGN_OR_RAISE(const size_t field_index, FindFieldIndex(footer_.schema, field_id));
+    key.reserve(resolved_plan_.sort_key_field_indices.size());
+    for (const size_t field_index : resolved_plan_.sort_key_field_indices) {
       ARROW_ASSIGN_OR_RAISE(auto value,
                             columns.at(field_index)->GetScalar(static_cast<int64_t>(row)));
       key.push_back(std::move(value));
@@ -1345,6 +1357,7 @@ class ScanState {
   internal::FooterData footer_;
   std::vector<internal::RowGroupIndex> indexes_;
   IOPlan plan_;
+  ResolvedScanPlan resolved_plan_;
   std::shared_ptr<ScanMetrics> metrics_;
   std::shared_ptr<arrow::Schema> output_schema_;
   size_t next_row_group_ = 0;
@@ -1502,7 +1515,7 @@ class SegmentReader::Impl {
 
   arrow::Result<arrow::RecordBatchIterator> Scan(IOPlan plan,
                                                  std::shared_ptr<ScanMetrics> metrics) const {
-    ARROW_RETURN_NOT_OK(ValidatePlan(footer_, plan));
+    ARROW_ASSIGN_OR_RAISE(auto resolved_plan, ValidatePlan(footer_, plan));
     if (!metrics) {
       metrics = std::make_shared<ScanMetrics>();
     } else {
@@ -1510,14 +1523,14 @@ class SegmentReader::Impl {
     }
     ARROW_ASSIGN_OR_RAISE(auto full_schema, footer_.schema.ToArrowSchema());
     std::vector<std::shared_ptr<arrow::Field>> projected_fields;
-    projected_fields.reserve(plan.projection_field_ids.size());
-    for (const uint32_t field_id : plan.projection_field_ids) {
-      ARROW_ASSIGN_OR_RAISE(const size_t field_index, FindFieldIndex(footer_.schema, field_id));
+    projected_fields.reserve(resolved_plan.projection_field_indices.size());
+    for (const size_t field_index : resolved_plan.projection_field_indices) {
       projected_fields.push_back(full_schema->field(static_cast<int>(field_index)));
     }
     auto output_schema = arrow::schema(std::move(projected_fields), full_schema->metadata());
     auto state = std::make_shared<ScanState>(file_, footer_, indexes_, std::move(plan),
-                                             std::move(metrics), std::move(output_schema));
+                                             std::move(resolved_plan), std::move(metrics),
+                                             std::move(output_schema));
     return arrow::MakeFunctionIterator(
         [state]() -> arrow::Result<std::shared_ptr<arrow::RecordBatch>> { return state->Next(); });
   }

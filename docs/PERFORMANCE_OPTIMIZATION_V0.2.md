@@ -88,7 +88,7 @@ v0.2 聚焦现有 Segment writer、reader、codec、scan 和文件 I/O 路径的
 
 ## 5. P1：优化扫描执行
 
-- [ ] 在计划校验时一次性把 `field_id` 解析为列下标，避免 predicate、projection 和逐行判断中
+- [x] 在计划校验时一次性把 `field_id` 解析为列下标，避免 predicate、projection 和逐行判断中
       重复线性调用 `FindFieldIndex()`。
 - [x] 为各基础类型实现 typed predicate kernel，直接读取 Arrow values/validity；避免逐行
       `GetScalar()`、虚调用和临时对象。
@@ -160,6 +160,25 @@ v0.2 聚焦现有 Segment writer、reader、codec、scan 和文件 I/O 路径的
 - [ ] 更新 README 的性能状态，不把合成 benchmark 结果表述为通用生产性能。
 
 ## 11. 执行记录
+
+### 2026-09-17：IOPlan field index 预解析
+
+- `Scan()` 在校验计划时一次性把 projection、predicate 和 sort-key 的稳定 `field_id` 解析为列下标，
+  `ScanState` 随后只使用已验证的下标；逐行 predicate、Row Group 解码、投影和 Bloom 剪枝不再线性
+  扫描 schema。
+- 新增 GTest 覆盖同一字段的多个 AND predicate、非 schema 顺序 projection，并复用既有 sort-key、
+  Bloom、空 projection、未知字段和类型校验测试。文件格式和公共 `IOPlan` API 均未改变。
+
+同机 Release、10 万行、Row Group 4,096、单 predicate、11 次 before 与 21 次 after 的 P50：
+
+| 指标 | Before | After | 变化 |
+|---|---:|---:|---:|
+| predicate 阶段 | 0.2666 ms | 0.2168 ms | -18.7% |
+| scan | 1.9755 ms | 1.9213 ms | -2.7% |
+| Row Group / chunk 观测 | 25 / 26 / 172.228k bytes | 25 / 26 / 172.228k bytes | 不变 |
+
+当前标准场景只有 3 列和 1 个 predicate，因此端到端收益较小；宽表和多 predicate 场景预计更敏感，
+但仍需在第 3 节完整矩阵中验证，不能从该合成场景外推生产收益。
 
 ### 2026-09-16：RLE typed/run-aware decode
 
