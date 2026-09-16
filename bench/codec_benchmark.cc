@@ -61,6 +61,8 @@ struct Scenario {
   sniffer::FieldSpec field;
   std::shared_ptr<arrow::Array> array;
   uint16_t encoding_id = 0;
+  std::vector<uint64_t> selection;
+  std::shared_ptr<arrow::Array> expected;
 };
 
 template <typename Generator>
@@ -84,7 +86,9 @@ arrow::Result<Scenario> MakeInt64Scenario(std::string name, std::string encoding
                   std::move(encoding_name),
                   {1, "value", arrow::int64(), nullable, nullptr},
                   std::move(array),
-                  encoding_id};
+                  encoding_id,
+                  {},
+                  nullptr};
 }
 
 template <typename Generator>
@@ -108,7 +112,9 @@ arrow::Result<Scenario> MakeStringScenario(std::string name, std::string encodin
                   std::move(encoding_name),
                   {1, "value", arrow::utf8(), nullable, nullptr},
                   std::move(array),
-                  encoding_id};
+                  encoding_id,
+                  {},
+                  nullptr};
 }
 
 uint64_t Mix(uint64_t value) {
@@ -120,7 +126,7 @@ uint64_t Mix(uint64_t value) {
 
 arrow::Result<std::vector<Scenario>> MakeScenarios(int64_t rows) {
   std::vector<Scenario> scenarios;
-  scenarios.reserve(4);
+  scenarios.reserve(5);
   ARROW_ASSIGN_OR_RAISE(
       auto plain,
       MakeInt64Scenario("plain_random_int64", "plain", sniffer::internal::kPlainEncodingId, rows,
@@ -131,7 +137,23 @@ arrow::Result<std::vector<Scenario>> MakeScenarios(int64_t rows) {
                           return std::optional<int64_t>(
                               static_cast<int64_t>(Mix(static_cast<uint64_t>(row))));
                         }));
+  Scenario plain_selected = plain;
+  plain_selected.name = "plain_selected_int64_50pct";
+  plain_selected.selection.reserve(static_cast<size_t>((rows + 1) / 2));
+  arrow::Int64Builder selected_builder;
+  ARROW_RETURN_NOT_OK(selected_builder.Reserve((rows + 1) / 2));
+  const auto& plain_array = static_cast<const arrow::Int64Array&>(*plain.array);
+  for (int64_t row = 0; row < rows; row += 2) {
+    plain_selected.selection.push_back(static_cast<uint64_t>(row));
+    if (plain_array.IsNull(row)) {
+      ARROW_RETURN_NOT_OK(selected_builder.AppendNull());
+    } else {
+      ARROW_RETURN_NOT_OK(selected_builder.Append(plain_array.Value(row)));
+    }
+  }
+  ARROW_RETURN_NOT_OK(selected_builder.Finish(&plain_selected.expected));
   scenarios.push_back(std::move(plain));
+  scenarios.push_back(std::move(plain_selected));
   ARROW_ASSIGN_OR_RAISE(
       auto dictionary,
       MakeStringScenario("dictionary_string_32", "dictionary",
@@ -177,6 +199,10 @@ arrow::Result<std::shared_ptr<arrow::Array>> Decode(const Scenario& scenario,
                                                     const sniffer::internal::ColumnChunkMeta& chunk,
                                                     std::span<const uint8_t> payload) {
   if (scenario.encoding_id == sniffer::internal::kPlainEncodingId) {
+    if (!scenario.selection.empty()) {
+      return sniffer::internal::DecodePlainSelected(scenario.field, chunk, payload,
+                                                    scenario.selection);
+    }
     return sniffer::internal::DecodePlain(scenario.field, chunk, payload);
   }
   return sniffer::internal::DecodeNonPlain(scenario.field, chunk, payload);
@@ -209,7 +235,8 @@ arrow::Result<Measurement> Measure(const Scenario& scenario, int iterations) {
     const auto decode_start = std::chrono::steady_clock::now();
     ARROW_ASSIGN_OR_RAISE(auto decoded, Decode(scenario, chunk, payload));
     const auto decode_end = std::chrono::steady_clock::now();
-    if (!decoded->Equals(*scenario.array)) {
+    const auto& expected = scenario.expected ? scenario.expected : scenario.array;
+    if (!decoded->Equals(*expected)) {
       return arrow::Status::Invalid("codec benchmark round-trip mismatch for ", scenario.name);
     }
     encode_times.push_back(
@@ -234,6 +261,8 @@ double LogicalMiBPerSecond(uint64_t logical_bytes, double milliseconds) {
 void PrintTextResult(const Scenario& scenario, const Measurement& measurement) {
   std::cout << "scenario=" << scenario.name << " encoding=" << scenario.encoding_name
             << " encoding_id=" << scenario.encoding_id << " rows=" << scenario.array->length()
+            << " output_rows="
+            << (scenario.expected ? scenario.expected->length() : scenario.array->length())
             << " logical_bytes=" << measurement.logical_bytes
             << " encoded_bytes=" << measurement.encoded_bytes << " compression_ratio="
             << static_cast<double>(measurement.logical_bytes) /
@@ -253,7 +282,8 @@ void PrintJsonResult(const Scenario& scenario, const Measurement& measurement) {
   std::cout << ",\"encoding\":";
   sniffer::benchmark::PrintJsonString(std::cout, scenario.encoding_name);
   std::cout << ",\"encoding_id\":" << scenario.encoding_id
-            << ",\"rows\":" << scenario.array->length()
+            << ",\"rows\":" << scenario.array->length() << ",\"output_rows\":"
+            << (scenario.expected ? scenario.expected->length() : scenario.array->length())
             << ",\"logical_bytes\":" << measurement.logical_bytes
             << ",\"encoded_bytes\":" << measurement.encoded_bytes << ",\"compression_ratio\":"
             << static_cast<double>(measurement.logical_bytes) /

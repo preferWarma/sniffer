@@ -496,7 +496,103 @@ arrow::Result<std::shared_ptr<arrow::Array>> SelectArray(
   }
 }
 
-arrow::Result<std::shared_ptr<arrow::Array>> DecodePlainSelected(
+template <typename UInt>
+UInt ReadLittleEndianValue(const uint8_t* bytes) {
+  static_assert(std::is_unsigned_v<UInt>);
+  UInt value = 0;
+  for (size_t index = 0; index < sizeof(UInt); ++index) {
+    value |= static_cast<UInt>(static_cast<UInt>(bytes[index]) << (index * 8U));
+  }
+  return value;
+}
+
+arrow::Status ValidateSelection(uint64_t row_count, const std::vector<uint64_t>& selection) {
+  uint64_t previous = 0;
+  bool first = true;
+  for (const uint64_t row : selection) {
+    if (row >= row_count || (!first && row <= previous)) {
+      return InvalidFormat("selection vector must be strictly increasing and bounded");
+    }
+    first = false;
+    previous = row;
+  }
+  return arrow::Status::OK();
+}
+
+template <typename Builder, typename ReadValue>
+arrow::Result<std::shared_ptr<arrow::Array>> DecodeSelectedFixed(
+    const std::vector<uint64_t>& selection, std::span<const uint8_t> validity,
+    std::span<const uint8_t> values, uint32_t width, Builder* builder, ReadValue read_value) {
+  ARROW_RETURN_NOT_OK(builder->Reserve(static_cast<int64_t>(selection.size())));
+  for (const uint64_t row : selection) {
+    if (!IsValid(validity, row)) {
+      ARROW_RETURN_NOT_OK(builder->AppendNull());
+      continue;
+    }
+    const size_t begin = static_cast<size_t>(row * static_cast<uint64_t>(width));
+    ARROW_RETURN_NOT_OK(builder->Append(read_value(values.data() + begin)));
+  }
+  std::shared_ptr<arrow::Array> result;
+  ARROW_RETURN_NOT_OK(builder->Finish(&result));
+  ARROW_RETURN_NOT_OK(result->ValidateFull());
+  return result;
+}
+
+arrow::Result<std::shared_ptr<arrow::Array>> DecodeSelectedBoolean(
+    const std::vector<uint64_t>& selection, std::span<const uint8_t> validity,
+    std::span<const uint8_t> values) {
+  arrow::BooleanBuilder builder;
+  ARROW_RETURN_NOT_OK(builder.Reserve(static_cast<int64_t>(selection.size())));
+  for (const uint64_t row : selection) {
+    if (!IsValid(validity, row)) {
+      ARROW_RETURN_NOT_OK(builder.AppendNull());
+      continue;
+    }
+    const uint8_t value = values[static_cast<size_t>(row)];
+    if (value > 1) {
+      return InvalidFormat("invalid boolean value");
+    }
+    ARROW_RETURN_NOT_OK(builder.Append(value != 0));
+  }
+  std::shared_ptr<arrow::Array> result;
+  ARROW_RETURN_NOT_OK(builder.Finish(&result));
+  ARROW_RETURN_NOT_OK(result->ValidateFull());
+  return result;
+}
+
+template <typename Builder>
+arrow::Result<std::shared_ptr<arrow::Array>> DecodeSelectedBinary(
+    const std::vector<uint64_t>& selection, std::span<const uint8_t> validity,
+    const std::vector<uint64_t>& offsets, std::span<const uint8_t> values, Builder* builder) {
+  ARROW_RETURN_NOT_OK(builder->Reserve(static_cast<int64_t>(selection.size())));
+  for (const uint64_t row : selection) {
+    if (!IsValid(validity, row)) {
+      ARROW_RETURN_NOT_OK(builder->AppendNull());
+      continue;
+    }
+    const uint64_t begin = offsets[static_cast<size_t>(row)];
+    const uint64_t end = offsets[static_cast<size_t>(row + 1U)];
+    const uint64_t length = end - begin;
+    if (length > static_cast<uint64_t>(std::numeric_limits<int32_t>::max())) {
+      return arrow::Status::Invalid(
+          "[sniffer.format.limit] Binary/String value exceeds Arrow limit");
+    }
+    static constexpr uint8_t kEmptyValue = 0;
+    const uint8_t* value = length == 0 ? &kEmptyValue : values.data() + static_cast<size_t>(begin);
+    if constexpr (std::is_same_v<Builder, arrow::StringBuilder>) {
+      ARROW_RETURN_NOT_OK(
+          builder->Append(reinterpret_cast<const char*>(value), static_cast<int32_t>(length)));
+    } else {
+      ARROW_RETURN_NOT_OK(builder->Append(value, static_cast<int32_t>(length)));
+    }
+  }
+  std::shared_ptr<arrow::Array> result;
+  ARROW_RETURN_NOT_OK(builder->Finish(&result));
+  ARROW_RETURN_NOT_OK(result->ValidateFull());
+  return result;
+}
+
+arrow::Result<std::shared_ptr<arrow::Array>> DecodePlainSelectedImpl(
     const FieldSpec& field, const internal::ColumnChunkMeta& chunk,
     std::span<const uint8_t> payload, const std::vector<uint64_t>& selection) {
   internal::ByteReader payload_reader(payload);
@@ -547,40 +643,96 @@ arrow::Result<std::shared_ptr<arrow::Array>> DecodePlainSelected(
     }
   }
 
-  ARROW_ASSIGN_OR_RAISE(auto builder, arrow::MakeBuilder(field.type));
   if (selection.size() > static_cast<size_t>(std::numeric_limits<int64_t>::max())) {
     return arrow::Status::Invalid("[sniffer.scan.limit] selection exceeds Arrow limit");
   }
-  ARROW_RETURN_NOT_OK(builder->Reserve(static_cast<int64_t>(selection.size())));
-  uint64_t previous = 0;
-  bool first_row = true;
-  for (const uint64_t row : selection) {
-    if (row >= chunk.row_count || (!first_row && row <= previous)) {
-      return InvalidFormat("selection vector must be strictly increasing and bounded");
+  ARROW_RETURN_NOT_OK(ValidateSelection(chunk.row_count, selection));
+
+  switch (chunk.physical_type) {
+    case internal::PhysicalTypeId::kBool:
+      return DecodeSelectedBoolean(selection, validity, values);
+    case internal::PhysicalTypeId::kInt8: {
+      arrow::Int8Builder builder;
+      return DecodeSelectedFixed(
+          selection, validity, values, width, &builder,
+          [](const uint8_t* bytes) { return std::bit_cast<int8_t>(*bytes); });
     }
-    first_row = false;
-    previous = row;
-    if (!IsValid(validity, row)) {
-      ARROW_RETURN_NOT_OK(builder->AppendNull());
-      continue;
+    case internal::PhysicalTypeId::kInt16: {
+      arrow::Int16Builder builder;
+      return DecodeSelectedFixed(
+          selection, validity, values, width, &builder, [](const uint8_t* bytes) {
+            return std::bit_cast<int16_t>(ReadLittleEndianValue<uint16_t>(bytes));
+          });
     }
-    std::span<const uint8_t> scalar_bytes;
-    if (variable) {
-      const uint64_t begin = variable_offsets[static_cast<size_t>(row)];
-      const uint64_t end = variable_offsets[static_cast<size_t>(row + 1U)];
-      scalar_bytes = values.subspan(static_cast<size_t>(begin), static_cast<size_t>(end - begin));
-    } else {
-      ARROW_ASSIGN_OR_RAISE(const uint64_t begin,
-                            internal::CheckedMultiply(row, static_cast<uint64_t>(width)));
-      scalar_bytes = values.subspan(static_cast<size_t>(begin), width);
+    case internal::PhysicalTypeId::kInt32: {
+      arrow::Int32Builder builder;
+      return DecodeSelectedFixed(
+          selection, validity, values, width, &builder, [](const uint8_t* bytes) {
+            return std::bit_cast<int32_t>(ReadLittleEndianValue<uint32_t>(bytes));
+          });
     }
-    ARROW_ASSIGN_OR_RAISE(auto scalar, internal::ParseScalar(field, scalar_bytes));
-    ARROW_RETURN_NOT_OK(builder->AppendScalar(*scalar));
+    case internal::PhysicalTypeId::kInt64: {
+      arrow::Int64Builder builder;
+      return DecodeSelectedFixed(
+          selection, validity, values, width, &builder, [](const uint8_t* bytes) {
+            return std::bit_cast<int64_t>(ReadLittleEndianValue<uint64_t>(bytes));
+          });
+    }
+    case internal::PhysicalTypeId::kUInt8: {
+      arrow::UInt8Builder builder;
+      return DecodeSelectedFixed(selection, validity, values, width, &builder,
+                                 [](const uint8_t* bytes) { return *bytes; });
+    }
+    case internal::PhysicalTypeId::kUInt16: {
+      arrow::UInt16Builder builder;
+      return DecodeSelectedFixed(
+          selection, validity, values, width, &builder,
+          [](const uint8_t* bytes) { return ReadLittleEndianValue<uint16_t>(bytes); });
+    }
+    case internal::PhysicalTypeId::kUInt32: {
+      arrow::UInt32Builder builder;
+      return DecodeSelectedFixed(
+          selection, validity, values, width, &builder,
+          [](const uint8_t* bytes) { return ReadLittleEndianValue<uint32_t>(bytes); });
+    }
+    case internal::PhysicalTypeId::kUInt64: {
+      arrow::UInt64Builder builder;
+      return DecodeSelectedFixed(
+          selection, validity, values, width, &builder,
+          [](const uint8_t* bytes) { return ReadLittleEndianValue<uint64_t>(bytes); });
+    }
+    case internal::PhysicalTypeId::kFloat32: {
+      arrow::FloatBuilder builder;
+      return DecodeSelectedFixed(
+          selection, validity, values, width, &builder, [](const uint8_t* bytes) {
+            return std::bit_cast<float>(ReadLittleEndianValue<uint32_t>(bytes));
+          });
+    }
+    case internal::PhysicalTypeId::kFloat64: {
+      arrow::DoubleBuilder builder;
+      return DecodeSelectedFixed(
+          selection, validity, values, width, &builder, [](const uint8_t* bytes) {
+            return std::bit_cast<double>(ReadLittleEndianValue<uint64_t>(bytes));
+          });
+    }
+    case internal::PhysicalTypeId::kTimestamp: {
+      arrow::TimestampBuilder builder(std::static_pointer_cast<arrow::TimestampType>(field.type),
+                                      arrow::default_memory_pool());
+      return DecodeSelectedFixed(
+          selection, validity, values, width, &builder, [](const uint8_t* bytes) {
+            return std::bit_cast<int64_t>(ReadLittleEndianValue<uint64_t>(bytes));
+          });
+    }
+    case internal::PhysicalTypeId::kString: {
+      arrow::StringBuilder builder;
+      return DecodeSelectedBinary(selection, validity, variable_offsets, values, &builder);
+    }
+    case internal::PhysicalTypeId::kBinary: {
+      arrow::BinaryBuilder builder;
+      return DecodeSelectedBinary(selection, validity, variable_offsets, values, &builder);
+    }
   }
-  std::shared_ptr<arrow::Array> result;
-  ARROW_RETURN_NOT_OK(builder->Finish(&result));
-  ARROW_RETURN_NOT_OK(result->ValidateFull());
-  return result;
+  return arrow::Status::NotImplemented("[sniffer.format.type] unknown physical type");
 }
 
 arrow::Result<size_t> FindFieldIndex(const TableSchema& schema, uint32_t field_id) {
@@ -925,6 +1077,12 @@ arrow::Result<std::shared_ptr<arrow::Array>> DecodePlain(const FieldSpec& field,
   return DecodePlainImpl(field, chunk, payload);
 }
 
+arrow::Result<std::shared_ptr<arrow::Array>> DecodePlainSelected(
+    const FieldSpec& field, const ColumnChunkMeta& chunk, std::span<const uint8_t> payload,
+    const std::vector<uint64_t>& selection) {
+  return DecodePlainSelectedImpl(field, chunk, payload, selection);
+}
+
 }  // namespace internal
 
 class ScanState {
@@ -1117,8 +1275,9 @@ class ScanState {
     {
       internal::NanosecondTimer timer(&metrics_->decode_nanoseconds);
       if (chunk.encoding_id == internal::kPlainEncodingId) {
-        ARROW_ASSIGN_OR_RAISE(array, DecodePlainSelected(footer_.schema.fields[field_index], chunk,
-                                                         payload, selection));
+        ARROW_ASSIGN_OR_RAISE(
+            array, internal::DecodePlainSelected(footer_.schema.fields[field_index], chunk, payload,
+                                                 selection));
       } else {
         ARROW_ASSIGN_OR_RAISE(array, internal::DecodeNonPlain(footer_.schema.fields[field_index],
                                                               chunk, payload, &selection));

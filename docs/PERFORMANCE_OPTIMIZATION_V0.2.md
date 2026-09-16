@@ -81,7 +81,7 @@ v0.2 聚焦现有 Segment writer、reader、codec、scan 和文件 I/O 路径的
       `vector<shared_ptr<arrow::Scalar>>`。
 - [ ] RLE decode 使用 run-aware 批量 append；selection 路径按 run 跳过未命中范围，不展开所有行。
 - [x] FOR decode 使用 typed base/delta 和按字/批量 bit unpack，移除每值 `ScalarFromBits()`。
-- [ ] Plain selected decode 按物理类型直接 append，移除每个命中行的 `ParseScalar()` 和
+- [x] Plain selected decode 按物理类型直接 append，移除每个命中行的 `ParseScalar()` 和
       `AppendScalar()` 动态分派。
 - [x] `RowsToDecode()` 的全量路径改为顺序迭代视图，避免构造 `[0..row_count)` 临时 vector。
 - [ ] 对每项 typed fast path 保留通用安全 fallback，并用 property tests 证明两条路径逐值一致。
@@ -329,3 +329,23 @@ fuzz smoke 和 benchmark JSON smoke 均通过。
 
 FOR 的 1.0% 差异低于本轮运行波动，不作为稳定回退或提升结论；该小步的确定收益是消除与
 Row Group 行数线性增长的临时内存，同时保持 payload、输出数组和错误语义不变。
+
+### 2026-09-16：Plain selected typed decode
+
+- Plain projection selection 按 physical type 直接读取 little-endian bytes，并写入对应 Arrow
+  typed builder；不再为每个命中值调用 `ParseScalar()`、构造 Scalar 和动态 `AppendScalar()`。
+- bool 保留 0/1 规范性检查，string/binary 保留完整 offset 单调性与边界校验，所有类型继续校验
+  null bitmap、selection 严格递增、数组完整性及 Arrow 长度上限；Plain v1 payload 未改变。
+- codec benchmark 新增 `plain_selected_int64_50pct` 场景，明确记录输入 10 万行、输出 5 万行；
+  reference test 覆盖全部 14 种首期类型、null、整数极值、浮点 signed zero、空/UTF-8 字符串、
+  binary 与重复 selection 拒绝路径。
+
+同机 Release、10 万值、50% selection、21 次 P50：
+
+| 指标 | Before | After | 变化 |
+|---|---:|---:|---:|
+| Plain selected decode | 1.8018 ms | 0.1548 ms | -91.4% |
+| 按输入 logical bytes 吞吐 | 430.0 MiB/s | 5,005.8 MiB/s | 约 11.6x |
+| P95 | 2.1270 ms | 0.1736 ms | -91.8% |
+
+该 microbenchmark 不包含文件 I/O、索引或 checksum；收益只归因于 selected decode kernel。

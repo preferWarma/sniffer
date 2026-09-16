@@ -529,6 +529,67 @@ void TestPlainVariableBulkCopyMatchesReference() {
          "nullable Plain binary bytes match row-wise reference");
 }
 
+void TestPlainSelectedTypedDecodeMatchesReference() {
+  const auto data = MakeAllTypesBatch();
+  const std::vector<uint64_t> selection = {0, 2, 4};
+  for (size_t column = 0; column < data.table_schema.fields.size(); ++column) {
+    const auto& field = data.table_schema.fields[column];
+    const auto& source = data.batch->column(static_cast<int>(column));
+    const auto payload = ValueOrThrow(sniffer::internal::EncodePlain(field, *source),
+                                      "encode selected Plain reference payload");
+    sniffer::internal::ColumnChunkMeta chunk;
+    chunk.field_id = field.field_id;
+    chunk.physical_type =
+        ValueOrThrow(sniffer::internal::PhysicalTypeFor(*field.type), "selected physical type");
+    chunk.encoding_id = sniffer::internal::kPlainEncodingId;
+    chunk.row_count = static_cast<uint64_t>(source->length());
+    chunk.null_count = static_cast<uint64_t>(source->null_count());
+    chunk.length = static_cast<uint64_t>(payload.size());
+
+    const auto actual =
+        ValueOrThrow(sniffer::internal::DecodePlainSelected(field, chunk, payload, selection),
+                     "decode selected typed Plain values");
+    auto expected_builder =
+        ValueOrThrow(arrow::MakeBuilder(field.type), "make selected Plain reference builder");
+    for (const uint64_t row : selection) {
+      const auto value = ValueOrThrow(source->GetScalar(static_cast<int64_t>(row)),
+                                      "get selected Plain reference scalar");
+      RequireOk(expected_builder->AppendScalar(*value), "append selected Plain reference scalar");
+    }
+    std::shared_ptr<arrow::Array> expected;
+    RequireOk(expected_builder->Finish(&expected), "finish selected Plain reference");
+    Expect(actual->Equals(expected),
+           "typed selected Plain decode matches scalar reference for " + field.name);
+
+    const std::vector<uint64_t> duplicate = {1, 1};
+    Expect(!sniffer::internal::DecodePlainSelected(field, chunk, payload, duplicate).ok(),
+           "selected Plain decode rejects duplicate rows");
+  }
+
+  const auto& bool_field = data.table_schema.fields.front();
+  const auto& bool_source = data.batch->column(0);
+  auto corrupted = ValueOrThrow(sniffer::internal::EncodePlain(bool_field, *bool_source),
+                                "encode selected Plain bool corruption payload");
+  sniffer::internal::ByteReader header(corrupted);
+  const uint64_t validity_length =
+      ValueOrThrow(header.ReadU64(), "read selected Plain bool validity length");
+  const uint64_t offsets_length =
+      ValueOrThrow(header.ReadU64(), "read selected Plain bool offsets length");
+  static_cast<void>(ValueOrThrow(header.ReadU64(), "read selected Plain bool values length"));
+  const size_t values_offset = static_cast<size_t>(24U + validity_length + offsets_length);
+  corrupted.at(values_offset) = 2;
+  sniffer::internal::ColumnChunkMeta bool_chunk;
+  bool_chunk.field_id = bool_field.field_id;
+  bool_chunk.physical_type = sniffer::internal::PhysicalTypeId::kBool;
+  bool_chunk.encoding_id = sniffer::internal::kPlainEncodingId;
+  bool_chunk.row_count = static_cast<uint64_t>(bool_source->length());
+  bool_chunk.null_count = static_cast<uint64_t>(bool_source->null_count());
+  bool_chunk.length = static_cast<uint64_t>(corrupted.size());
+  const std::vector<uint64_t> first_row = {0};
+  Expect(!sniffer::internal::DecodePlainSelected(bool_field, bool_chunk, corrupted, first_row).ok(),
+         "selected Plain decode rejects non-canonical boolean values");
+}
+
 void TestTypedRleMatchesScalarReference() {
   const auto data = MakeAllTypesBatch();
   for (size_t index = 0; index < 9; ++index) {
@@ -1993,6 +2054,8 @@ int main() {
       {"forced_dictionary_round_trip_and_scan", TestForcedDictionaryRoundTripAndScan},
       {"typed_array_hash_matches_scalar_reference", TestTypedArrayHashMatchesScalarReference},
       {"plain_variable_bulk_copy_matches_reference", TestPlainVariableBulkCopyMatchesReference},
+      {"plain_selected_typed_decode_matches_reference",
+       TestPlainSelectedTypedDecodeMatchesReference},
       {"typed_dictionary_matches_scalar_reference", TestTypedDictionaryMatchesScalarReference},
       {"non_plain_selection_validation", TestNonPlainSelectionValidation},
       {"forced_rle_round_trip_and_scan", TestForcedRleRoundTripAndScan},
