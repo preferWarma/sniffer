@@ -1783,6 +1783,84 @@ TEST(SnifferCoreTest, CompositeSortKeyRange) {
       << "composite sort-key range uses lexicographic half-open semantics";
 }
 
+TEST(SnifferCoreTest, TypedSortKeyRangesMatchScalarReference) {
+  const auto timestamp_type = std::static_pointer_cast<arrow::TimestampType>(
+      arrow::timestamp(arrow::TimeUnit::MICRO, "UTC"));
+  struct SortCase {
+    std::string name;
+    std::shared_ptr<arrow::DataType> type;
+    std::shared_ptr<arrow::Array> values;
+  };
+  const std::vector<SortCase> cases = {
+      {"bool", arrow::boolean(),
+       BuildArray<arrow::BooleanBuilder, bool>({false, false, false, true, true})},
+      {"int8", arrow::int8(), BuildArray<arrow::Int8Builder, int8_t>({-3, -1, 0, 2, 4})},
+      {"int16", arrow::int16(), BuildArray<arrow::Int16Builder, int16_t>({-3, -1, 0, 2, 4})},
+      {"int32", arrow::int32(), BuildArray<arrow::Int32Builder, int32_t>({-3, -1, 0, 2, 4})},
+      {"int64", arrow::int64(), BuildArray<arrow::Int64Builder, int64_t>({-3, -1, 0, 2, 4})},
+      {"uint8", arrow::uint8(), BuildArray<arrow::UInt8Builder, uint8_t>({0, 1, 2, 3, 4})},
+      {"uint16", arrow::uint16(), BuildArray<arrow::UInt16Builder, uint16_t>({0, 1, 2, 3, 4})},
+      {"uint32", arrow::uint32(), BuildArray<arrow::UInt32Builder, uint32_t>({0, 1, 2, 3, 4})},
+      {"uint64", arrow::uint64(), BuildArray<arrow::UInt64Builder, uint64_t>({0, 1, 2, 3, 4})},
+      {"float", arrow::float32(), BuildArray<arrow::FloatBuilder, float>({-3, -1, 0, 2, 4})},
+      {"double", arrow::float64(), BuildArray<arrow::DoubleBuilder, double>({-3, -1, 0, 2, 4})},
+      {"timestamp", timestamp_type, BuildTimestampArray(timestamp_type, {-3, -1, 0, 2, 4})},
+      {"string", arrow::utf8(), BuildStringArray({"", "a", "aa", "b", "z"})},
+      {"binary", arrow::binary(),
+       BuildBinaryArray({std::vector<uint8_t>{}, std::vector<uint8_t>{0},
+                         std::vector<uint8_t>{0, 1}, std::vector<uint8_t>{1},
+                         std::vector<uint8_t>{0xFF}})},
+  };
+
+  for (const auto& test_case : cases) {
+    SCOPED_TRACE(test_case.name);
+    sniffer::TableSchema schema{1, {{1, "key", test_case.type, false, nullptr}}};
+    const auto arrow_schema = ValueOrThrow(schema.ToArrowSchema(), "typed sort-key schema");
+    const auto batch =
+        arrow::RecordBatch::Make(arrow_schema, test_case.values->length(), {test_case.values});
+    sniffer::LayoutPolicy policy;
+    policy.target_row_group_rows = 2;
+    policy.sort_key_field_ids = {1};
+    TempFile file("typed_sort_" + test_case.name + ".seg");
+    WriteSegmentWithPolicy(file.path(), schema, {batch}, policy);
+    const auto reader = ValueOrThrow(sniffer::SegmentReader::Open(file.path().string()),
+                                     "open typed sort-key segment");
+
+    const auto lower = ValueOrThrow(test_case.values->GetScalar(1), "typed lower bound");
+    const auto upper = ValueOrThrow(test_case.values->GetScalar(4), "typed upper bound");
+    sniffer::IOPlan plan;
+    plan.projection_field_ids = {1};
+    sniffer::SortKeyRange range;
+    range.lower = std::vector<std::shared_ptr<arrow::Scalar>>{lower};
+    range.upper = std::vector<std::shared_ptr<arrow::Scalar>>{upper};
+    plan.sort_key_range = std::move(range);
+    plan.output_batch_rows = 2;
+    const auto batches = CollectScan(ValueOrThrow(reader->Scan(plan), "scan typed sort-key range"));
+    arrow::ArrayVector actual_chunks;
+    for (const auto& output : batches) {
+      actual_chunks.push_back(output->column(0));
+    }
+    const auto actual =
+        ValueOrThrow(arrow::Concatenate(actual_chunks), "concatenate typed sort-key result");
+
+    auto expected_builder =
+        ValueOrThrow(arrow::MakeBuilder(test_case.type), "make typed sort-key reference builder");
+    for (int64_t row = 0; row < test_case.values->length(); ++row) {
+      const auto value = ValueOrThrow(test_case.values->GetScalar(row), "typed sort-key value");
+      const int lower_order = ValueOrThrow(sniffer::internal::CompareScalars(*value, *lower),
+                                           "compare typed lower bound");
+      const int upper_order = ValueOrThrow(sniffer::internal::CompareScalars(*value, *upper),
+                                           "compare typed upper bound");
+      if (lower_order >= 0 && upper_order < 0) {
+        RequireOk(expected_builder->AppendScalar(*value), "append typed sort-key reference");
+      }
+    }
+    std::shared_ptr<arrow::Array> expected;
+    RequireOk(expected_builder->Finish(&expected), "finish typed sort-key reference");
+    EXPECT_TRUE(actual->Equals(expected)) << "typed sort-key range matches scalar reference";
+  }
+}
+
 TEST(SnifferCoreTest, ForcedDictionaryRoundTripAndScan) {
   sniffer::TableSchema schema{1,
                               {{1, "number", arrow::int64(), true, nullptr},

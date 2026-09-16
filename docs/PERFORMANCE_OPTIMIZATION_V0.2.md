@@ -95,6 +95,8 @@ v0.2 聚焦现有 Segment writer、reader、codec、scan 和文件 I/O 路径的
 - [x] 在计划校验时为 predicate 绑定 typed evaluator，并按 predicate 顺序对齐已解码列指针；
       逐行判断不再执行类型 switch 或 `unordered_map` 查找。
 - [x] 将多个 AND predicate 融合到同一次 selection 构建，优先执行成本低、选择性高的谓词。
+- [x] 在计划校验时为 sort-key range 绑定 typed comparator，逐行范围判断不再调用 `GetScalar()`
+      或构造临时 key vector。
 - [ ] 比较 index vector、bitmap 和连续 range 表示在 1%/10%/50%/100% 选择率下的成本，使用
       确定性阈值选择表示。
 - [x] projection 与 predicate 是同一列时，直接从已解码列构造输出，提供 typed take/filter 路径。
@@ -162,6 +164,27 @@ v0.2 聚焦现有 Segment writer、reader、codec、scan 和文件 I/O 路径的
 - [ ] 更新 README 的性能状态，不把合成 benchmark 结果表述为通用生产性能。
 
 ## 11. 执行记录
+
+### 2026-09-17：预绑定 typed sort-key comparator
+
+- sort-key range 在计划校验阶段按每个 key 字段绑定 typed comparator；逐行 lexicographic 比较直接
+  读取 Arrow array value，不再调用 `GetScalar()`、分配 `Scalar` 或构造临时 key vector。lower/upper
+  inclusive 语义、复合排序键顺序、Row Group 剪枝与落盘格式均未改变。
+- Google Benchmark 新增独立 `SnifferSortKeyRange` case：10 万有序行、Row Group 4,096、范围
+  `[25,000, 75,000)`、50% 选择率和 `id,value` 投影，避免把该热点混入普通 predicate case。
+- GTest 新增全部 14 种首期平铺类型的范围结果与通用 Scalar reference 对照；既有复合排序键测试继续
+  验证 lexicographic 半开区间。Release 与 ASan+UBSan 均为 46/46 通过。
+
+同机 Release、21 次 P50：
+
+| 指标 | Before | After | 变化 |
+|---|---:|---:|---:|
+| sort-range 行级比较阶段 | 3.1375 ms | 0.2796 ms | -91.1% |
+| scan | 4.9702 ms | 2.1065 ms | -57.6% |
+| 端到端 | 19.5778 ms | 16.8039 ms | -14.2% |
+
+两侧均考虑 25 个 Row Group、剪枝 12 个、读取 26 个 ColumnChunk 和 180,752 字节；输出均为
+50,000 行。结果属于 warm-cache 合成场景，最终 v0.2 结论仍以完整选择率、Row Group 和投影矩阵为准。
 
 ### 2026-09-17：确定性 AND predicate 执行顺序
 

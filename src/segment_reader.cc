@@ -760,16 +760,20 @@ arrow::Result<int> CompareKeyVectors(const std::vector<std::shared_ptr<arrow::Sc
 
 struct ResolvedScanPlan {
   using PredicateEvaluator = bool (*)(const arrow::Array&, uint64_t, const Predicate&);
+  using SortKeyComparator = arrow::Result<int> (*)(const arrow::Array&, uint64_t,
+                                                   const arrow::Scalar&);
 
   std::vector<size_t> projection_field_indices;
   std::vector<size_t> predicate_field_indices;
   std::vector<PredicateEvaluator> predicate_evaluators;
   std::vector<size_t> predicate_evaluation_order;
   std::vector<size_t> sort_key_field_indices;
+  std::vector<SortKeyComparator> sort_key_comparators;
 };
 
 arrow::Result<ResolvedScanPlan::PredicateEvaluator> ResolvePredicateEvaluator(
     const FieldSpec& field, Predicate::Op op);
+arrow::Result<ResolvedScanPlan::SortKeyComparator> ResolveSortKeyComparator(const FieldSpec& field);
 
 std::pair<uint8_t, uint8_t> PredicatePriority(const FieldSpec& field, Predicate::Op op) {
   uint8_t selectivity_rank = 0;
@@ -856,9 +860,13 @@ arrow::Result<ResolvedScanPlan> ValidatePlan(const internal::FooterData& footer,
         "[sniffer.plan.sort_key] range requires a configured segment sort key");
   }
   resolved.sort_key_field_indices.reserve(sort_fields.size());
+  resolved.sort_key_comparators.reserve(sort_fields.size());
   for (const uint32_t field_id : sort_fields) {
     ARROW_ASSIGN_OR_RAISE(const size_t field_index, FindFieldIndex(footer.schema, field_id));
     resolved.sort_key_field_indices.push_back(field_index);
+    ARROW_ASSIGN_OR_RAISE(auto comparator,
+                          ResolveSortKeyComparator(footer.schema.fields[field_index]));
+    resolved.sort_key_comparators.push_back(comparator);
   }
   const auto validate_bound =
       [&footer, &resolved](const std::optional<std::vector<std::shared_ptr<arrow::Scalar>>>& bound)
@@ -949,6 +957,71 @@ int CompareBinaryViews(std::string_view left, std::string_view right) {
     }
   }
   return left.size() < right.size() ? -1 : (left.size() > right.size() ? 1 : 0);
+}
+
+template <typename ArrayType, typename ScalarType>
+arrow::Result<int> ComparePrimitiveSortKey(const arrow::Array& untyped, uint64_t row,
+                                           const arrow::Scalar& untyped_bound) {
+  if (untyped.IsNull(static_cast<int64_t>(row))) {
+    return arrow::Status::Invalid("[sniffer.scalar] null scalar is not orderable");
+  }
+  const auto& array = static_cast<const ArrayType&>(untyped);
+  const auto left = array.Value(static_cast<int64_t>(row));
+  const auto right = static_cast<const ScalarType&>(untyped_bound).value;
+  if constexpr (std::is_floating_point_v<decltype(left)>) {
+    if (std::isnan(left)) {
+      return arrow::Status::Invalid("[sniffer.scalar] NaN scalar is not orderable");
+    }
+  }
+  return left < right ? -1 : (left > right ? 1 : 0);
+}
+
+template <typename ArrayType>
+arrow::Result<int> CompareBinarySortKey(const arrow::Array& untyped, uint64_t row,
+                                        const arrow::Scalar& untyped_bound) {
+  if (untyped.IsNull(static_cast<int64_t>(row))) {
+    return arrow::Status::Invalid("[sniffer.scalar] null scalar is not orderable");
+  }
+  const auto& array = static_cast<const ArrayType&>(untyped);
+  const auto left = array.GetView(static_cast<int64_t>(row));
+  const auto right = static_cast<const arrow::BaseBinaryScalar&>(untyped_bound).view();
+  return CompareBinaryViews(left, right);
+}
+
+arrow::Result<ResolvedScanPlan::SortKeyComparator> ResolveSortKeyComparator(
+    const FieldSpec& field) {
+  switch (field.type->id()) {
+    case arrow::Type::BOOL:
+      return &ComparePrimitiveSortKey<arrow::BooleanArray, arrow::BooleanScalar>;
+    case arrow::Type::INT8:
+      return &ComparePrimitiveSortKey<arrow::Int8Array, arrow::Int8Scalar>;
+    case arrow::Type::INT16:
+      return &ComparePrimitiveSortKey<arrow::Int16Array, arrow::Int16Scalar>;
+    case arrow::Type::INT32:
+      return &ComparePrimitiveSortKey<arrow::Int32Array, arrow::Int32Scalar>;
+    case arrow::Type::INT64:
+      return &ComparePrimitiveSortKey<arrow::Int64Array, arrow::Int64Scalar>;
+    case arrow::Type::UINT8:
+      return &ComparePrimitiveSortKey<arrow::UInt8Array, arrow::UInt8Scalar>;
+    case arrow::Type::UINT16:
+      return &ComparePrimitiveSortKey<arrow::UInt16Array, arrow::UInt16Scalar>;
+    case arrow::Type::UINT32:
+      return &ComparePrimitiveSortKey<arrow::UInt32Array, arrow::UInt32Scalar>;
+    case arrow::Type::UINT64:
+      return &ComparePrimitiveSortKey<arrow::UInt64Array, arrow::UInt64Scalar>;
+    case arrow::Type::FLOAT:
+      return &ComparePrimitiveSortKey<arrow::FloatArray, arrow::FloatScalar>;
+    case arrow::Type::DOUBLE:
+      return &ComparePrimitiveSortKey<arrow::DoubleArray, arrow::DoubleScalar>;
+    case arrow::Type::TIMESTAMP:
+      return &ComparePrimitiveSortKey<arrow::TimestampArray, arrow::TimestampScalar>;
+    case arrow::Type::STRING:
+      return &CompareBinarySortKey<arrow::StringArray>;
+    case arrow::Type::BINARY:
+      return &CompareBinarySortKey<arrow::BinaryArray>;
+    default:
+      return arrow::Status::NotImplemented("[sniffer.scan.type] unsupported sort-key type");
+  }
 }
 
 template <typename ArrayType>
@@ -1386,29 +1459,7 @@ class ScanState {
         return false;
       }
     }
-    if (!plan_.sort_key_range) {
-      return true;
-    }
-    std::vector<std::shared_ptr<arrow::Scalar>> key;
-    key.reserve(sort_key_columns.size());
-    for (const auto* column : sort_key_columns) {
-      ARROW_ASSIGN_OR_RAISE(auto value, column->GetScalar(static_cast<int64_t>(row)));
-      key.push_back(std::move(value));
-    }
-    const auto& range = *plan_.sort_key_range;
-    if (range.lower) {
-      ARROW_ASSIGN_OR_RAISE(const int order, CompareKeyVectors(key, *range.lower));
-      if (order < 0 || (order == 0 && !range.lower_inclusive)) {
-        return false;
-      }
-    }
-    if (range.upper) {
-      ARROW_ASSIGN_OR_RAISE(const int order, CompareKeyVectors(key, *range.upper));
-      if (order > 0 || (order == 0 && !range.upper_inclusive)) {
-        return false;
-      }
-    }
-    return true;
+    return SortKeyRowMatches(row, sort_key_columns);
   }
 
   arrow::Result<bool> RowMatches(uint64_t row,
@@ -1421,24 +1472,39 @@ class ScanState {
         return false;
       }
     }
+    return SortKeyRowMatches(row, sort_key_columns);
+  }
+
+  arrow::Result<int> CompareSortKeyRow(
+      const std::vector<const arrow::Array*>& sort_key_columns, uint64_t row,
+      const std::vector<std::shared_ptr<arrow::Scalar>>& bound) const {
+    for (size_t position = 0; position < sort_key_columns.size(); ++position) {
+      ARROW_ASSIGN_OR_RAISE(const int order,
+                            resolved_plan_.sort_key_comparators[position](
+                                *sort_key_columns[position], row, *bound[position]));
+      if (order != 0) {
+        return order;
+      }
+    }
+    return 0;
+  }
+
+  arrow::Result<bool> SortKeyRowMatches(
+      uint64_t row, const std::vector<const arrow::Array*>& sort_key_columns) const {
     if (!plan_.sort_key_range) {
       return true;
     }
-    std::vector<std::shared_ptr<arrow::Scalar>> key;
-    key.reserve(sort_key_columns.size());
-    for (const auto* column : sort_key_columns) {
-      ARROW_ASSIGN_OR_RAISE(auto value, column->GetScalar(static_cast<int64_t>(row)));
-      key.push_back(std::move(value));
-    }
     const auto& range = *plan_.sort_key_range;
     if (range.lower) {
-      ARROW_ASSIGN_OR_RAISE(const int order, CompareKeyVectors(key, *range.lower));
+      ARROW_ASSIGN_OR_RAISE(const int order,
+                            CompareSortKeyRow(sort_key_columns, row, *range.lower));
       if (order < 0 || (order == 0 && !range.lower_inclusive)) {
         return false;
       }
     }
     if (range.upper) {
-      ARROW_ASSIGN_OR_RAISE(const int order, CompareKeyVectors(key, *range.upper));
+      ARROW_ASSIGN_OR_RAISE(const int order,
+                            CompareSortKeyRow(sort_key_columns, row, *range.upper));
       if (order > 0 || (order == 0 && !range.upper_inclusive)) {
         return false;
       }

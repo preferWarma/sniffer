@@ -26,7 +26,7 @@ constexpr int64_t kDefaultRows = 100000;
 constexpr int64_t kDefaultRowGroupRows = 4096;
 
 enum class Format { kSniffer, kArrowIpc, kArrowIpcZstd };
-enum class Query { kSinglePredicate, kThreePredicates };
+enum class Query { kSinglePredicate, kThreePredicates, kSortKeyRange };
 
 struct BenchmarkConfig {
   int64_t rows;
@@ -99,8 +99,17 @@ arrow::Result<Measurement> RunSnifferOnce(const std::filesystem::path& path,
   ARROW_ASSIGN_OR_RAISE(auto reader, sniffer::SegmentReader::Open(path.string(), reader_metrics));
   sniffer::IOPlan plan;
   plan.projection_field_ids = {1, 3};
-  plan.conjunctive_predicates = {{1, sniffer::Predicate::Op::kGe,
-                                  std::make_shared<arrow::Int64Scalar>(batch->num_rows() / 2)}};
+  if (query == Query::kSortKeyRange) {
+    sniffer::SortKeyRange range;
+    range.lower = std::vector<std::shared_ptr<arrow::Scalar>>{
+        std::make_shared<arrow::Int64Scalar>(batch->num_rows() / 4)};
+    range.upper = std::vector<std::shared_ptr<arrow::Scalar>>{
+        std::make_shared<arrow::Int64Scalar>(batch->num_rows() * 3 / 4)};
+    plan.sort_key_range = std::move(range);
+  } else {
+    plan.conjunctive_predicates = {{1, sniffer::Predicate::Op::kGe,
+                                    std::make_shared<arrow::Int64Scalar>(batch->num_rows() / 2)}};
+  }
   if (query == Query::kThreePredicates) {
     plan.conjunctive_predicates.push_back(
         {2, sniffer::Predicate::Op::kEq, std::make_shared<arrow::StringScalar>("group-0")});
@@ -355,6 +364,10 @@ BENCHMARK_CAPTURE(Performance, SnifferThreePredicates, Format::kSniffer, Query::
     ->Args({kDefaultRows, kDefaultRowGroupRows})
     ->UseManualTime()
     ->Unit(benchmark::kMillisecond);
+BENCHMARK_CAPTURE(Performance, SnifferSortKeyRange, Format::kSniffer, Query::kSortKeyRange)
+    ->Args({kDefaultRows, kDefaultRowGroupRows})
+    ->UseManualTime()
+    ->Unit(benchmark::kMillisecond);
 BENCHMARK_CAPTURE(Performance, ArrowIPC, Format::kArrowIpc, Query::kSinglePredicate)
     ->Args({kDefaultRows, kDefaultRowGroupRows})
     ->UseManualTime()
@@ -375,7 +388,7 @@ void AddBenchmarkContext() {
   benchmark::AddCustomContext("arrow_version", ARROW_VERSION_STRING);
   benchmark::AddCustomContext("distribution", "grouped_id_linear_value_nullable");
   benchmark::AddCustomContext("predicate", "id_ge_half");
-  benchmark::AddCustomContext("query_variants", "single_predicate,three_predicates");
+  benchmark::AddCustomContext("query_variants", "single_predicate,three_predicates,sort_key_range");
   benchmark::AddCustomContext("projection", "id,value");
 }
 
