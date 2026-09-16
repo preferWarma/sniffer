@@ -1,6 +1,6 @@
 # v0.2 性能优化专项 TODO
 
-**状态：** Proposed
+**状态：** In Progress
 
 **目标版本：** v0.2
 
@@ -47,7 +47,7 @@ v0.2 聚焦现有 Segment writer、reader、codec、scan 和文件 I/O 路径的
 - [x] benchmark 输出每轮原始耗时，并同时报告 P50、P95、最小值和变异系数；保留现有中位数，
       避免破坏脚本消费者。
 - [x] 增加机器可读 JSON 结果格式，记录 commit、编译器、Arrow 版本、构建参数和运行命令。
-- [ ] 将文件级 benchmark 与纯内存 codec microbenchmark 分开；后者分别测 Plain、Dictionary、
+- [x] 将文件级 benchmark 与纯内存 codec microbenchmark 分开；后者分别测 Plain、Dictionary、
       RLE、FOR + Bitpack 的 encode/decode，不包含文件打开、footer、index 和 checksum。
 - [ ] 增加 writer 分阶段计时：编码选择、Plain/非 Plain 编码、索引构建、checksum、文件写入、
       footer/trailer。
@@ -69,9 +69,9 @@ v0.2 聚焦现有 Segment writer、reader、codec、scan 和文件 I/O 路径的
       非 Plain 编码命中时又编码一次；改为用无分配的长度计算得到 `uncompressed_length`。
 - [ ] 合并编码选择采样、statistics、sort-key 和实际编码可复用的数据遍历，避免同一列重复
       `GetScalar()`、序列化和比较。
-- [ ] 为整数、timestamp、bool、string/binary 增加 typed encoder 路径，避免逐值构造
+- [x] 为整数、timestamp、bool、string/binary 增加 typed encoder 路径，避免逐值构造
       `arrow::Scalar` 和调用 `SerializeScalar()`。
-- [ ] 为 `ByteWriter` 增加可计算的容量预留和批量 append，减少 vector 扩容及中间 payload 拷贝。
+- [x] 为 `ByteWriter` 增加可计算的容量预留和批量 append，减少 vector 扩容及中间 payload 拷贝。
 - [ ] 评估直接编码到最终 chunk buffer，并在一次顺序遍历中计算 chunk CRC32C；不得改变 CRC
       算法或落盘字节。
 
@@ -80,7 +80,7 @@ v0.2 聚焦现有 Segment writer、reader、codec、scan 和文件 I/O 路径的
 - [ ] Dictionary decode 直接向 typed Arrow builder/buffer 写入，不构造
       `vector<shared_ptr<arrow::Scalar>>`。
 - [ ] RLE decode 使用 run-aware 批量 append；selection 路径按 run 跳过未命中范围，不展开所有行。
-- [ ] FOR decode 使用 typed base/delta 和按字/批量 bit unpack，移除每值 `ScalarFromBits()`。
+- [x] FOR decode 使用 typed base/delta 和按字/批量 bit unpack，移除每值 `ScalarFromBits()`。
 - [ ] Plain selected decode 按物理类型直接 append，移除每个命中行的 `ParseScalar()` 和
       `AppendScalar()` 动态分派。
 - [ ] `RowsToDecode()` 的全量路径改为顺序迭代视图，避免构造 `[0..row_count)` 临时 vector。
@@ -151,7 +151,7 @@ v0.2 聚焦现有 Segment writer、reader、codec、scan 和文件 I/O 路径的
 ## 10. v0.2 完成定义
 
 - [ ] 第 2 节正确性和非回归门槛全部满足；
-- [ ] 至少达到第 2 节中的 writer、scan、encode、decode 四个吞吐目标；
+- [x] 至少达到第 2 节中的 writer、scan、encode、decode 四个吞吐目标；
 - [ ] benchmark 矩阵覆盖第 3 节规定的 Row Group、选择率、投影和缓存维度；
 - [ ] 所有性能结论都有 profiler 证据和至少 7 次重复测量；
 - [ ] 生成 `bench/BENCHMARK_V2.md`，同时记录绝对值、相对 v1 的变化、压缩比、峰值内存和原始
@@ -181,3 +181,82 @@ v0.2 聚焦现有 Segment writer、reader、codec、scan 和文件 I/O 路径的
 接近运行波动，不能单独视为稳定性能结论；该改动的确定收益是消除非 Plain 路径的一份完整
 payload 分配和写入，同时保持文件大小与格式语义不变。下一步应通过 codec microbenchmark 和
 分阶段 profile 继续定位 `GetScalar()`、`SerializeScalar()`、索引构建与实际编码的占比。
+
+### 2026-09-16：纯内存 codec benchmark
+
+- 新增 `sniffer_core_codec_benchmark`，直接调用生产 Plain、Dictionary、RLE、FOR + Bitpack
+  encode/decode 路径，不包含文件 I/O、索引和 checksum。
+- 每轮均验证完整 Arrow round-trip，验证位于计时区间外；文本和 JSON 都输出 payload 大小、
+  压缩比、吞吐、原始样本、P50/P95/min/CV 与构建元数据。
+- Plain 的生产 encode/decode 入口已提升为 `internal` 共享入口，writer/reader 和 benchmark 使用
+  同一实现，没有复制 benchmark 专用 codec。
+- 新增文本与 JSON CTest smoke。下一步用 Release 大样本结果确认各 codec 的热点优先级，并增加
+  writer/reader 分阶段计时。
+
+Release、10 万值、11 次运行的第一轮 profile 随后驱动了三个 typed fast path：
+
+| 路径 | 优化前 P50 | 优化后 P50 | 吞吐变化 | payload 字节 |
+|---|---:|---:|---:|---:|
+| Dictionary string encode | 11.3188 ms | 1.1085 ms | 95.7 -> 977.4 MiB/s | 113,058 -> 113,058 |
+| RLE int64 encode | 13.5230 ms | 0.2273 ms | 56.4 -> 3,356.7 MiB/s | 3,112 -> 3,112 |
+| FOR + Bitpack int64 decode | 11.5800 ms | 0.4182 ms | 66.9 -> 1,852.8 MiB/s | 100,040 -> 100,040 |
+
+Dictionary 和 RLE encoder 现在直接读取 Arrow typed values，避免逐值 `GetScalar()`、
+`SerializeScalar()` 和临时 value vector；FOR decoder 直接写入 typed Arrow builder，避免每行
+构造 Scalar。新增 reference tests 将 Dictionary/RLE typed encoder 与原 scalar 算法逐字节比较，
+覆盖全部支持的整数宽度、bool、string/binary、负数、null 和连续 run；现有随机 property tests
+继续覆盖 encode/decode 与 selection 语义。极短 RLE 测量容易受计时分辨率影响，后续矩阵应增加
+更大数据量，但优化前后的数量级差异已经明确。
+
+相同优化已经穿透文件级路径，文件大小、剪枝和读取字节保持不变：
+
+| 文件级指标 | v0.1 参考值 | 当前值 | 变化 |
+|---|---:|---:|---:|
+| 性能场景写入 | 72.9057 ms / 1.372 M rows/s | 54.2313 ms / 1.844 M rows/s | 吞吐约 +34% |
+| 50% 选择率扫描 | 18.9773 ms / 5.269 M rows/s | 6.8883 ms / 14.517 M rows/s | 吞吐约 2.76x |
+| 性能场景端到端 | 91.4441 ms / 1.094 M rows/s | 61.2957 ms / 1.631 M rows/s | 吞吐约 +49% |
+| 压缩套件合计编码 | 86.9556 ms / 78.760 MiB/s | 62.1259 ms / 110.237 MiB/s | 吞吐约 +40% |
+| 压缩套件合计解码 | 51.3035 ms / 133.492 MiB/s | 22.7979 ms / 300.404 MiB/s | 吞吐约 2.25x |
+
+性能场景仍剪枝 6/13 Row Group、读取 14 个 ColumnChunk 和 184,036 字节，Segment 文件仍为
+675,943 字节；压缩套件合计仍为 3,622,610 字节。
+
+### 2026-09-16：typed 索引、选择器、FOR encode 与 CRC32C
+
+- 单排序键校验直接比较 Arrow typed values，每个 batch 只为跨 batch 边界保留首尾 Scalar；
+  复合排序键继续使用原通用路径。
+- statistics 直接在 Arrow array 中跟踪 min/max 行，Bloom 直接散列 Arrow value bytes；双种子 Bloom
+  哈希在一次 value 遍历中完成。新增测试证明 typed hash 与原 `SerializeScalar()` 哈希完全一致。
+- encoding selector 改为 typed 采样；Dictionary distinct、RLE runs 与 FOR extrema 不再逐值创建和
+  序列化 Scalar，选择阈值与 tie-break 规则不变。
+- FOR encoder 改为 typed base/delta；与旧 Scalar reference 对全部整数宽度、timestamp、null、极值
+  逐字节比较。微基准从 175.9 MiB/s 提升至 710.6 MiB/s，payload 保持 100,040 字节。
+- Plain variable-width 无 null 路径批量复制连续 Arrow value buffer，`ByteWriter` 按可计算长度预留
+  容量；切片 string 与 nullable binary 均有逐字节 reference test。
+- CRC32C 从逐字节、逐位实现改为相同 Castagnoli 多项式的 256 项查表实现。测试中的独立逐位实现
+  保持不变并验证所有既有 header/footer/chunk checksum；未关闭或减少任何 checksum。该项尚未建立
+  独立 CRC microbenchmark，收益来自完整文件 benchmark 的 before/after，应在后续分阶段测量中补齐。
+
+同机 Release 最终测量（性能 11 次、压缩 7 次，均取 P50）：
+
+| 指标 | v0.1 | 本轮优化前 | 当前 | v0.2 目标 |
+|---|---:|---:|---:|---:|
+| 性能场景写入 | 1.372 M rows/s | 1.844 M rows/s | 6.957 M rows/s | >= 4.0 M rows/s |
+| 50% 选择率扫描 | 5.269 M rows/s | 14.517 M rows/s | 16.111 M rows/s | >= 15.0 M rows/s |
+| 性能场景端到端 | 1.094 M rows/s | 1.631 M rows/s | 4.852 M rows/s | >= 3.0 M rows/s |
+| 压缩套件合计编码 | 78.760 MiB/s | 110.237 MiB/s | 270.085 MiB/s | >= 250 MiB/s |
+| 压缩套件合计解码 | 133.492 MiB/s | 300.404 MiB/s | 433.734 MiB/s | >= 400 MiB/s |
+
+当前性能场景 P50 为写入 14.3747 ms、扫描 6.2069 ms、端到端 20.6113 ms。仍剪枝 6/13 Row
+Group、读取 14 个 ColumnChunk 和 184,036 字节，Segment 为 675,943 字节。压缩套件合计仍为
+3,622,610 字节，所有场景压缩比不变。
+
+高基数 string 的 0.874x 压缩比没有变化：v0.1 Plain 为每行持久化一个 64-bit offset，且每个 Row
+Group 都有 chunk/index 元数据和 checksum；该场景本身不可字典化，因此 2,800,004 logical bytes
+对应 3,202,118 file bytes。这是现有 v0.1 格式开销，不是本轮速度优化造成的回退；若要改善需按
+第 7 节为 compact offset 分配新 encoding ID，不能静默改变 Plain v1 字节语义。
+
+本轮验证：Debug、Release、ASan+UBSan 三套构建的 8/8 CTest 均通过；其中包含普通单元测试、
+随机 property/fuzz smoke、三个 benchmark 文本 smoke 和三个 JSON schema smoke。`clang-format` 与
+`git diff --check` 通过。v0.2 尚未完成：分阶段计时、RSS/allocation、完整 Row Group/选择率/宽表矩阵、
+warm/cold cache、reader 文件句柄复用以及 `bench/BENCHMARK_V2.md` 仍按第 3、5、6、10 节继续推进。

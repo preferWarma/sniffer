@@ -182,6 +182,18 @@ ARROW_ASSIGN_OR_RAISE(auto batches, reader->Scan(std::move(plan), metrics));
 计算的 MiB/s；输入构造、文件大小查询和回读正确性比较不计时。合计结果的耗时是各场景中位
 耗时之和。
 
+纯内存 codec benchmark 单独测量生产代码中的 Plain、Dictionary、RLE 和 FOR + Bitpack，排除
+文件 I/O、索引和 checksum：
+
+```bash
+./build/sniffer_core_codec_benchmark \
+  --rows=100000 \
+  --iterations=7
+```
+
+它报告各 codec 的 payload 大小、压缩比、encode/decode 吞吐和原始统计样本；round-trip 比较在
+计时区间外执行。该 benchmark 同样支持 `--output-format=json`。
+
 Arrow IPC 对照使用类型化循环完成过滤和 projection materialization，但不提供 Sniffer 的编码
 选择、Row Group 索引、剪枝和各层 checksum，因此它是序列化/通用压缩基线，不是功能完全
 等价的存储格式。结果应分别用于观察端到端成本和文件大小，不能直接解释为纯解码器速度对比。

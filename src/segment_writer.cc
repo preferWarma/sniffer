@@ -67,49 +67,60 @@ std::vector<uint8_t> EncodeValidity(const arrow::Array& array) {
   return validity;
 }
 
-arrow::Result<std::vector<uint8_t>> EncodePlain(const FieldSpec& field,
-                                                const std::shared_ptr<arrow::Array>& array) {
+arrow::Result<std::vector<uint8_t>> EncodePlainImpl(const FieldSpec& field,
+                                                    const arrow::Array& array) {
   // Plain serialization deliberately copies values so persisted bytes have an
   // explicit endian and deterministic contents for Arrow null slots.
   ARROW_ASSIGN_OR_RAISE(const auto physical_type, internal::PhysicalTypeFor(*field.type));
-  auto validity = EncodeValidity(*array);
+  auto validity = EncodeValidity(array);
   ByteWriter offsets;
   ByteWriter values;
 
+  if (field.type->id() != arrow::Type::STRING && field.type->id() != arrow::Type::BINARY) {
+    ARROW_ASSIGN_OR_RAISE(
+        const uint64_t value_bytes,
+        internal::CheckedMultiply(static_cast<uint64_t>(array.length()),
+                                  static_cast<uint64_t>(internal::FixedWidthBytes(physical_type))));
+    if (value_bytes > std::numeric_limits<size_t>::max()) {
+      return arrow::Status::Invalid("[sniffer.format.limit] Plain values exceed platform limit");
+    }
+    values.Reserve(static_cast<size_t>(value_bytes));
+  }
+
   switch (physical_type) {
     case internal::PhysicalTypeId::kBool: {
-      const auto& typed = static_cast<const arrow::BooleanArray&>(*array);
+      const auto& typed = static_cast<const arrow::BooleanArray&>(array);
       for (int64_t index = 0; index < typed.length(); ++index) {
         values.WriteU8(typed.IsValid(index) && typed.Value(index) ? uint8_t{1} : uint8_t{0});
       }
       break;
     }
     case internal::PhysicalTypeId::kInt8:
-      EncodeIntegerValues(static_cast<const arrow::Int8Array&>(*array), 1, &values);
+      EncodeIntegerValues(static_cast<const arrow::Int8Array&>(array), 1, &values);
       break;
     case internal::PhysicalTypeId::kInt16:
-      EncodeIntegerValues(static_cast<const arrow::Int16Array&>(*array), 2, &values);
+      EncodeIntegerValues(static_cast<const arrow::Int16Array&>(array), 2, &values);
       break;
     case internal::PhysicalTypeId::kInt32:
-      EncodeIntegerValues(static_cast<const arrow::Int32Array&>(*array), 4, &values);
+      EncodeIntegerValues(static_cast<const arrow::Int32Array&>(array), 4, &values);
       break;
     case internal::PhysicalTypeId::kInt64:
-      EncodeIntegerValues(static_cast<const arrow::Int64Array&>(*array), 8, &values);
+      EncodeIntegerValues(static_cast<const arrow::Int64Array&>(array), 8, &values);
       break;
     case internal::PhysicalTypeId::kUInt8:
-      EncodeIntegerValues(static_cast<const arrow::UInt8Array&>(*array), 1, &values);
+      EncodeIntegerValues(static_cast<const arrow::UInt8Array&>(array), 1, &values);
       break;
     case internal::PhysicalTypeId::kUInt16:
-      EncodeIntegerValues(static_cast<const arrow::UInt16Array&>(*array), 2, &values);
+      EncodeIntegerValues(static_cast<const arrow::UInt16Array&>(array), 2, &values);
       break;
     case internal::PhysicalTypeId::kUInt32:
-      EncodeIntegerValues(static_cast<const arrow::UInt32Array&>(*array), 4, &values);
+      EncodeIntegerValues(static_cast<const arrow::UInt32Array&>(array), 4, &values);
       break;
     case internal::PhysicalTypeId::kUInt64:
-      EncodeIntegerValues(static_cast<const arrow::UInt64Array&>(*array), 8, &values);
+      EncodeIntegerValues(static_cast<const arrow::UInt64Array&>(array), 8, &values);
       break;
     case internal::PhysicalTypeId::kFloat32: {
-      const auto& typed = static_cast<const arrow::FloatArray&>(*array);
+      const auto& typed = static_cast<const arrow::FloatArray&>(array);
       for (int64_t index = 0; index < typed.length(); ++index) {
         const float value = typed.IsNull(index) ? 0.0F : typed.Value(index);
         values.WriteU32(std::bit_cast<uint32_t>(value));
@@ -117,7 +128,7 @@ arrow::Result<std::vector<uint8_t>> EncodePlain(const FieldSpec& field,
       break;
     }
     case internal::PhysicalTypeId::kFloat64: {
-      const auto& typed = static_cast<const arrow::DoubleArray&>(*array);
+      const auto& typed = static_cast<const arrow::DoubleArray&>(array);
       for (int64_t index = 0; index < typed.length(); ++index) {
         const double value = typed.IsNull(index) ? 0.0 : typed.Value(index);
         values.WriteU64(std::bit_cast<uint64_t>(value));
@@ -125,29 +136,79 @@ arrow::Result<std::vector<uint8_t>> EncodePlain(const FieldSpec& field,
       break;
     }
     case internal::PhysicalTypeId::kTimestamp:
-      EncodeIntegerValues(static_cast<const arrow::TimestampArray&>(*array), 8, &values);
+      EncodeIntegerValues(static_cast<const arrow::TimestampArray&>(array), 8, &values);
       break;
     case internal::PhysicalTypeId::kString:
     case internal::PhysicalTypeId::kBinary: {
+      const auto& typed = static_cast<const arrow::BinaryArray&>(array);
+      ARROW_ASSIGN_OR_RAISE(
+          const uint64_t offset_count,
+          internal::CheckedAdd(static_cast<uint64_t>(typed.length()), uint64_t{1}));
+      ARROW_ASSIGN_OR_RAISE(const uint64_t offset_bytes,
+                            internal::CheckedMultiply(offset_count, uint64_t{8}));
+      if (offset_bytes > std::numeric_limits<size_t>::max()) {
+        return arrow::Status::Invalid("[sniffer.format.limit] Plain offsets exceed platform limit");
+      }
+      offsets.Reserve(static_cast<size_t>(offset_bytes));
       offsets.WriteU64(0);
-      uint64_t current_offset = 0;
-      const auto& typed = static_cast<const arrow::BinaryArray&>(*array);
-      for (int64_t index = 0; index < typed.length(); ++index) {
-        if (typed.IsValid(index)) {
-          const std::string_view value = typed.GetView(index);
-          ARROW_ASSIGN_OR_RAISE(
-              current_offset,
-              internal::CheckedAdd(current_offset, static_cast<uint64_t>(value.size())));
-          values.WriteBytes(std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(value.data()),
-                                                     value.size()));
+      if (typed.null_count() == 0) {
+        const int64_t first_offset = typed.value_offset(0);
+        const int64_t last_offset = typed.value_offset(typed.length());
+        if (first_offset < 0 || last_offset < first_offset) {
+          return arrow::Status::Invalid("[sniffer.writer.input] invalid Arrow binary offsets");
         }
-        offsets.WriteU64(current_offset);
+        const uint64_t value_bytes = static_cast<uint64_t>(last_offset - first_offset);
+        if (value_bytes > std::numeric_limits<size_t>::max()) {
+          return arrow::Status::Invalid(
+              "[sniffer.format.limit] Plain values exceed platform limit");
+        }
+        values.Reserve(static_cast<size_t>(value_bytes));
+        for (int64_t index = 0; index < typed.length(); ++index) {
+          const int64_t offset = typed.value_offset(index + 1) - first_offset;
+          if (offset < 0) {
+            return arrow::Status::Invalid("[sniffer.writer.input] invalid Arrow binary offsets");
+          }
+          offsets.WriteU64(static_cast<uint64_t>(offset));
+        }
+        const auto value_data = typed.value_data();
+        if (value_bytes != 0 && !value_data) {
+          return arrow::Status::Invalid("[sniffer.writer.input] missing Arrow binary values");
+        }
+        if (value_bytes != 0) {
+          values.WriteBytes(std::span<const uint8_t>(value_data->data() + first_offset,
+                                                     static_cast<size_t>(value_bytes)));
+        }
+      } else {
+        uint64_t current_offset = 0;
+        for (int64_t index = 0; index < typed.length(); ++index) {
+          if (typed.IsValid(index)) {
+            const std::string_view value = typed.GetView(index);
+            ARROW_ASSIGN_OR_RAISE(
+                current_offset,
+                internal::CheckedAdd(current_offset, static_cast<uint64_t>(value.size())));
+            values.WriteBytes(std::span<const uint8_t>(
+                reinterpret_cast<const uint8_t*>(value.data()), value.size()));
+          }
+          offsets.WriteU64(current_offset);
+        }
       }
       break;
     }
   }
 
   ByteWriter payload;
+  ARROW_ASSIGN_OR_RAISE(const uint64_t header_and_validity,
+                        internal::CheckedAdd(uint64_t{24}, static_cast<uint64_t>(validity.size())));
+  ARROW_ASSIGN_OR_RAISE(
+      const uint64_t header_validity_and_offsets,
+      internal::CheckedAdd(header_and_validity, static_cast<uint64_t>(offsets.data().size())));
+  ARROW_ASSIGN_OR_RAISE(const uint64_t payload_size,
+                        internal::CheckedAdd(header_validity_and_offsets,
+                                             static_cast<uint64_t>(values.data().size())));
+  if (payload_size > std::numeric_limits<size_t>::max()) {
+    return arrow::Status::Invalid("[sniffer.format.limit] Plain payload exceeds platform limit");
+  }
+  payload.Reserve(static_cast<size_t>(payload_size));
   payload.WriteU64(static_cast<uint64_t>(validity.size()));
   payload.WriteU64(static_cast<uint64_t>(offsets.data().size()));
   payload.WriteU64(static_cast<uint64_t>(values.data().size()));
@@ -158,6 +219,14 @@ arrow::Result<std::vector<uint8_t>> EncodePlain(const FieldSpec& field,
 }
 
 }  // namespace
+
+namespace internal {
+
+arrow::Result<std::vector<uint8_t>> EncodePlain(const FieldSpec& field, const arrow::Array& array) {
+  return EncodePlainImpl(field, array);
+}
+
+}  // namespace internal
 
 class SegmentWriter::Impl {
  public:
@@ -241,7 +310,7 @@ class SegmentWriter::Impl {
       std::vector<uint8_t> payload;
       uint64_t uncompressed_length = 0;
       if (encoding_id == internal::kPlainEncodingId) {
-        ARROW_ASSIGN_OR_RAISE(payload, EncodePlain(field, array));
+        ARROW_ASSIGN_OR_RAISE(payload, internal::EncodePlain(field, *array));
         uncompressed_length = static_cast<uint64_t>(payload.size());
       } else {
         ARROW_ASSIGN_OR_RAISE(uncompressed_length, internal::PlainEncodedSize(field, *array));

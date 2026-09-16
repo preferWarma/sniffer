@@ -1,8 +1,10 @@
 #include "index_internal.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <limits>
+#include <string_view>
 
 #include "scalar_internal.h"
 
@@ -30,6 +32,132 @@ arrow::Result<int> CompareKeys(const std::vector<std::shared_ptr<arrow::Scalar>>
     }
   }
   return 0;
+}
+
+template <typename ArrayType>
+int ComparePrimitiveRows(const arrow::Array& untyped, int64_t left_index, int64_t right_index) {
+  const auto& array = static_cast<const ArrayType&>(untyped);
+  const auto left = array.Value(left_index);
+  const auto right = array.Value(right_index);
+  if (left < right) {
+    return -1;
+  }
+  if (left > right) {
+    return 1;
+  }
+  return 0;
+}
+
+int CompareByteViews(std::string_view left, std::string_view right) {
+  const size_t common_size = std::min(left.size(), right.size());
+  for (size_t index = 0; index < common_size; ++index) {
+    const auto left_byte = static_cast<uint8_t>(left[index]);
+    const auto right_byte = static_cast<uint8_t>(right[index]);
+    if (left_byte < right_byte) {
+      return -1;
+    }
+    if (left_byte > right_byte) {
+      return 1;
+    }
+  }
+  if (left.size() < right.size()) {
+    return -1;
+  }
+  if (left.size() > right.size()) {
+    return 1;
+  }
+  return 0;
+}
+
+arrow::Result<int> CompareArrayRows(const arrow::Array& array, int64_t left_index,
+                                    int64_t right_index) {
+  switch (array.type_id()) {
+    case arrow::Type::BOOL:
+      return ComparePrimitiveRows<arrow::BooleanArray>(array, left_index, right_index);
+    case arrow::Type::INT8:
+      return ComparePrimitiveRows<arrow::Int8Array>(array, left_index, right_index);
+    case arrow::Type::INT16:
+      return ComparePrimitiveRows<arrow::Int16Array>(array, left_index, right_index);
+    case arrow::Type::INT32:
+      return ComparePrimitiveRows<arrow::Int32Array>(array, left_index, right_index);
+    case arrow::Type::INT64:
+      return ComparePrimitiveRows<arrow::Int64Array>(array, left_index, right_index);
+    case arrow::Type::UINT8:
+      return ComparePrimitiveRows<arrow::UInt8Array>(array, left_index, right_index);
+    case arrow::Type::UINT16:
+      return ComparePrimitiveRows<arrow::UInt16Array>(array, left_index, right_index);
+    case arrow::Type::UINT32:
+      return ComparePrimitiveRows<arrow::UInt32Array>(array, left_index, right_index);
+    case arrow::Type::UINT64:
+      return ComparePrimitiveRows<arrow::UInt64Array>(array, left_index, right_index);
+    case arrow::Type::FLOAT:
+      return ComparePrimitiveRows<arrow::FloatArray>(array, left_index, right_index);
+    case arrow::Type::DOUBLE:
+      return ComparePrimitiveRows<arrow::DoubleArray>(array, left_index, right_index);
+    case arrow::Type::TIMESTAMP:
+      return ComparePrimitiveRows<arrow::TimestampArray>(array, left_index, right_index);
+    case arrow::Type::STRING: {
+      const auto& strings = static_cast<const arrow::StringArray&>(array);
+      return CompareByteViews(strings.GetView(left_index), strings.GetView(right_index));
+    }
+    case arrow::Type::BINARY: {
+      const auto& binary = static_cast<const arrow::BinaryArray&>(array);
+      return CompareByteViews(binary.GetView(left_index), binary.GetView(right_index));
+    }
+    default:
+      return arrow::Status::NotImplemented("[sniffer.layout.sort_key] unsupported type ",
+                                           array.type()->ToString());
+  }
+}
+
+bool ArrayValueHasNaN(const arrow::Array& array, int64_t row) {
+  if (array.type_id() == arrow::Type::FLOAT) {
+    return std::isnan(static_cast<const arrow::FloatArray&>(array).Value(row));
+  }
+  if (array.type_id() == arrow::Type::DOUBLE) {
+    return std::isnan(static_cast<const arrow::DoubleArray&>(array).Value(row));
+  }
+  return false;
+}
+
+arrow::Status ValidateSingleSortKey(const TableSchema& schema, uint32_t field_id,
+                                    const arrow::RecordBatch& batch,
+                                    std::vector<std::shared_ptr<arrow::Scalar>>* previous_key) {
+  ARROW_ASSIGN_OR_RAISE(const size_t field_index, FieldIndex(schema, field_id));
+  const auto& array = *batch.column(static_cast<int>(field_index));
+  for (int64_t row = 0; row < array.length(); ++row) {
+    if (array.IsNull(row) || ArrayValueHasNaN(array, row)) {
+      return arrow::Status::Invalid("[sniffer.layout.sort_key] field ", field_id,
+                                    " contains null or NaN");
+    }
+  }
+
+  ARROW_ASSIGN_OR_RAISE(auto first, array.GetScalar(0));
+  if (!previous_key->empty()) {
+    if (previous_key->size() != 1) {
+      return arrow::Status::Invalid("[sniffer.layout.sort_key] sort-key arity mismatch");
+    }
+    ARROW_ASSIGN_OR_RAISE(const int order, CompareScalars(*previous_key->front(), *first));
+    if (order > 0) {
+      return arrow::Status::Invalid(
+          "[sniffer.layout.sort_key] input is not globally non-decreasing");
+    }
+  }
+  for (int64_t row = 1; row < array.length(); ++row) {
+    ARROW_ASSIGN_OR_RAISE(const int order, CompareArrayRows(array, row - 1, row));
+    if (order > 0) {
+      return arrow::Status::Invalid(
+          "[sniffer.layout.sort_key] input is not globally non-decreasing");
+    }
+  }
+
+  if (array.length() == 1) {
+    *previous_key = {std::move(first)};
+  } else {
+    ARROW_ASSIGN_OR_RAISE(auto last, array.GetScalar(array.length() - 1));
+    *previous_key = {std::move(last)};
+  }
+  return arrow::Status::OK();
 }
 
 arrow::Result<std::vector<std::shared_ptr<arrow::Scalar>>> KeyAt(const TableSchema& schema,
@@ -61,9 +189,11 @@ uint64_t BloomBitCount(uint64_t row_count) {
   return bits;
 }
 
-arrow::Status BloomInsert(const FieldSpec& field, const arrow::Scalar& value, BloomMeta* bloom) {
-  ARROW_ASSIGN_OR_RAISE(const uint64_t first, HashScalar(field, value, 0x243F6A8885A308D3ULL));
-  ARROW_ASSIGN_OR_RAISE(const uint64_t raw_second, HashScalar(field, value, 0x13198A2E03707344ULL));
+arrow::Status BloomInsertArrayValue(const FieldSpec& field, const arrow::Array& array, int64_t row,
+                                    BloomMeta* bloom) {
+  ARROW_ASSIGN_OR_RAISE(auto hashes, HashArrayValuePair(field, array, row, 0x243F6A8885A308D3ULL,
+                                                        0x13198A2E03707344ULL));
+  const auto [first, raw_second] = hashes;
   const uint64_t second = raw_second | 1U;
   for (uint32_t probe = 0; probe < bloom->hash_count; ++probe) {
     const uint64_t bit = (first + static_cast<uint64_t>(probe) * second) & (bloom->bit_count - 1U);
@@ -73,6 +203,40 @@ arrow::Status BloomInsert(const FieldSpec& field, const arrow::Scalar& value, Bl
   return arrow::Status::OK();
 }
 
+arrow::Result<StatisticsMeta> BuildStatistics(uint32_t field_id, const arrow::Array& array) {
+  StatisticsMeta statistics;
+  statistics.field_id = field_id;
+  statistics.null_count = static_cast<uint64_t>(array.null_count());
+  int64_t min_row = -1;
+  int64_t max_row = -1;
+  for (int64_t row = 0; row < array.length(); ++row) {
+    if (array.IsNull(row)) {
+      continue;
+    }
+    if (ArrayValueHasNaN(array, row)) {
+      return statistics;
+    }
+    if (min_row < 0) {
+      min_row = row;
+      max_row = row;
+      continue;
+    }
+    ARROW_ASSIGN_OR_RAISE(const int min_order, CompareArrayRows(array, row, min_row));
+    ARROW_ASSIGN_OR_RAISE(const int max_order, CompareArrayRows(array, row, max_row));
+    if (min_order < 0) {
+      min_row = row;
+    }
+    if (max_order > 0) {
+      max_row = row;
+    }
+  }
+  if (min_row >= 0) {
+    ARROW_ASSIGN_OR_RAISE(statistics.min, array.GetScalar(min_row));
+    ARROW_ASSIGN_OR_RAISE(statistics.max, array.GetScalar(max_row));
+  }
+  return statistics;
+}
+
 }  // namespace
 
 arrow::Status ValidateAndUpdateSortOrder(
@@ -80,6 +244,9 @@ arrow::Status ValidateAndUpdateSortOrder(
     std::vector<std::shared_ptr<arrow::Scalar>>* previous_key) {
   if (layout.sort_key_field_ids.empty() || batch.num_rows() == 0) {
     return arrow::Status::OK();
+  }
+  if (layout.sort_key_field_ids.size() == 1) {
+    return ValidateSingleSortKey(schema, layout.sort_key_field_ids.front(), batch, previous_key);
   }
   std::vector<std::shared_ptr<arrow::Scalar>> prior = *previous_key;
   for (int64_t row = 0; row < batch.num_rows(); ++row) {
@@ -108,37 +275,7 @@ arrow::Result<RowGroupIndex> BuildRowGroupIndex(const TableSchema& schema,
   for (const uint32_t field_id : layout.statistics_field_ids) {
     ARROW_ASSIGN_OR_RAISE(const size_t field_index, FieldIndex(schema, field_id));
     const auto& array = batch.column(static_cast<int>(field_index));
-    StatisticsMeta statistics;
-    statistics.field_id = field_id;
-    statistics.null_count = static_cast<uint64_t>(array->null_count());
-    bool saw_nan = false;
-    for (int64_t row = 0; row < array->length(); ++row) {
-      if (array->IsNull(row)) {
-        continue;
-      }
-      ARROW_ASSIGN_OR_RAISE(auto value, array->GetScalar(row));
-      if (ScalarHasNaN(*value)) {
-        saw_nan = true;
-        continue;
-      }
-      if (!statistics.min) {
-        statistics.min = value;
-        statistics.max = std::move(value);
-        continue;
-      }
-      ARROW_ASSIGN_OR_RAISE(const int min_order, CompareScalars(*value, *statistics.min));
-      ARROW_ASSIGN_OR_RAISE(const int max_order, CompareScalars(*value, *statistics.max));
-      if (min_order < 0) {
-        statistics.min = value;
-      }
-      if (max_order > 0) {
-        statistics.max = std::move(value);
-      }
-    }
-    if (saw_nan) {
-      statistics.min.reset();
-      statistics.max.reset();
-    }
+    ARROW_ASSIGN_OR_RAISE(auto statistics, BuildStatistics(field_id, *array));
     result.statistics.push_back(std::move(statistics));
   }
 
@@ -158,9 +295,8 @@ arrow::Result<RowGroupIndex> BuildRowGroupIndex(const TableSchema& schema,
       if (array->IsNull(row)) {
         continue;
       }
-      ARROW_ASSIGN_OR_RAISE(auto value, array->GetScalar(row));
-      if (!ScalarHasNaN(*value)) {
-        ARROW_RETURN_NOT_OK(BloomInsert(field, *value, &bloom));
+      if (!ArrayValueHasNaN(*array, row)) {
+        ARROW_RETURN_NOT_OK(BloomInsertArrayValue(field, *array, row, &bloom));
       }
     }
     result.blooms.push_back(std::move(bloom));

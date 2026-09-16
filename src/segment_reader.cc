@@ -196,9 +196,9 @@ arrow::Result<std::shared_ptr<arrow::Array>> DecodeVariable(internal::PhysicalTy
   return result;
 }
 
-arrow::Result<std::shared_ptr<arrow::Array>> DecodePlain(const FieldSpec& field,
-                                                         const internal::ColumnChunkMeta& chunk,
-                                                         std::span<const uint8_t> payload) {
+arrow::Result<std::shared_ptr<arrow::Array>> DecodePlainImpl(const FieldSpec& field,
+                                                             const internal::ColumnChunkMeta& chunk,
+                                                             std::span<const uint8_t> payload) {
   // Builders deliberately allocate Arrow-owned output buffers: little-endian
   // wire values cannot be exposed as portable zero-copy Arrow buffers.
   internal::ByteReader payload_reader(payload);
@@ -689,6 +689,16 @@ arrow::Result<bool> SortRangePrunes(const internal::FooterData& footer,
 
 }  // namespace
 
+namespace internal {
+
+arrow::Result<std::shared_ptr<arrow::Array>> DecodePlain(const FieldSpec& field,
+                                                         const ColumnChunkMeta& chunk,
+                                                         std::span<const uint8_t> payload) {
+  return DecodePlainImpl(field, chunk, payload);
+}
+
+}  // namespace internal
+
 class ScanState {
  public:
   ScanState(std::string path, uint64_t file_size, internal::FooterData footer,
@@ -835,7 +845,8 @@ class ScanState {
     ARROW_ASSIGN_OR_RAISE(auto payload, ReadChunk(chunk));
     std::shared_ptr<arrow::Array> array;
     if (chunk.encoding_id == internal::kPlainEncodingId) {
-      ARROW_ASSIGN_OR_RAISE(array, DecodePlain(footer_.schema.fields[field_index], chunk, payload));
+      ARROW_ASSIGN_OR_RAISE(
+          array, internal::DecodePlain(footer_.schema.fields[field_index], chunk, payload));
     } else {
       ARROW_ASSIGN_OR_RAISE(
           array, internal::DecodeNonPlain(footer_.schema.fields[field_index], chunk, payload));
@@ -1103,7 +1114,8 @@ class SegmentReader::Impl {
         }
         std::shared_ptr<arrow::Array> array;
         if (chunk.encoding_id == internal::kPlainEncodingId) {
-          ARROW_ASSIGN_OR_RAISE(array, DecodePlain(footer_.schema.fields[index], chunk, payload));
+          ARROW_ASSIGN_OR_RAISE(
+              array, internal::DecodePlain(footer_.schema.fields[index], chunk, payload));
         } else {
           ARROW_ASSIGN_OR_RAISE(
               array, internal::DecodeNonPlain(footer_.schema.fields[index], chunk, payload));

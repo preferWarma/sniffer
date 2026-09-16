@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
@@ -17,9 +18,12 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
+#include "codec_internal.h"
+#include "scalar_internal.h"
 #include "sniffer/segment_reader.h"
 #include "sniffer/segment_writer.h"
 
@@ -132,6 +136,279 @@ std::shared_ptr<arrow::Array> BuildBinaryArray(
   return array;
 }
 
+arrow::Result<std::vector<uint8_t>> ReferenceEncodePlainVariable(const arrow::Array& array) {
+  const uint64_t rows = static_cast<uint64_t>(array.length());
+  std::vector<uint8_t> validity;
+  if (array.null_count() != 0) {
+    validity.resize(static_cast<size_t>(rows / 8U + (rows % 8U != 0)), 0);
+    for (int64_t row = 0; row < array.length(); ++row) {
+      if (array.IsValid(row)) {
+        validity[static_cast<size_t>(row / 8)] |=
+            static_cast<uint8_t>(1U << static_cast<uint32_t>(row % 8));
+      }
+    }
+  }
+  const auto& binary = static_cast<const arrow::BinaryArray&>(array);
+  sniffer::internal::ByteWriter offsets;
+  sniffer::internal::ByteWriter values;
+  offsets.WriteU64(0);
+  uint64_t current_offset = 0;
+  for (int64_t row = 0; row < binary.length(); ++row) {
+    if (binary.IsValid(row)) {
+      const std::string_view value = binary.GetView(row);
+      ARROW_ASSIGN_OR_RAISE(
+          current_offset,
+          sniffer::internal::CheckedAdd(current_offset, static_cast<uint64_t>(value.size())));
+      values.WriteBytes(
+          std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(value.data()), value.size()));
+    }
+    offsets.WriteU64(current_offset);
+  }
+  sniffer::internal::ByteWriter payload;
+  payload.WriteU64(static_cast<uint64_t>(validity.size()));
+  payload.WriteU64(static_cast<uint64_t>(offsets.data().size()));
+  payload.WriteU64(static_cast<uint64_t>(values.data().size()));
+  payload.WriteBytes(validity);
+  payload.WriteBytes(offsets.data());
+  payload.WriteBytes(values.data());
+  return std::move(payload).Finish();
+}
+
+arrow::Result<std::vector<uint8_t>> ReferenceEncodeRle(const sniffer::FieldSpec& field,
+                                                       const arrow::Array& array) {
+  ARROW_ASSIGN_OR_RAISE(const auto physical_type, sniffer::internal::PhysicalTypeFor(*field.type));
+  const uint32_t width = sniffer::internal::FixedWidthBytes(physical_type);
+  struct Run {
+    uint64_t count = 0;
+    bool valid = false;
+    std::vector<uint8_t> value;
+  };
+  std::vector<Run> runs;
+  for (int64_t row = 0; row < array.length(); ++row) {
+    const bool valid = array.IsValid(row);
+    std::vector<uint8_t> value(width, 0);
+    if (valid) {
+      ARROW_ASSIGN_OR_RAISE(auto scalar, array.GetScalar(row));
+      ARROW_ASSIGN_OR_RAISE(value, sniffer::internal::SerializeScalar(field, *scalar));
+    }
+    if (!runs.empty() && runs.back().valid == valid && runs.back().value == value) {
+      ++runs.back().count;
+    } else {
+      runs.push_back({1, valid, std::move(value)});
+    }
+  }
+  sniffer::internal::ByteWriter payload;
+  payload.WriteU64(static_cast<uint64_t>(runs.size()));
+  payload.WriteU64(0);
+  for (const auto& run : runs) {
+    payload.WriteU64(run.count);
+    payload.WriteU8(run.valid ? 1U : 0U);
+    for (int reserved = 0; reserved < 7; ++reserved) {
+      payload.WriteU8(0);
+    }
+    payload.WriteBytes(run.value);
+  }
+  return std::move(payload).Finish();
+}
+
+uint32_t ReferenceDictionaryIndexWidth(uint64_t dictionary_count) {
+  if (dictionary_count <= 256U) {
+    return 1;
+  }
+  if (dictionary_count <= 65536U) {
+    return 2;
+  }
+  if (dictionary_count <= std::numeric_limits<uint32_t>::max()) {
+    return 4;
+  }
+  return 8;
+}
+
+void ReferenceWriteWidth(sniffer::internal::ByteWriter* writer, uint64_t value, uint32_t width) {
+  switch (width) {
+    case 1:
+      writer->WriteU8(static_cast<uint8_t>(value));
+      break;
+    case 2:
+      writer->WriteU16(static_cast<uint16_t>(value));
+      break;
+    case 4:
+      writer->WriteU32(static_cast<uint32_t>(value));
+      break;
+    case 8:
+      writer->WriteU64(value);
+      break;
+    default:
+      break;
+  }
+}
+
+arrow::Result<std::vector<uint8_t>> ReferenceEncodeDictionary(const sniffer::FieldSpec& field,
+                                                              const arrow::Array& array) {
+  const uint64_t rows = static_cast<uint64_t>(array.length());
+  std::vector<uint8_t> validity;
+  if (array.null_count() != 0) {
+    validity.resize(static_cast<size_t>(rows / 8U + (rows % 8U != 0)), 0);
+    for (int64_t row = 0; row < array.length(); ++row) {
+      if (array.IsValid(row)) {
+        validity[static_cast<size_t>(row / 8)] |=
+            static_cast<uint8_t>(1U << static_cast<uint32_t>(row % 8));
+      }
+    }
+  }
+  std::unordered_map<std::string, uint64_t> lookup;
+  std::vector<std::vector<uint8_t>> dictionary;
+  std::vector<uint64_t> indices(static_cast<size_t>(array.length()), 0);
+  for (int64_t row = 0; row < array.length(); ++row) {
+    if (array.IsNull(row)) {
+      continue;
+    }
+    ARROW_ASSIGN_OR_RAISE(auto scalar, array.GetScalar(row));
+    ARROW_ASSIGN_OR_RAISE(auto bytes, sniffer::internal::SerializeScalar(field, *scalar));
+    const std::string key(bytes.begin(), bytes.end());
+    const auto [entry, inserted] = lookup.emplace(key, dictionary.size());
+    if (inserted) {
+      dictionary.push_back(std::move(bytes));
+    }
+    indices[static_cast<size_t>(row)] = entry->second;
+  }
+
+  const uint32_t index_width = ReferenceDictionaryIndexWidth(dictionary.size());
+  sniffer::internal::ByteWriter dictionary_offsets;
+  sniffer::internal::ByteWriter dictionary_values;
+  const bool variable =
+      field.type->id() == arrow::Type::STRING || field.type->id() == arrow::Type::BINARY;
+  if (variable) {
+    uint64_t offset = 0;
+    dictionary_offsets.WriteU64(0);
+    for (const auto& value : dictionary) {
+      ARROW_ASSIGN_OR_RAISE(
+          offset, sniffer::internal::CheckedAdd(offset, static_cast<uint64_t>(value.size())));
+      dictionary_values.WriteBytes(value);
+      dictionary_offsets.WriteU64(offset);
+    }
+  } else {
+    for (const auto& value : dictionary) {
+      dictionary_values.WriteBytes(value);
+    }
+  }
+  sniffer::internal::ByteWriter encoded_indices;
+  for (const uint64_t index : indices) {
+    ReferenceWriteWidth(&encoded_indices, index, index_width);
+  }
+  sniffer::internal::ByteWriter payload;
+  payload.WriteU64(static_cast<uint64_t>(validity.size()));
+  payload.WriteU64(static_cast<uint64_t>(dictionary.size()));
+  payload.WriteU8(static_cast<uint8_t>(index_width));
+  for (int reserved = 0; reserved < 7; ++reserved) {
+    payload.WriteU8(0);
+  }
+  payload.WriteU64(static_cast<uint64_t>(dictionary_offsets.data().size()));
+  payload.WriteU64(static_cast<uint64_t>(dictionary_values.data().size()));
+  payload.WriteU64(static_cast<uint64_t>(encoded_indices.data().size()));
+  payload.WriteBytes(validity);
+  payload.WriteBytes(dictionary_offsets.data());
+  payload.WriteBytes(dictionary_values.data());
+  payload.WriteBytes(encoded_indices.data());
+  return std::move(payload).Finish();
+}
+
+arrow::Result<uint64_t> ReferenceIntegralBits(const arrow::Scalar& scalar) {
+  switch (scalar.type->id()) {
+    case arrow::Type::INT8:
+      return static_cast<uint64_t>(static_cast<const arrow::Int8Scalar&>(scalar).value);
+    case arrow::Type::INT16:
+      return static_cast<uint64_t>(static_cast<const arrow::Int16Scalar&>(scalar).value);
+    case arrow::Type::INT32:
+      return static_cast<uint64_t>(static_cast<const arrow::Int32Scalar&>(scalar).value);
+    case arrow::Type::INT64:
+      return static_cast<uint64_t>(static_cast<const arrow::Int64Scalar&>(scalar).value);
+    case arrow::Type::UINT8:
+      return static_cast<const arrow::UInt8Scalar&>(scalar).value;
+    case arrow::Type::UINT16:
+      return static_cast<const arrow::UInt16Scalar&>(scalar).value;
+    case arrow::Type::UINT32:
+      return static_cast<const arrow::UInt32Scalar&>(scalar).value;
+    case arrow::Type::UINT64:
+      return static_cast<const arrow::UInt64Scalar&>(scalar).value;
+    case arrow::Type::TIMESTAMP:
+      return static_cast<uint64_t>(static_cast<const arrow::TimestampScalar&>(scalar).value);
+    default:
+      return arrow::Status::Invalid("reference FOR value is not integral");
+  }
+}
+
+arrow::Result<std::vector<uint8_t>> ReferenceEncodeFor(const sniffer::FieldSpec& field,
+                                                       const arrow::Array& array) {
+  const uint64_t rows = static_cast<uint64_t>(array.length());
+  std::vector<uint8_t> validity;
+  if (array.null_count() != 0) {
+    validity.resize(static_cast<size_t>(rows / 8U + (rows % 8U != 0)), 0);
+  }
+  std::shared_ptr<arrow::Scalar> base;
+  std::vector<std::shared_ptr<arrow::Scalar>> values(static_cast<size_t>(array.length()));
+  for (int64_t row = 0; row < array.length(); ++row) {
+    if (array.IsNull(row)) {
+      continue;
+    }
+    if (!validity.empty()) {
+      validity[static_cast<size_t>(row / 8)] |=
+          static_cast<uint8_t>(1U << static_cast<uint32_t>(row % 8));
+    }
+    ARROW_ASSIGN_OR_RAISE(auto value, array.GetScalar(row));
+    values[static_cast<size_t>(row)] = value;
+    if (!base) {
+      base = std::move(value);
+    } else {
+      ARROW_ASSIGN_OR_RAISE(const int order, sniffer::internal::CompareScalars(*value, *base));
+      if (order < 0) {
+        base = std::move(value);
+      }
+    }
+  }
+  if (!base) {
+    return arrow::Status::Invalid("reference FOR test requires a non-null value");
+  }
+  ARROW_ASSIGN_OR_RAISE(const uint64_t base_bits, ReferenceIntegralBits(*base));
+  std::vector<uint64_t> deltas(values.size(), 0);
+  uint64_t maximum_delta = 0;
+  for (size_t row = 0; row < values.size(); ++row) {
+    if (values[row]) {
+      ARROW_ASSIGN_OR_RAISE(const uint64_t bits, ReferenceIntegralBits(*values[row]));
+      deltas[row] = bits - base_bits;
+      maximum_delta = std::max(maximum_delta, deltas[row]);
+    }
+  }
+  const uint8_t bit_width = static_cast<uint8_t>(std::bit_width(maximum_delta));
+  ARROW_ASSIGN_OR_RAISE(const uint64_t total_bits,
+                        sniffer::internal::CheckedMultiply(rows, bit_width));
+  ARROW_ASSIGN_OR_RAISE(const uint64_t padded_bits,
+                        sniffer::internal::CheckedAdd(total_bits, uint64_t{7}));
+  std::vector<uint8_t> packed(static_cast<size_t>(padded_bits / 8U), 0);
+  for (uint64_t row = 0; row < deltas.size(); ++row) {
+    for (uint32_t bit = 0; bit < bit_width; ++bit) {
+      if (((deltas[static_cast<size_t>(row)] >> bit) & 1U) != 0) {
+        const uint64_t position = row * bit_width + bit;
+        packed[static_cast<size_t>(position / 8U)] |=
+            static_cast<uint8_t>(1U << static_cast<uint32_t>(position % 8U));
+      }
+    }
+  }
+  ARROW_ASSIGN_OR_RAISE(const auto base_bytes, sniffer::internal::SerializeScalar(field, *base));
+  sniffer::internal::ByteWriter payload;
+  payload.WriteU64(static_cast<uint64_t>(validity.size()));
+  payload.WriteU8(bit_width);
+  for (int reserved = 0; reserved < 7; ++reserved) {
+    payload.WriteU8(0);
+  }
+  payload.WriteU64(static_cast<uint64_t>(base_bytes.size()));
+  payload.WriteU64(static_cast<uint64_t>(packed.size()));
+  payload.WriteBytes(base_bytes);
+  payload.WriteBytes(validity);
+  payload.WriteBytes(packed);
+  return std::move(payload).Finish();
+}
+
 struct TestData {
   sniffer::TableSchema table_schema;
   std::shared_ptr<arrow::RecordBatch> batch;
@@ -197,6 +474,113 @@ TestData MakeAllTypesBatch() {
   auto batch = arrow::RecordBatch::Make(arrow_schema, 5, std::move(columns));
   RequireOk(batch->ValidateFull(), "validate all-types batch");
   return {std::move(table_schema), std::move(batch)};
+}
+
+void TestTypedArrayHashMatchesScalarReference() {
+  const auto data = MakeAllTypesBatch();
+  constexpr std::array<uint64_t, 2> kSeeds = {0x243F6A8885A308D3ULL, 0x13198A2E03707344ULL};
+  for (size_t column = 0; column < data.table_schema.fields.size(); ++column) {
+    const auto& field = data.table_schema.fields[column];
+    const auto& array = *data.batch->column(static_cast<int>(column));
+    for (int64_t row = 0; row < array.length(); ++row) {
+      if (array.IsNull(row)) {
+        continue;
+      }
+      const auto scalar = ValueOrThrow(array.GetScalar(row), "get scalar hash reference");
+      std::array<uint64_t, 2> expected_hashes{};
+      for (size_t seed_index = 0; seed_index < kSeeds.size(); ++seed_index) {
+        const uint64_t seed = kSeeds[seed_index];
+        const auto expected = ValueOrThrow(sniffer::internal::HashScalar(field, *scalar, seed),
+                                           "hash scalar reference");
+        expected_hashes[seed_index] = expected;
+        const auto actual = ValueOrThrow(sniffer::internal::HashArrayValue(field, array, row, seed),
+                                         "hash typed array value");
+        Expect(actual == expected, "typed array hash matches scalar byte format");
+      }
+      const auto pair = ValueOrThrow(
+          sniffer::internal::HashArrayValuePair(field, array, row, kSeeds[0], kSeeds[1]),
+          "hash typed array value pair");
+      Expect(pair.first == expected_hashes[0] && pair.second == expected_hashes[1],
+             "paired typed array hash matches independent scalar hashes");
+    }
+  }
+}
+
+void TestPlainVariableBulkCopyMatchesReference() {
+  const auto strings = BuildStringArray({"discard", "alpha", "beta", "gamma", "tail"});
+  const auto sliced = strings->Slice(1, 3);
+  const sniffer::FieldSpec string_field{1, "text", arrow::utf8(), false, nullptr};
+  const auto expected =
+      ValueOrThrow(ReferenceEncodePlainVariable(*sliced), "reference sliced Plain string");
+  const auto actual = ValueOrThrow(sniffer::internal::EncodePlain(string_field, *sliced),
+                                   "bulk sliced Plain string");
+  Expect(actual == expected, "bulk Plain string bytes match row-wise reference");
+
+  const auto binary = BuildBinaryArray(
+      {std::vector<uint8_t>{0, 1}, std::nullopt,
+       std::vector<uint8_t>{static_cast<uint8_t>('a'), 0, static_cast<uint8_t>('b')},
+       std::vector<uint8_t>{}, std::vector<uint8_t>{0xFF}});
+  const sniffer::FieldSpec binary_field{2, "bytes", arrow::binary(), true, nullptr};
+  const auto nullable_expected =
+      ValueOrThrow(ReferenceEncodePlainVariable(*binary), "reference nullable Plain binary");
+  const auto nullable_actual =
+      ValueOrThrow(sniffer::internal::EncodePlain(binary_field, *binary), "nullable Plain binary");
+  Expect(nullable_actual == nullable_expected,
+         "nullable Plain binary bytes match row-wise reference");
+}
+
+void TestTypedRleMatchesScalarReference() {
+  const auto data = MakeAllTypesBatch();
+  for (size_t index = 0; index < 9; ++index) {
+    const auto& field = data.table_schema.fields[index];
+    const auto& array = *data.batch->column(static_cast<int>(index));
+    const auto expected = ValueOrThrow(ReferenceEncodeRle(field, array), "reference RLE encode");
+    const auto actual = ValueOrThrow(
+        sniffer::internal::EncodeNonPlain(sniffer::internal::kRleEncodingId, field, array),
+        "typed RLE encode");
+    Expect(actual == expected, "typed RLE bytes match scalar reference for " + field.name);
+  }
+
+  sniffer::FieldSpec repeated_field{1, "repeated", arrow::int32(), true, nullptr};
+  const auto repeated = BuildArray<arrow::Int32Builder, int32_t>(
+      {-7, -7, -7, std::nullopt, std::nullopt, 42, 42, -1, -1, -1});
+  const auto expected =
+      ValueOrThrow(ReferenceEncodeRle(repeated_field, *repeated), "reference repeated RLE encode");
+  const auto actual =
+      ValueOrThrow(sniffer::internal::EncodeNonPlain(sniffer::internal::kRleEncodingId,
+                                                     repeated_field, *repeated),
+                   "typed repeated RLE encode");
+  Expect(actual == expected, "typed RLE coalescing bytes match scalar reference");
+}
+
+void TestTypedForMatchesScalarReference() {
+  const auto data = MakeAllTypesBatch();
+  constexpr std::array<size_t, 9> kColumns = {1, 2, 3, 4, 5, 6, 7, 8, 11};
+  for (const size_t index : kColumns) {
+    const auto& field = data.table_schema.fields[index];
+    const auto& array = *data.batch->column(static_cast<int>(index));
+    const auto expected = ValueOrThrow(ReferenceEncodeFor(field, array), "reference FOR encode");
+    const auto actual =
+        ValueOrThrow(sniffer::internal::EncodeNonPlain(
+                         static_cast<uint16_t>(sniffer::EncodingKind::kForBitpack), field, array),
+                     "typed FOR encode");
+    Expect(actual == expected, "typed FOR bytes match scalar reference");
+  }
+}
+
+void TestTypedDictionaryMatchesScalarReference() {
+  const auto data = MakeAllTypesBatch();
+  const std::array<size_t, 10> field_indexes = {1, 2, 3, 4, 5, 6, 7, 8, 12, 13};
+  for (const size_t index : field_indexes) {
+    const auto& field = data.table_schema.fields[index];
+    const auto& array = *data.batch->column(static_cast<int>(index));
+    const auto expected =
+        ValueOrThrow(ReferenceEncodeDictionary(field, array), "reference Dictionary encode");
+    const auto actual = ValueOrThrow(
+        sniffer::internal::EncodeNonPlain(sniffer::internal::kDictionaryEncodingId, field, array),
+        "typed Dictionary encode");
+    Expect(actual == expected, "typed Dictionary bytes match scalar reference for " + field.name);
+  }
 }
 
 void WriteSegment(const std::filesystem::path& path, const sniffer::TableSchema& schema,
@@ -1459,8 +1843,13 @@ int main() {
       {"unknown_index_version", TestUnknownIndexVersionFailsExplicitly},
       {"composite_sort_key_range", TestCompositeSortKeyRange},
       {"forced_dictionary_round_trip_and_scan", TestForcedDictionaryRoundTripAndScan},
+      {"typed_array_hash_matches_scalar_reference", TestTypedArrayHashMatchesScalarReference},
+      {"plain_variable_bulk_copy_matches_reference", TestPlainVariableBulkCopyMatchesReference},
+      {"typed_dictionary_matches_scalar_reference", TestTypedDictionaryMatchesScalarReference},
       {"forced_rle_round_trip_and_scan", TestForcedRleRoundTripAndScan},
+      {"typed_rle_matches_scalar_reference", TestTypedRleMatchesScalarReference},
       {"forced_for_bitpack_round_trip_and_scan", TestForcedForBitpackRoundTripAndScan},
+      {"typed_for_matches_scalar_reference", TestTypedForMatchesScalarReference},
       {"forced_encoding_randomized_property", TestForcedEncodingRandomizedProperty},
       {"deterministic_encoding_selector", TestDeterministicEncodingSelector},
   };

@@ -7,6 +7,7 @@
 #include <limits>
 #include <memory>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -120,28 +121,62 @@ arrow::Result<uint64_t> ReadWidth(ByteReader* reader, uint32_t width) {
   }
 }
 
-arrow::Result<uint64_t> IntegralBits(const arrow::Scalar& scalar) {
-  switch (scalar.type->id()) {
+arrow::Result<uint64_t> ArrayIntegralBits(const arrow::Array& array, int64_t row) {
+  switch (array.type_id()) {
+    case arrow::Type::BOOL:
+      return static_cast<const arrow::BooleanArray&>(array).Value(row) ? uint64_t{1} : uint64_t{0};
     case arrow::Type::INT8:
-      return static_cast<uint64_t>(static_cast<const arrow::Int8Scalar&>(scalar).value);
+      return static_cast<uint64_t>(static_cast<const arrow::Int8Array&>(array).Value(row));
     case arrow::Type::INT16:
-      return static_cast<uint64_t>(static_cast<const arrow::Int16Scalar&>(scalar).value);
+      return static_cast<uint64_t>(static_cast<const arrow::Int16Array&>(array).Value(row));
     case arrow::Type::INT32:
-      return static_cast<uint64_t>(static_cast<const arrow::Int32Scalar&>(scalar).value);
+      return static_cast<uint64_t>(static_cast<const arrow::Int32Array&>(array).Value(row));
     case arrow::Type::INT64:
-      return static_cast<uint64_t>(static_cast<const arrow::Int64Scalar&>(scalar).value);
+      return static_cast<uint64_t>(static_cast<const arrow::Int64Array&>(array).Value(row));
     case arrow::Type::UINT8:
-      return static_cast<const arrow::UInt8Scalar&>(scalar).value;
+      return static_cast<const arrow::UInt8Array&>(array).Value(row);
     case arrow::Type::UINT16:
-      return static_cast<const arrow::UInt16Scalar&>(scalar).value;
+      return static_cast<const arrow::UInt16Array&>(array).Value(row);
     case arrow::Type::UINT32:
-      return static_cast<const arrow::UInt32Scalar&>(scalar).value;
+      return static_cast<const arrow::UInt32Array&>(array).Value(row);
     case arrow::Type::UINT64:
-      return static_cast<const arrow::UInt64Scalar&>(scalar).value;
+      return static_cast<const arrow::UInt64Array&>(array).Value(row);
     case arrow::Type::TIMESTAMP:
-      return static_cast<uint64_t>(static_cast<const arrow::TimestampScalar&>(scalar).value);
+      return static_cast<uint64_t>(static_cast<const arrow::TimestampArray&>(array).Value(row));
     default:
-      return InvalidCodec("FOR value is not integral");
+      return InvalidCodec("array value is not integral");
+  }
+}
+
+template <typename Value>
+int CompareValues(Value left, Value right) {
+  return left < right ? -1 : (left > right ? 1 : 0);
+}
+
+arrow::Result<int> CompareIntegralBits(const arrow::DataType& type, uint64_t left, uint64_t right) {
+  switch (type.id()) {
+    case arrow::Type::INT8:
+      return CompareValues(std::bit_cast<int8_t>(static_cast<uint8_t>(left)),
+                           std::bit_cast<int8_t>(static_cast<uint8_t>(right)));
+    case arrow::Type::INT16:
+      return CompareValues(std::bit_cast<int16_t>(static_cast<uint16_t>(left)),
+                           std::bit_cast<int16_t>(static_cast<uint16_t>(right)));
+    case arrow::Type::INT32:
+      return CompareValues(std::bit_cast<int32_t>(static_cast<uint32_t>(left)),
+                           std::bit_cast<int32_t>(static_cast<uint32_t>(right)));
+    case arrow::Type::INT64:
+    case arrow::Type::TIMESTAMP:
+      return CompareValues(std::bit_cast<int64_t>(left), std::bit_cast<int64_t>(right));
+    case arrow::Type::UINT8:
+      return CompareValues(static_cast<uint8_t>(left), static_cast<uint8_t>(right));
+    case arrow::Type::UINT16:
+      return CompareValues(static_cast<uint16_t>(left), static_cast<uint16_t>(right));
+    case arrow::Type::UINT32:
+      return CompareValues(static_cast<uint32_t>(left), static_cast<uint32_t>(right));
+    case arrow::Type::UINT64:
+      return CompareValues(left, right);
+    default:
+      return InvalidCodec("value is not integral or timestamp");
   }
 }
 
@@ -167,15 +202,6 @@ arrow::Result<uint64_t> MaximumBits(const FieldSpec& field) {
     default:
       return InvalidCodec("FOR type has no maximum");
   }
-}
-
-arrow::Result<std::shared_ptr<arrow::Scalar>> ScalarFromBits(const FieldSpec& field,
-                                                             uint64_t bits) {
-  ARROW_ASSIGN_OR_RAISE(const auto physical_type, PhysicalTypeFor(*field.type));
-  const uint32_t width = FixedWidthBytes(physical_type);
-  ByteWriter writer;
-  WriteWidth(&writer, bits, width);
-  return ParseScalar(field, writer.data());
 }
 
 arrow::Result<std::vector<uint64_t>> RowsToDecode(uint64_t row_count,
@@ -225,46 +251,67 @@ arrow::Result<std::shared_ptr<arrow::Array>> FinishScalars(
 arrow::Result<std::vector<uint8_t>> EncodeDictionary(const FieldSpec& field,
                                                      const arrow::Array& array) {
   const auto validity = EncodeValidity(array);
-  std::unordered_map<std::string, uint64_t> lookup;
-  std::vector<std::vector<uint8_t>> dictionary;
   std::vector<uint64_t> indices(static_cast<size_t>(array.length()), 0);
-  for (int64_t row = 0; row < array.length(); ++row) {
-    if (array.IsNull(row)) {
-      continue;
-    }
-    ARROW_ASSIGN_OR_RAISE(auto scalar, array.GetScalar(row));
-    ARROW_ASSIGN_OR_RAISE(auto bytes, SerializeScalar(field, *scalar));
-    const std::string key(bytes.begin(), bytes.end());
-    const auto [entry, inserted] = lookup.emplace(key, dictionary.size());
-    if (inserted) {
-      dictionary.push_back(std::move(bytes));
-    }
-    indices[static_cast<size_t>(row)] = entry->second;
-  }
-
-  const uint32_t index_width = IndexWidth(dictionary.size());
   ByteWriter dictionary_offsets;
   ByteWriter dictionary_values;
+  uint64_t dictionary_count = 0;
   if (IsVariable(field.type->id())) {
+    const auto& binary = static_cast<const arrow::BinaryArray&>(array);
+    std::unordered_map<std::string_view, uint64_t> lookup;
+    std::vector<std::string_view> dictionary;
+    lookup.reserve(static_cast<size_t>(std::min<int64_t>(array.length(), 1024)));
+    dictionary.reserve(static_cast<size_t>(std::min<int64_t>(array.length(), 1024)));
+    for (int64_t row = 0; row < array.length(); ++row) {
+      if (binary.IsNull(row)) {
+        continue;
+      }
+      const std::string_view value = binary.GetView(row);
+      const auto [entry, inserted] = lookup.emplace(value, dictionary.size());
+      if (inserted) {
+        dictionary.push_back(value);
+      }
+      indices[static_cast<size_t>(row)] = entry->second;
+    }
     uint64_t offset = 0;
     dictionary_offsets.WriteU64(0);
     for (const auto& value : dictionary) {
       ARROW_ASSIGN_OR_RAISE(offset, CheckedAdd(offset, static_cast<uint64_t>(value.size())));
-      dictionary_values.WriteBytes(value);
+      dictionary_values.WriteBytes(
+          std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(value.data()), value.size()));
       dictionary_offsets.WriteU64(offset);
     }
+    dictionary_count = static_cast<uint64_t>(dictionary.size());
   } else {
-    for (const auto& value : dictionary) {
-      dictionary_values.WriteBytes(value);
+    ARROW_ASSIGN_OR_RAISE(const auto physical_type, PhysicalTypeFor(*field.type));
+    const uint32_t width = FixedWidthBytes(physical_type);
+    std::unordered_map<uint64_t, uint64_t> lookup;
+    std::vector<uint64_t> dictionary;
+    lookup.reserve(static_cast<size_t>(std::min<int64_t>(array.length(), 1024)));
+    dictionary.reserve(static_cast<size_t>(std::min<int64_t>(array.length(), 1024)));
+    for (int64_t row = 0; row < array.length(); ++row) {
+      if (array.IsNull(row)) {
+        continue;
+      }
+      ARROW_ASSIGN_OR_RAISE(const uint64_t value, ArrayIntegralBits(array, row));
+      const auto [entry, inserted] = lookup.emplace(value, dictionary.size());
+      if (inserted) {
+        dictionary.push_back(value);
+      }
+      indices[static_cast<size_t>(row)] = entry->second;
     }
+    for (const auto& value : dictionary) {
+      WriteWidth(&dictionary_values, value, width);
+    }
+    dictionary_count = static_cast<uint64_t>(dictionary.size());
   }
+  const uint32_t index_width = IndexWidth(dictionary_count);
   ByteWriter encoded_indices;
   for (const uint64_t index : indices) {
     WriteWidth(&encoded_indices, index, index_width);
   }
   ByteWriter payload;
   payload.WriteU64(static_cast<uint64_t>(validity.size()));
-  payload.WriteU64(static_cast<uint64_t>(dictionary.size()));
+  payload.WriteU64(dictionary_count);
   payload.WriteU8(static_cast<uint8_t>(index_width));
   for (int reserved = 0; reserved < 7; ++reserved) {
     payload.WriteU8(0);
@@ -282,24 +329,24 @@ arrow::Result<std::vector<uint8_t>> EncodeDictionary(const FieldSpec& field,
 struct Run {
   uint64_t count = 0;
   bool valid = false;
-  std::vector<uint8_t> value;
+  uint64_t value = 0;
 };
 
 arrow::Result<std::vector<uint8_t>> EncodeRle(const FieldSpec& field, const arrow::Array& array) {
   ARROW_ASSIGN_OR_RAISE(const auto physical_type, PhysicalTypeFor(*field.type));
   const uint32_t width = FixedWidthBytes(physical_type);
   std::vector<Run> runs;
+  runs.reserve(static_cast<size_t>(std::min<int64_t>(array.length(), 1024)));
   for (int64_t row = 0; row < array.length(); ++row) {
     const bool valid = array.IsValid(row);
-    std::vector<uint8_t> value(width, 0);
+    uint64_t value = 0;
     if (valid) {
-      ARROW_ASSIGN_OR_RAISE(auto scalar, array.GetScalar(row));
-      ARROW_ASSIGN_OR_RAISE(value, SerializeScalar(field, *scalar));
+      ARROW_ASSIGN_OR_RAISE(value, ArrayIntegralBits(array, row));
     }
     if (!runs.empty() && runs.back().valid == valid && runs.back().value == value) {
       ++runs.back().count;
     } else {
-      runs.push_back({1, valid, std::move(value)});
+      runs.push_back({1, valid, value});
     }
   }
   ByteWriter payload;
@@ -311,7 +358,7 @@ arrow::Result<std::vector<uint8_t>> EncodeRle(const FieldSpec& field, const arro
     for (int reserved = 0; reserved < 7; ++reserved) {
       payload.WriteU8(0);
     }
-    payload.WriteBytes(run.value);
+    WriteWidth(&payload, run.value, width);
   }
   return std::move(payload).Finish();
 }
@@ -321,34 +368,31 @@ arrow::Result<std::vector<uint8_t>> EncodeForBitpack(const FieldSpec& field,
   ARROW_ASSIGN_OR_RAISE(const auto physical_type, PhysicalTypeFor(*field.type));
   const uint32_t width = FixedWidthBytes(physical_type);
   const auto validity = EncodeValidity(array);
-  std::shared_ptr<arrow::Scalar> base;
-  std::vector<std::shared_ptr<arrow::Scalar>> values(static_cast<size_t>(array.length()));
+  uint64_t base_bits = 0;
+  bool have_base = false;
   for (int64_t row = 0; row < array.length(); ++row) {
     if (array.IsNull(row)) {
       continue;
     }
-    ARROW_ASSIGN_OR_RAISE(auto value, array.GetScalar(row));
-    values[static_cast<size_t>(row)] = value;
-    if (!base) {
-      base = std::move(value);
+    ARROW_ASSIGN_OR_RAISE(const uint64_t bits, ArrayIntegralBits(array, row));
+    if (!have_base) {
+      base_bits = bits;
+      have_base = true;
     } else {
-      ARROW_ASSIGN_OR_RAISE(const int order, CompareScalars(*value, *base));
+      ARROW_ASSIGN_OR_RAISE(const int order, CompareIntegralBits(*field.type, bits, base_bits));
       if (order < 0) {
-        base = std::move(value);
+        base_bits = bits;
       }
     }
   }
-  if (!base) {
-    ARROW_ASSIGN_OR_RAISE(base, ScalarFromBits(field, 0));
-  }
-  ARROW_ASSIGN_OR_RAISE(const uint64_t base_bits, IntegralBits(*base));
-  std::vector<uint64_t> deltas(values.size(), 0);
+  std::vector<uint64_t> deltas(static_cast<size_t>(array.length()), 0);
   uint64_t maximum_delta = 0;
-  for (size_t row = 0; row < values.size(); ++row) {
-    if (values[row]) {
-      ARROW_ASSIGN_OR_RAISE(const uint64_t bits, IntegralBits(*values[row]));
-      deltas[row] = bits - base_bits;
-      maximum_delta = std::max(maximum_delta, deltas[row]);
+  for (int64_t row = 0; row < array.length(); ++row) {
+    if (array.IsValid(row)) {
+      ARROW_ASSIGN_OR_RAISE(const uint64_t bits, ArrayIntegralBits(array, row));
+      const uint64_t delta = bits - base_bits;
+      deltas[static_cast<size_t>(row)] = delta;
+      maximum_delta = std::max(maximum_delta, delta);
     }
   }
   const uint8_t bit_width = static_cast<uint8_t>(std::bit_width(maximum_delta));
@@ -370,19 +414,17 @@ arrow::Result<std::vector<uint8_t>> EncodeForBitpack(const FieldSpec& field,
       }
     }
   }
-  ARROW_ASSIGN_OR_RAISE(auto base_bytes, SerializeScalar(field, *base));
-  if (base_bytes.size() != width) {
-    return InvalidCodec("FOR base width mismatch");
-  }
+  ByteWriter base_bytes;
+  WriteWidth(&base_bytes, base_bits, width);
   ByteWriter payload;
   payload.WriteU64(static_cast<uint64_t>(validity.size()));
   payload.WriteU8(bit_width);
   for (int reserved = 0; reserved < 7; ++reserved) {
     payload.WriteU8(0);
   }
-  payload.WriteU64(static_cast<uint64_t>(base_bytes.size()));
+  payload.WriteU64(static_cast<uint64_t>(base_bytes.data().size()));
   payload.WriteU64(static_cast<uint64_t>(packed.size()));
-  payload.WriteBytes(base_bytes);
+  payload.WriteBytes(base_bytes.data());
   payload.WriteBytes(validity);
   payload.WriteBytes(packed);
   return std::move(payload).Finish();
@@ -557,6 +599,41 @@ arrow::Result<std::shared_ptr<arrow::Array>> DecodeRle(const FieldSpec& field,
   return FinishScalars(field, output);
 }
 
+template <typename Builder, typename Convert>
+arrow::Result<std::shared_ptr<arrow::Array>> DecodeForValues(const std::vector<uint64_t>& rows,
+                                                             std::span<const uint8_t> validity,
+                                                             std::span<const uint8_t> packed,
+                                                             uint8_t bit_width, uint64_t base_bits,
+                                                             uint64_t maximum_delta,
+                                                             Builder* builder, Convert convert) {
+  if (rows.size() > static_cast<size_t>(std::numeric_limits<int64_t>::max())) {
+    return InvalidCodec("decoded FOR array exceeds Arrow limit");
+  }
+  ARROW_RETURN_NOT_OK(builder->Reserve(static_cast<int64_t>(rows.size())));
+  for (const uint64_t row : rows) {
+    if (!IsValid(validity, row)) {
+      ARROW_RETURN_NOT_OK(builder->AppendNull());
+      continue;
+    }
+    uint64_t delta = 0;
+    for (uint32_t bit = 0; bit < bit_width; ++bit) {
+      const uint64_t position = row * bit_width + bit;
+      if ((packed[static_cast<size_t>(position / 8U)] &
+           static_cast<uint8_t>(1U << static_cast<uint32_t>(position % 8U))) != 0) {
+        delta |= uint64_t{1} << bit;
+      }
+    }
+    if (delta > maximum_delta) {
+      return InvalidCodec("FOR delta exceeds physical type domain");
+    }
+    ARROW_RETURN_NOT_OK(builder->Append(convert(base_bits + delta)));
+  }
+  std::shared_ptr<arrow::Array> result;
+  ARROW_RETURN_NOT_OK(builder->Finish(&result));
+  ARROW_RETURN_NOT_OK(result->ValidateFull());
+  return result;
+}
+
 arrow::Result<std::shared_ptr<arrow::Array>> DecodeForBitpack(
     const FieldSpec& field, const ColumnChunkMeta& chunk, std::span<const uint8_t> payload,
     const std::vector<uint64_t>* selection) {
@@ -591,33 +668,64 @@ arrow::Result<std::shared_ptr<arrow::Array>> DecodeForBitpack(
       return InvalidCodec("non-zero FOR padding bits");
     }
   }
-  ARROW_ASSIGN_OR_RAISE(auto base, ParseScalar(field, base_bytes));
-  ARROW_ASSIGN_OR_RAISE(const uint64_t base_bits, IntegralBits(*base));
+  ByteReader base_reader(base_bytes);
+  ARROW_ASSIGN_OR_RAISE(const uint64_t base_bits, ReadWidth(&base_reader, width));
   ARROW_ASSIGN_OR_RAISE(const uint64_t maximum_bits, MaximumBits(field));
   const uint64_t maximum_delta = maximum_bits - base_bits;
   ARROW_ASSIGN_OR_RAISE(auto rows, RowsToDecode(chunk.row_count, selection));
-  std::vector<std::shared_ptr<arrow::Scalar>> output;
-  output.reserve(rows.size());
-  for (const uint64_t row : rows) {
-    if (!IsValid(validity, row)) {
-      output.push_back(nullptr);
-      continue;
+  switch (field.type->id()) {
+    case arrow::Type::INT8: {
+      arrow::Int8Builder builder;
+      return DecodeForValues(
+          rows, validity, packed, bit_width, base_bits, maximum_delta, &builder,
+          [](uint64_t bits) { return std::bit_cast<int8_t>(static_cast<uint8_t>(bits)); });
     }
-    uint64_t delta = 0;
-    for (uint32_t bit = 0; bit < bit_width; ++bit) {
-      const uint64_t position = row * bit_width + bit;
-      if ((packed[static_cast<size_t>(position / 8U)] &
-           static_cast<uint8_t>(1U << static_cast<uint32_t>(position % 8U))) != 0) {
-        delta |= uint64_t{1} << bit;
-      }
+    case arrow::Type::INT16: {
+      arrow::Int16Builder builder;
+      return DecodeForValues(
+          rows, validity, packed, bit_width, base_bits, maximum_delta, &builder,
+          [](uint64_t bits) { return std::bit_cast<int16_t>(static_cast<uint16_t>(bits)); });
     }
-    if (delta > maximum_delta) {
-      return InvalidCodec("FOR delta exceeds physical type domain");
+    case arrow::Type::INT32: {
+      arrow::Int32Builder builder;
+      return DecodeForValues(
+          rows, validity, packed, bit_width, base_bits, maximum_delta, &builder,
+          [](uint64_t bits) { return std::bit_cast<int32_t>(static_cast<uint32_t>(bits)); });
     }
-    ARROW_ASSIGN_OR_RAISE(auto value, ScalarFromBits(field, base_bits + delta));
-    output.push_back(std::move(value));
+    case arrow::Type::INT64: {
+      arrow::Int64Builder builder;
+      return DecodeForValues(rows, validity, packed, bit_width, base_bits, maximum_delta, &builder,
+                             [](uint64_t bits) { return std::bit_cast<int64_t>(bits); });
+    }
+    case arrow::Type::UINT8: {
+      arrow::UInt8Builder builder;
+      return DecodeForValues(rows, validity, packed, bit_width, base_bits, maximum_delta, &builder,
+                             [](uint64_t bits) { return static_cast<uint8_t>(bits); });
+    }
+    case arrow::Type::UINT16: {
+      arrow::UInt16Builder builder;
+      return DecodeForValues(rows, validity, packed, bit_width, base_bits, maximum_delta, &builder,
+                             [](uint64_t bits) { return static_cast<uint16_t>(bits); });
+    }
+    case arrow::Type::UINT32: {
+      arrow::UInt32Builder builder;
+      return DecodeForValues(rows, validity, packed, bit_width, base_bits, maximum_delta, &builder,
+                             [](uint64_t bits) { return static_cast<uint32_t>(bits); });
+    }
+    case arrow::Type::UINT64: {
+      arrow::UInt64Builder builder;
+      return DecodeForValues(rows, validity, packed, bit_width, base_bits, maximum_delta, &builder,
+                             [](uint64_t bits) { return bits; });
+    }
+    case arrow::Type::TIMESTAMP: {
+      arrow::TimestampBuilder builder(std::static_pointer_cast<arrow::TimestampType>(field.type),
+                                      arrow::default_memory_pool());
+      return DecodeForValues(rows, validity, packed, bit_width, base_bits, maximum_delta, &builder,
+                             [](uint64_t bits) { return std::bit_cast<int64_t>(bits); });
+    }
+    default:
+      return InvalidCodec("FOR type is not integral or timestamp");
   }
-  return FinishScalars(field, output);
 }
 
 arrow::Result<uint64_t> PlainSampleSize(const FieldSpec& field, const arrow::Array& array,
@@ -697,54 +805,85 @@ arrow::Result<uint16_t> SelectEncoding(const FieldSpec& field, const arrow::Arra
     }
   };
 
-  std::unordered_set<std::string> distinct;
+  const bool supports_dictionary = EncodingSupports(kDictionaryEncodingId, *field.type);
+  const bool supports_rle = EncodingSupports(kRleEncodingId, *field.type);
+  const bool supports_for = EncodingSupports(kForBitpackEncodingId, *field.type);
+  if (!supports_dictionary && !supports_rle && !supports_for) {
+    return best_id;
+  }
+
   uint64_t dictionary_values_size = 0;
+  uint64_t dictionary_count = 0;
   uint64_t runs = 0;
-  std::string previous;
   bool previous_valid = false;
   bool first = true;
-  std::shared_ptr<arrow::Scalar> minimum;
-  std::shared_ptr<arrow::Scalar> maximum;
-  for (int64_t row = 0; row < sample_rows; ++row) {
-    const bool valid = array.IsValid(row);
-    std::string key;
-    if (valid) {
-      ARROW_ASSIGN_OR_RAISE(auto scalar, array.GetScalar(row));
-      ARROW_ASSIGN_OR_RAISE(auto bytes, SerializeScalar(field, *scalar));
-      key.assign(bytes.begin(), bytes.end());
-      const auto [entry, inserted] = distinct.insert(key);
-      if (inserted) {
-        dictionary_values_size += static_cast<uint64_t>(entry->size());
+  uint64_t minimum_bits = 0;
+  uint64_t maximum_bits = 0;
+  bool have_extrema = false;
+
+  if (IsVariable(field.type->id())) {
+    std::unordered_set<std::string_view> distinct;
+    std::string_view previous;
+    const auto& binary = static_cast<const arrow::BinaryArray&>(array);
+    for (int64_t row = 0; row < sample_rows; ++row) {
+      const bool valid = binary.IsValid(row);
+      const std::string_view value = valid ? binary.GetView(row) : std::string_view{};
+      if (valid && distinct.insert(value).second) {
+        dictionary_values_size += static_cast<uint64_t>(value.size());
       }
-      if (EncodingSupports(kForBitpackEncodingId, *field.type)) {
-        if (!minimum) {
-          minimum = scalar;
-          maximum = std::move(scalar);
-        } else {
-          ARROW_ASSIGN_OR_RAISE(const int min_order, CompareScalars(*scalar, *minimum));
-          ARROW_ASSIGN_OR_RAISE(const int max_order, CompareScalars(*scalar, *maximum));
-          if (min_order < 0) {
-            minimum = scalar;
-          }
-          if (max_order > 0) {
-            maximum = std::move(scalar);
+      if (first || valid != previous_valid || (valid && value != previous)) {
+        ++runs;
+      }
+      first = false;
+      previous_valid = valid;
+      previous = value;
+    }
+    dictionary_count = static_cast<uint64_t>(distinct.size());
+  } else {
+    std::unordered_set<uint64_t> distinct;
+    uint64_t previous = 0;
+    for (int64_t row = 0; row < sample_rows; ++row) {
+      const bool valid = array.IsValid(row);
+      uint64_t value = 0;
+      if (valid) {
+        ARROW_ASSIGN_OR_RAISE(value, ArrayIntegralBits(array, row));
+        if (supports_dictionary && distinct.insert(value).second) {
+          ARROW_ASSIGN_OR_RAISE(const auto physical_type, PhysicalTypeFor(*field.type));
+          dictionary_values_size += FixedWidthBytes(physical_type);
+        }
+        if (supports_for) {
+          if (!have_extrema) {
+            minimum_bits = value;
+            maximum_bits = value;
+            have_extrema = true;
+          } else {
+            ARROW_ASSIGN_OR_RAISE(const int min_order,
+                                  CompareIntegralBits(*field.type, value, minimum_bits));
+            ARROW_ASSIGN_OR_RAISE(const int max_order,
+                                  CompareIntegralBits(*field.type, value, maximum_bits));
+            if (min_order < 0) {
+              minimum_bits = value;
+            }
+            if (max_order > 0) {
+              maximum_bits = value;
+            }
           }
         }
       }
+      if (first || valid != previous_valid || (valid && value != previous)) {
+        ++runs;
+      }
+      first = false;
+      previous_valid = valid;
+      previous = value;
     }
-    if (first || valid != previous_valid || (valid && key != previous)) {
-      ++runs;
-    }
-    first = false;
-    previous_valid = valid;
-    previous = std::move(key);
+    dictionary_count = static_cast<uint64_t>(distinct.size());
   }
   const uint64_t validity_size = array.Slice(0, sample_rows)->null_count() == 0
                                      ? 0
                                      : static_cast<uint64_t>(sample_rows) / 8U +
                                            (static_cast<uint64_t>(sample_rows) % 8U != 0);
-  if (EncodingSupports(kDictionaryEncodingId, *field.type)) {
-    const uint64_t dictionary_count = distinct.size();
+  if (supports_dictionary) {
     uint64_t dictionary_size = 48U + validity_size + dictionary_values_size +
                                static_cast<uint64_t>(sample_rows) * IndexWidth(dictionary_count);
     if (IsVariable(field.type->id())) {
@@ -752,17 +891,15 @@ arrow::Result<uint16_t> SelectEncoding(const FieldSpec& field, const arrow::Arra
     }
     consider(kDictionaryEncodingId, dictionary_size);
   }
-  if (EncodingSupports(kRleEncodingId, *field.type)) {
+  if (supports_rle) {
     ARROW_ASSIGN_OR_RAISE(const auto physical_type, PhysicalTypeFor(*field.type));
     consider(kRleEncodingId, 16U + runs * (16U + FixedWidthBytes(physical_type)));
   }
-  if (EncodingSupports(kForBitpackEncodingId, *field.type)) {
+  if (supports_for) {
     ARROW_ASSIGN_OR_RAISE(const auto physical_type, PhysicalTypeFor(*field.type));
     uint8_t bit_width = 0;
-    if (minimum && maximum) {
-      ARROW_ASSIGN_OR_RAISE(const uint64_t min_bits, IntegralBits(*minimum));
-      ARROW_ASSIGN_OR_RAISE(const uint64_t max_bits, IntegralBits(*maximum));
-      const uint64_t delta = max_bits - min_bits;
+    if (have_extrema) {
+      const uint64_t delta = maximum_bits - minimum_bits;
       bit_width = static_cast<uint8_t>(std::bit_width(delta));
     }
     const uint64_t packed = (static_cast<uint64_t>(sample_rows) * bit_width + 7U) / 8U;

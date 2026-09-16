@@ -83,6 +83,7 @@ if(SNIFFER_BUILD_TESTS)
   enable_testing()
   add_executable(sniffer_core_tests tests/sniffer_core_test.cc)
   target_compile_features(sniffer_core_tests PRIVATE cxx_std_20)
+  target_include_directories(sniffer_core_tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
   target_link_libraries(sniffer_core_tests PRIVATE sniffer_core)
   if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
     target_compile_options(sniffer_core_tests PRIVATE -Wall -Wextra -Wpedantic -Wconversion)
@@ -144,6 +145,16 @@ if(SNIFFER_BUILD_BENCHMARK)
     sniffer_core_compression_benchmark PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/generated"
   )
   target_link_libraries(sniffer_core_compression_benchmark PRIVATE sniffer_core)
+
+  add_executable(sniffer_core_codec_benchmark bench/codec_benchmark.cc)
+  target_compile_features(sniffer_core_codec_benchmark PRIVATE cxx_std_20)
+  target_include_directories(
+    sniffer_core_codec_benchmark
+    PRIVATE
+      "${CMAKE_CURRENT_BINARY_DIR}/generated"
+      "${CMAKE_CURRENT_SOURCE_DIR}/src"
+  )
+  target_link_libraries(sniffer_core_codec_benchmark PRIVATE sniffer_core)
   if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
     target_compile_options(
       sniffer_core_performance_benchmark
@@ -151,6 +162,10 @@ if(SNIFFER_BUILD_BENCHMARK)
     )
     target_compile_options(
       sniffer_core_compression_benchmark
+      PRIVATE -Wall -Wextra -Wpedantic -Wconversion
+    )
+    target_compile_options(
+      sniffer_core_codec_benchmark
       PRIVATE -Wall -Wextra -Wpedantic -Wconversion
     )
   endif()
@@ -162,6 +177,10 @@ if(SNIFFER_BUILD_BENCHMARK)
     add_test(
       NAME sniffer_core_compression_benchmark_smoke
       COMMAND sniffer_core_compression_benchmark --rows=1024 --iterations=1 --row-group=128
+    )
+    add_test(
+      NAME sniffer_core_codec_benchmark_smoke
+      COMMAND sniffer_core_codec_benchmark --rows=1024 --iterations=1
     )
     add_test(
       NAME sniffer_core_performance_benchmark_json_smoke
@@ -177,6 +196,14 @@ if(SNIFFER_BUILD_BENCHMARK)
         "${CMAKE_COMMAND}"
         "-DBENCHMARK_EXECUTABLE=$<TARGET_FILE:sniffer_core_compression_benchmark>"
         -DEXPECTED_BENCHMARK=compression
+        -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/validate_benchmark_json.cmake"
+    )
+    add_test(
+      NAME sniffer_core_codec_benchmark_json_smoke
+      COMMAND
+        "${CMAKE_COMMAND}"
+        "-DBENCHMARK_EXECUTABLE=$<TARGET_FILE:sniffer_core_codec_benchmark>"
+        -DEXPECTED_BENCHMARK=codec
         -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/validate_benchmark_json.cmake"
     )
   endif()

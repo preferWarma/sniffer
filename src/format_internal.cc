@@ -22,6 +22,21 @@ arrow::Status InvalidFormat(std::string_view what) {
   return arrow::Status::Invalid("[sniffer.format.invalid] ", what);
 }
 
+constexpr std::array<uint32_t, 256> MakeCrc32cTable() {
+  std::array<uint32_t, 256> table{};
+  for (uint32_t index = 0; index < table.size(); ++index) {
+    uint32_t value = index;
+    for (int bit = 0; bit < 8; ++bit) {
+      const uint32_t mask = 0U - (value & 1U);
+      value = (value >> 1U) ^ (0x82F63B78U & mask);
+    }
+    table[index] = value;
+  }
+  return table;
+}
+
+inline constexpr auto kCrc32cTable = MakeCrc32cTable();
+
 arrow::Result<std::vector<uint8_t>> SerializeTypeParameters(const arrow::DataType& type) {
   ByteWriter writer;
   if (type.id() != arrow::Type::TIMESTAMP) {
@@ -161,11 +176,7 @@ arrow::Result<uint64_t> CheckedMultiply(uint64_t left, uint64_t right) {
 uint32_t Crc32c(std::span<const uint8_t> bytes, uint32_t previous) {
   uint32_t crc = ~previous;
   for (const uint8_t byte : bytes) {
-    crc ^= byte;
-    for (int bit = 0; bit < 8; ++bit) {
-      const uint32_t mask = 0U - (crc & 1U);
-      crc = (crc >> 1U) ^ (0x82F63B78U & mask);
-    }
+    crc = kCrc32cTable[(crc ^ byte) & 0xFFU] ^ (crc >> 8U);
   }
   return ~crc;
 }

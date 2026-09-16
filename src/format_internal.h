@@ -117,6 +117,7 @@ struct FooterTrailer {
 
 class ByteWriter {
  public:
+  void Reserve(size_t capacity) { data_.reserve(capacity); }
   void WriteU8(uint8_t value);
   void WriteU16(uint16_t value);
   void WriteU32(uint32_t value);

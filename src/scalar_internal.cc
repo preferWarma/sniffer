@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <string>
 #include <string_view>
+#include <type_traits>
 
 #include "format_internal.h"
 
@@ -53,6 +54,112 @@ uint64_t Mix64(uint64_t value) {
   value ^= value >> 27U;
   value *= 0x94D049BB133111EBULL;
   return value ^ (value >> 31U);
+}
+
+void HashByte(uint8_t byte, uint64_t* hash) {
+  *hash ^= byte;
+  *hash *= 1099511628211ULL;
+}
+
+template <typename Unsigned, typename EmitByte>
+void EmitLittleEndian(Unsigned value, EmitByte&& emit_byte) {
+  for (size_t index = 0; index < sizeof(Unsigned); ++index) {
+    emit_byte(static_cast<uint8_t>(value >> (index * 8U)));
+  }
+}
+
+arrow::Result<uint64_t> HashBytes(const FieldSpec& field, std::span<const uint8_t> bytes,
+                                  uint64_t seed) {
+  uint64_t hash = 1469598103934665603ULL ^ seed;
+  ARROW_ASSIGN_OR_RAISE(const auto physical_type, PhysicalTypeFor(*field.type));
+  HashByte(static_cast<uint8_t>(physical_type), &hash);
+  for (const uint8_t byte : bytes) {
+    HashByte(byte, &hash);
+  }
+  return Mix64(hash);
+}
+
+template <typename ArrayType, typename Unsigned>
+Unsigned ArrayBits(const arrow::Array& untyped, int64_t row) {
+  const auto value = static_cast<const ArrayType&>(untyped).Value(row);
+  if constexpr (std::is_same_v<decltype(value), Unsigned>) {
+    return value;
+  } else {
+    return std::bit_cast<Unsigned>(value);
+  }
+}
+
+template <typename EmitByte>
+arrow::Status EmitArrayValueBytes(const FieldSpec& field, const arrow::Array& array, int64_t row,
+                                  EmitByte&& emit_byte) {
+  if (!array.type()->Equals(field.type)) {
+    return InvalidScalar(field, "array type does not match field");
+  }
+  if (row < 0 || row >= array.length() || array.IsNull(row)) {
+    return InvalidScalar(field, "cannot hash missing array value");
+  }
+
+  ARROW_ASSIGN_OR_RAISE(const auto physical_type, PhysicalTypeFor(*field.type));
+  emit_byte(static_cast<uint8_t>(physical_type));
+  switch (field.type->id()) {
+    case arrow::Type::BOOL:
+      emit_byte(static_cast<const arrow::BooleanArray&>(array).Value(row) ? 1U : 0U);
+      break;
+    case arrow::Type::INT8:
+      EmitLittleEndian(ArrayBits<arrow::Int8Array, uint8_t>(array, row), emit_byte);
+      break;
+    case arrow::Type::INT16:
+      EmitLittleEndian(ArrayBits<arrow::Int16Array, uint16_t>(array, row), emit_byte);
+      break;
+    case arrow::Type::INT32:
+      EmitLittleEndian(ArrayBits<arrow::Int32Array, uint32_t>(array, row), emit_byte);
+      break;
+    case arrow::Type::INT64:
+      EmitLittleEndian(ArrayBits<arrow::Int64Array, uint64_t>(array, row), emit_byte);
+      break;
+    case arrow::Type::UINT8:
+      EmitLittleEndian(ArrayBits<arrow::UInt8Array, uint8_t>(array, row), emit_byte);
+      break;
+    case arrow::Type::UINT16:
+      EmitLittleEndian(ArrayBits<arrow::UInt16Array, uint16_t>(array, row), emit_byte);
+      break;
+    case arrow::Type::UINT32:
+      EmitLittleEndian(ArrayBits<arrow::UInt32Array, uint32_t>(array, row), emit_byte);
+      break;
+    case arrow::Type::UINT64:
+      EmitLittleEndian(ArrayBits<arrow::UInt64Array, uint64_t>(array, row), emit_byte);
+      break;
+    case arrow::Type::FLOAT: {
+      const float value = static_cast<const arrow::FloatArray&>(array).Value(row);
+      EmitLittleEndian(value == 0.0F ? 0U : std::bit_cast<uint32_t>(value), emit_byte);
+      break;
+    }
+    case arrow::Type::DOUBLE: {
+      const double value = static_cast<const arrow::DoubleArray&>(array).Value(row);
+      EmitLittleEndian(value == 0.0 ? 0ULL : std::bit_cast<uint64_t>(value), emit_byte);
+      break;
+    }
+    case arrow::Type::TIMESTAMP:
+      EmitLittleEndian(ArrayBits<arrow::TimestampArray, uint64_t>(array, row), emit_byte);
+      break;
+    case arrow::Type::STRING: {
+      const auto value = static_cast<const arrow::StringArray&>(array).GetView(row);
+      for (const char byte : value) {
+        emit_byte(static_cast<uint8_t>(byte));
+      }
+      break;
+    }
+    case arrow::Type::BINARY: {
+      const auto value = static_cast<const arrow::BinaryArray&>(array).GetView(row);
+      for (const char byte : value) {
+        emit_byte(static_cast<uint8_t>(byte));
+      }
+      break;
+    }
+    default:
+      return InvalidScalar(field, "unsupported array type");
+  }
+  return arrow::Status::OK();
 }
 
 }  // namespace
@@ -282,15 +389,28 @@ arrow::Result<uint64_t> HashScalar(const FieldSpec& field, const arrow::Scalar& 
     bytes.assign(8, 0);
   }
 
+  return HashBytes(field, bytes, seed);
+}
+
+arrow::Result<uint64_t> HashArrayValue(const FieldSpec& field, const arrow::Array& array,
+                                       int64_t row, uint64_t seed) {
   uint64_t hash = 1469598103934665603ULL ^ seed;
-  ARROW_ASSIGN_OR_RAISE(const auto physical_type, PhysicalTypeFor(*field.type));
-  hash ^= static_cast<uint64_t>(physical_type);
-  hash *= 1099511628211ULL;
-  for (const uint8_t byte : bytes) {
-    hash ^= byte;
-    hash *= 1099511628211ULL;
-  }
+  ARROW_RETURN_NOT_OK(
+      EmitArrayValueBytes(field, array, row, [&hash](uint8_t byte) { HashByte(byte, &hash); }));
   return Mix64(hash);
+}
+
+arrow::Result<std::pair<uint64_t, uint64_t>> HashArrayValuePair(const FieldSpec& field,
+                                                                const arrow::Array& array,
+                                                                int64_t row, uint64_t first_seed,
+                                                                uint64_t second_seed) {
+  uint64_t first = 1469598103934665603ULL ^ first_seed;
+  uint64_t second = 1469598103934665603ULL ^ second_seed;
+  ARROW_RETURN_NOT_OK(EmitArrayValueBytes(field, array, row, [&](uint8_t byte) {
+    HashByte(byte, &first);
+    HashByte(byte, &second);
+  }));
+  return std::pair<uint64_t, uint64_t>{Mix64(first), Mix64(second)};
 }
 
 }  // namespace sniffer::internal
