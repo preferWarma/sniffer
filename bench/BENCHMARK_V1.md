@@ -40,6 +40,10 @@ Row Group/RecordBatch 切分。多次执行后分别报告各阶段的中位数�
 
 ## 性能 benchmark
 
+> 本文固化的是 v1 自建 benchmark runner 的历史结果，下面的 `--rows`、`--iterations` 和
+> `--row-group` 命令仅适用于对应历史提交。当前主线已迁移到 Google Benchmark；请使用 README
+> 中的 `--benchmark_repetitions`、`--benchmark_filter` 和 `--benchmark_format=json`。
+
 复现命令：
 
 ```bash

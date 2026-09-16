@@ -4,6 +4,7 @@
 #include <arrow/util/byte_size.h>
 #include <arrow/util/compression.h>
 #include <arrow/util/config.h>
+#include <benchmark/benchmark.h>
 
 #include <algorithm>
 #include <chrono>
@@ -14,61 +15,30 @@
 #include <optional>
 #include <string>
 #include <string_view>
-#include <thread>
-#include <type_traits>
 #include <utility>
 #include <vector>
 
 #include "benchmark_build_config.h"
-#include "benchmark_stats.h"
 #include "sniffer/segment_reader.h"
 #include "sniffer/segment_writer.h"
 
 namespace {
 
-struct Options {
-  int64_t rows = 100000;
-  int iterations = 5;
-  uint32_t row_group_rows = 4096;
-  bool output_json = false;
-};
+constexpr int64_t kDefaultRows = 100000;
+constexpr uint32_t kDefaultRowGroupRows = 4096;
 
-Options ParseOptions(int argc, char** argv) {
-  Options options;
-  for (int index = 1; index < argc; ++index) {
-    const std::string argument = argv[index];
-    const auto parse = [&argument](std::string_view prefix, auto* destination) {
-      if (argument.starts_with(prefix)) {
-        using Value = std::remove_reference_t<decltype(*destination)>;
-        *destination = static_cast<Value>(std::stoll(argument.substr(prefix.size())));
-        return true;
-      }
-      return false;
-    };
-    if (parse("--rows=", &options.rows)) {
-      continue;
-    }
-    if (parse("--iterations=", &options.iterations)) {
-      continue;
-    }
-    if (parse("--row-group=", &options.row_group_rows)) {
-      continue;
-    }
-    if (argument == "--output-format=json") {
-      options.output_json = true;
-      continue;
-    }
-  }
-  options.rows = std::max<int64_t>(1, options.rows);
-  options.iterations = std::max(1, options.iterations);
-  options.row_group_rows = std::max<uint32_t>(1, options.row_group_rows);
-  return options;
-}
+enum class Format { kSniffer, kArrowIpc, kArrowIpcZstd };
 
 struct Scenario {
   std::string name;
   sniffer::TableSchema schema;
   std::shared_ptr<arrow::RecordBatch> batch;
+};
+
+struct CompressionMeasurement {
+  double encode_write_milliseconds = 0;
+  double decode_read_milliseconds = 0;
+  uint64_t file_bytes = 0;
 };
 
 template <typename Generator>
@@ -196,28 +166,12 @@ arrow::Status ValidateBatches(const arrow::RecordBatch& expected,
   return arrow::Status::OK();
 }
 
-struct CompressionMeasurement {
-  double encode_write_milliseconds = 0;
-  double decode_read_milliseconds = 0;
-  uint64_t file_bytes = 0;
-  sniffer::benchmark::SampleStats encode_write_stats;
-  sniffer::benchmark::SampleStats decode_read_stats;
-};
-
-struct ScenarioMeasurement {
-  std::string name;
-  uint64_t logical_bytes = 0;
-  CompressionMeasurement sniffer;
-  CompressionMeasurement arrow_ipc;
-  CompressionMeasurement arrow_ipc_zstd;
-};
-
 arrow::Result<CompressionMeasurement> MeasureSnifferOnce(const std::filesystem::path& path,
                                                          const Scenario& scenario,
-                                                         const Options& options) {
+                                                         uint32_t row_group_rows) {
   const auto encode_start = std::chrono::steady_clock::now();
   sniffer::LayoutPolicy policy;
-  policy.target_row_group_rows = options.row_group_rows;
+  policy.target_row_group_rows = row_group_rows;
   ARROW_ASSIGN_OR_RAISE(auto writer,
                         sniffer::SegmentWriter::Open(path.string(), scenario.schema, policy));
   ARROW_RETURN_NOT_OK(writer->Append(scenario.batch));
@@ -230,18 +184,14 @@ arrow::Result<CompressionMeasurement> MeasureSnifferOnce(const std::filesystem::
   ARROW_ASSIGN_OR_RAISE(auto batches, reader->ReadAll());
   const auto decode_end = std::chrono::steady_clock::now();
   ARROW_RETURN_NOT_OK(ValidateBatches(*scenario.batch, batches));
-  CompressionMeasurement measurement;
-  measurement.encode_write_milliseconds =
-      std::chrono::duration<double, std::milli>(encode_end - encode_start).count();
-  measurement.decode_read_milliseconds =
-      std::chrono::duration<double, std::milli>(decode_end - decode_start).count();
-  measurement.file_bytes = file_bytes;
-  return measurement;
+  return CompressionMeasurement{
+      std::chrono::duration<double, std::milli>(encode_end - encode_start).count(),
+      std::chrono::duration<double, std::milli>(decode_end - decode_start).count(), file_bytes};
 }
 
 arrow::Result<CompressionMeasurement> MeasureArrowIpcOnce(const std::filesystem::path& path,
                                                           const Scenario& scenario,
-                                                          const Options& options,
+                                                          uint32_t row_group_rows,
                                                           arrow::Compression::type compression) {
   const auto encode_start = std::chrono::steady_clock::now();
   ARROW_ASSIGN_OR_RAISE(auto output, arrow::io::FileOutputStream::Open(path.string()));
@@ -253,9 +203,8 @@ arrow::Result<CompressionMeasurement> MeasureArrowIpcOnce(const std::filesystem:
   }
   ARROW_ASSIGN_OR_RAISE(
       auto writer, arrow::ipc::MakeFileWriter(output, scenario.batch->schema(), write_options));
-  for (int64_t offset = 0; offset < scenario.batch->num_rows(); offset += options.row_group_rows) {
-    const int64_t length =
-        std::min<int64_t>(options.row_group_rows, scenario.batch->num_rows() - offset);
+  for (int64_t offset = 0; offset < scenario.batch->num_rows(); offset += row_group_rows) {
+    const int64_t length = std::min<int64_t>(row_group_rows, scenario.batch->num_rows() - offset);
     ARROW_RETURN_NOT_OK(writer->WriteRecordBatch(*scenario.batch->Slice(offset, length)));
   }
   ARROW_RETURN_NOT_OK(writer->Close());
@@ -277,270 +226,128 @@ arrow::Result<CompressionMeasurement> MeasureArrowIpcOnce(const std::filesystem:
   ARROW_RETURN_NOT_OK(input->Close());
   const auto decode_end = std::chrono::steady_clock::now();
   ARROW_RETURN_NOT_OK(ValidateBatches(*scenario.batch, batches));
-  CompressionMeasurement measurement;
-  measurement.encode_write_milliseconds =
-      std::chrono::duration<double, std::milli>(encode_end - encode_start).count();
-  measurement.decode_read_milliseconds =
-      std::chrono::duration<double, std::milli>(decode_end - decode_start).count();
-  measurement.file_bytes = file_bytes;
-  return measurement;
+  return CompressionMeasurement{
+      std::chrono::duration<double, std::milli>(encode_end - encode_start).count(),
+      std::chrono::duration<double, std::milli>(decode_end - decode_start).count(), file_bytes};
 }
 
-template <typename Runner>
-arrow::Result<CompressionMeasurement> MedianMeasurement(int iterations, Runner&& runner) {
-  std::vector<double> encode_write_times;
-  std::vector<double> decode_read_times;
-  encode_write_times.reserve(static_cast<size_t>(iterations));
-  decode_read_times.reserve(static_cast<size_t>(iterations));
+std::string_view FormatName(Format format) {
+  switch (format) {
+    case Format::kSniffer:
+      return "Sniffer";
+    case Format::kArrowIpc:
+      return "ArrowIPC";
+    case Format::kArrowIpcZstd:
+      return "ArrowIPC_ZSTD";
+  }
+  return "Unknown";
+}
+
+void RunCompressionBenchmark(benchmark::State& state, const Scenario& scenario, Format format,
+                             uint32_t row_group_rows) {
+  const int64_t logical_size = arrow::util::TotalBufferSize(*scenario.batch);
+  if (logical_size <= 0) {
+    state.SkipWithError("logical size must be positive");
+    return;
+  }
+  const auto path =
+      std::filesystem::temp_directory_path() /
+      ("sniffer_compression_" + scenario.name + "_" + std::string(FormatName(format)) + ".tmp");
+  double encode_total = 0;
+  double decode_total = 0;
   uint64_t file_bytes = 0;
-  for (int iteration = 0; iteration < iterations; ++iteration) {
-    ARROW_ASSIGN_OR_RAISE(auto measurement, runner());
-    if (iteration != 0 && measurement.file_bytes != file_bytes) {
-      return arrow::Status::Invalid("compression benchmark produced a non-deterministic file size");
+  for (auto _ : state) {
+    (void)_;
+    arrow::Result<CompressionMeasurement> result = arrow::Status::Invalid("unknown format");
+    if (format == Format::kSniffer) {
+      result = MeasureSnifferOnce(path, scenario, row_group_rows);
+    } else {
+      result = MeasureArrowIpcOnce(path, scenario, row_group_rows,
+                                   format == Format::kArrowIpc ? arrow::Compression::UNCOMPRESSED
+                                                               : arrow::Compression::ZSTD);
     }
-    file_bytes = measurement.file_bytes;
-    encode_write_times.push_back(measurement.encode_write_milliseconds);
-    decode_read_times.push_back(measurement.decode_read_milliseconds);
-  }
-  CompressionMeasurement result;
-  result.encode_write_stats = sniffer::benchmark::SummarizeSamples(std::move(encode_write_times));
-  result.decode_read_stats = sniffer::benchmark::SummarizeSamples(std::move(decode_read_times));
-  result.encode_write_milliseconds = result.encode_write_stats.p50;
-  result.decode_read_milliseconds = result.decode_read_stats.p50;
-  result.file_bytes = file_bytes;
-  return result;
-}
-
-double LogicalMiBPerSecond(uint64_t logical_bytes, double milliseconds) {
-  constexpr double kBytesPerMiB = 1024.0 * 1024.0;
-  return static_cast<double>(logical_bytes) / kBytesPerMiB / (milliseconds / 1000.0);
-}
-
-void AccumulateSamples(const sniffer::benchmark::SampleStats& source,
-                       std::vector<double>* destination) {
-  if (destination->empty()) {
-    destination->resize(source.samples.size(), 0);
-  }
-  for (size_t index = 0; index < source.samples.size(); ++index) {
-    (*destination)[index] += source.samples[index];
-  }
-}
-
-void FinalizeAggregate(std::vector<double> encode_write_samples,
-                       std::vector<double> decode_read_samples,
-                       CompressionMeasurement* measurement) {
-  measurement->encode_write_stats =
-      sniffer::benchmark::SummarizeSamples(std::move(encode_write_samples));
-  measurement->decode_read_stats =
-      sniffer::benchmark::SummarizeSamples(std::move(decode_read_samples));
-  measurement->encode_write_milliseconds = measurement->encode_write_stats.p50;
-  measurement->decode_read_milliseconds = measurement->decode_read_stats.p50;
-}
-
-void PrintResult(std::string_view scenario, std::string_view format, int64_t rows,
-                 uint64_t logical_bytes, const CompressionMeasurement& measurement) {
-  std::cout << "scenario=" << scenario << " format=" << format << " rows=" << rows
-            << " logical_bytes=" << logical_bytes << " file_bytes=" << measurement.file_bytes
-            << " compression_ratio="
-            << static_cast<double>(logical_bytes) / static_cast<double>(measurement.file_bytes)
-            << " storage_ratio="
-            << static_cast<double>(measurement.file_bytes) / static_cast<double>(logical_bytes)
-            << " bytes_per_value="
-            << static_cast<double>(measurement.file_bytes) / static_cast<double>(rows)
-            << " encode_write_ms=" << measurement.encode_write_milliseconds
-            << " encode_write_mib_per_second="
-            << LogicalMiBPerSecond(logical_bytes, measurement.encode_write_milliseconds)
-            << " decode_read_ms=" << measurement.decode_read_milliseconds
-            << " decode_read_mib_per_second="
-            << LogicalMiBPerSecond(logical_bytes, measurement.decode_read_milliseconds);
-  sniffer::benchmark::PrintSampleStats(std::cout, "encode_write", measurement.encode_write_stats);
-  sniffer::benchmark::PrintSampleStats(std::cout, "decode_read", measurement.decode_read_stats);
-  std::cout << '\n';
-}
-
-void PrintJsonMeasurement(std::string_view format, int64_t rows, uint64_t logical_bytes,
-                          const CompressionMeasurement& measurement) {
-  std::cout << "{\"format\":";
-  sniffer::benchmark::PrintJsonString(std::cout, format);
-  std::cout << ",\"rows\":" << rows << ",\"logical_bytes\":" << logical_bytes
-            << ",\"file_bytes\":" << measurement.file_bytes << ",\"compression_ratio\":"
-            << static_cast<double>(logical_bytes) / static_cast<double>(measurement.file_bytes)
-            << ",\"storage_ratio\":"
-            << static_cast<double>(measurement.file_bytes) / static_cast<double>(logical_bytes)
-            << ",\"bytes_per_value\":"
-            << static_cast<double>(measurement.file_bytes) / static_cast<double>(rows)
-            << ",\"encode_write_ms\":" << measurement.encode_write_milliseconds
-            << ",\"encode_write_mib_per_second\":"
-            << LogicalMiBPerSecond(logical_bytes, measurement.encode_write_milliseconds)
-            << ",\"decode_read_ms\":" << measurement.decode_read_milliseconds
-            << ",\"decode_read_mib_per_second\":"
-            << LogicalMiBPerSecond(logical_bytes, measurement.decode_read_milliseconds)
-            << ",\"encode_write_stats\":";
-  sniffer::benchmark::PrintJsonSampleStats(std::cout, measurement.encode_write_stats);
-  std::cout << ",\"decode_read_stats\":";
-  sniffer::benchmark::PrintJsonSampleStats(std::cout, measurement.decode_read_stats);
-  std::cout << '}';
-}
-
-void PrintJsonScenario(const ScenarioMeasurement& scenario, int64_t rows) {
-  std::cout << "    {\"scenario\":";
-  sniffer::benchmark::PrintJsonString(std::cout, scenario.name);
-  std::cout << ",\"formats\":[";
-  PrintJsonMeasurement("sniffer", rows, scenario.logical_bytes, scenario.sniffer);
-  std::cout << ',';
-  PrintJsonMeasurement("arrow_ipc", rows, scenario.logical_bytes, scenario.arrow_ipc);
-  std::cout << ',';
-  PrintJsonMeasurement("arrow_ipc_zstd", rows, scenario.logical_bytes, scenario.arrow_ipc_zstd);
-  std::cout << "]}";
-}
-
-void PrintJsonReport(int argc, char** argv, const Options& options, std::string_view build_mode,
-                     const std::vector<ScenarioMeasurement>& scenarios, int64_t total_rows,
-                     uint64_t total_logical, const CompressionMeasurement& total_sniffer,
-                     const CompressionMeasurement& total_ipc,
-                     const CompressionMeasurement& total_ipc_zstd) {
-  std::cout << "{\n  \"benchmark\":\"compression\",\n  \"source_revision\":";
-  sniffer::benchmark::PrintJsonString(std::cout, SNIFFER_BENCHMARK_SOURCE_REVISION);
-  std::cout << ",\n  \"compiler\":";
-  sniffer::benchmark::PrintJsonString(std::cout, SNIFFER_BENCHMARK_COMPILER);
-  std::cout << ",\n  \"arrow_version\":";
-  sniffer::benchmark::PrintJsonString(std::cout, ARROW_VERSION_STRING);
-  std::cout << ",\n  \"build_mode\":";
-  sniffer::benchmark::PrintJsonString(std::cout, build_mode);
-  std::cout << ",\n  \"command_arguments\":";
-  sniffer::benchmark::PrintJsonArguments(std::cout, argc, argv);
-  std::cout << ",\n  \"configuration\":{\"rows_per_scenario\":" << options.rows
-            << ",\"row_group_rows\":" << options.row_group_rows
-            << ",\"iterations\":" << options.iterations
-            << ",\"execution\":\"single_thread\",\"timing\":"
-               "\"encode_write_and_decode_read\",\"hardware_threads\":"
-            << std::thread::hardware_concurrency() << "},\n  \"scenarios\":[\n";
-  for (size_t index = 0; index < scenarios.size(); ++index) {
-    if (index != 0) {
-      std::cout << ",\n";
+    if (!result.ok()) {
+      state.SkipWithError(result.status().ToString());
+      break;
     }
-    PrintJsonScenario(scenarios[index], options.rows);
+    if (file_bytes != 0 && file_bytes != result->file_bytes) {
+      state.SkipWithError("non-deterministic benchmark file size");
+      break;
+    }
+    file_bytes = result->file_bytes;
+    encode_total += result->encode_write_milliseconds;
+    decode_total += result->decode_read_milliseconds;
+    state.SetIterationTime((result->encode_write_milliseconds + result->decode_read_milliseconds) /
+                           1000.0);
+    benchmark::DoNotOptimize(result->file_bytes);
   }
-  std::cout << "\n  ],\n  \"aggregate\":{\"formats\":[";
-  PrintJsonMeasurement("sniffer", total_rows, total_logical, total_sniffer);
-  std::cout << ',';
-  PrintJsonMeasurement("arrow_ipc", total_rows, total_logical, total_ipc);
-  std::cout << ',';
-  PrintJsonMeasurement("arrow_ipc_zstd", total_rows, total_logical, total_ipc_zstd);
-  std::cout << "]},\n  \"comparisons\":{\"sniffer_size_ratio_vs_arrow_ipc\":"
-            << static_cast<double>(total_sniffer.file_bytes) /
-                   static_cast<double>(total_ipc.file_bytes)
-            << ",\"sniffer_size_ratio_vs_arrow_ipc_zstd\":"
-            << static_cast<double>(total_sniffer.file_bytes) /
-                   static_cast<double>(total_ipc_zstd.file_bytes)
-            << "}\n}\n";
+
+  std::error_code ignored;
+  std::filesystem::remove(path, ignored);
+  if (state.iterations() == 0 || file_bytes == 0) {
+    return;
+  }
+  const double iterations = static_cast<double>(state.iterations());
+  state.counters["encode_write_ms"] = encode_total / iterations;
+  state.counters["decode_read_ms"] = decode_total / iterations;
+  state.counters["logical_bytes"] = static_cast<double>(logical_size);
+  state.counters["file_bytes"] = static_cast<double>(file_bytes);
+  state.counters["compression_ratio"] =
+      static_cast<double>(logical_size) / static_cast<double>(file_bytes);
+  state.counters["storage_ratio"] =
+      static_cast<double>(file_bytes) / static_cast<double>(logical_size);
+  state.counters["bytes_per_value"] =
+      static_cast<double>(file_bytes) / static_cast<double>(scenario.batch->num_rows());
+  state.SetBytesProcessed(state.iterations() * logical_size);
+  state.SetItemsProcessed(state.iterations() * scenario.batch->num_rows());
 }
 
-arrow::Result<int> RunBenchmark(int argc, char** argv) {
-  const Options options = ParseOptions(argc, argv);
-  ARROW_ASSIGN_OR_RAISE(auto scenarios, MakeScenarios(options.rows));
-  const auto temporary = std::filesystem::temp_directory_path();
-  uint64_t total_logical = 0;
-  CompressionMeasurement total_sniffer;
-  CompressionMeasurement total_ipc;
-  CompressionMeasurement total_ipc_zstd;
-  std::vector<double> total_sniffer_encode_samples;
-  std::vector<double> total_sniffer_decode_samples;
-  std::vector<double> total_ipc_encode_samples;
-  std::vector<double> total_ipc_decode_samples;
-  std::vector<double> total_ipc_zstd_encode_samples;
-  std::vector<double> total_ipc_zstd_decode_samples;
-  std::vector<ScenarioMeasurement> results;
-  results.reserve(scenarios.size());
-#ifdef NDEBUG
-  constexpr std::string_view kBuildMode = "release";
-#else
-  constexpr std::string_view kBuildMode = "debug";
-#endif
-  if (!options.output_json) {
-    std::cout << "benchmark=compression row_group_rows=" << options.row_group_rows
-              << " iterations=" << options.iterations
-              << " execution=single_thread build_mode=" << kBuildMode
-              << " hardware_threads=" << std::thread::hardware_concurrency()
-              << " timing=encode_write_and_decode_read scenarios=" << scenarios.size()
-              << " source_revision=" << SNIFFER_BENCHMARK_SOURCE_REVISION << " compiler=\""
-              << SNIFFER_BENCHMARK_COMPILER << "\""
-              << " arrow_version=" << ARROW_VERSION_STRING << '\n';
-  }
+arrow::Status RegisterBenchmarks() {
+  ARROW_ASSIGN_OR_RAISE(auto scenarios, MakeScenarios(kDefaultRows));
   for (const auto& scenario : scenarios) {
-    const auto sniffer_path = temporary / ("sniffer_compression_" + scenario.name + ".seg");
-    const auto ipc_path = temporary / ("sniffer_compression_" + scenario.name + ".arrow");
-    const auto ipc_zstd_path = temporary / ("sniffer_compression_" + scenario.name + ".zstd.arrow");
-    const int64_t logical_size = arrow::util::TotalBufferSize(*scenario.batch);
-    if (logical_size <= 0) {
-      return arrow::Status::Invalid("compression benchmark logical size must be positive");
+    for (const auto format : {Format::kSniffer, Format::kArrowIpc, Format::kArrowIpcZstd}) {
+      const std::string name =
+          "Compression/" + scenario.name + "/" + std::string(FormatName(format));
+      benchmark::RegisterBenchmark(name.c_str(),
+                                   [scenario, format](benchmark::State& state) {
+                                     RunCompressionBenchmark(state, scenario, format,
+                                                             kDefaultRowGroupRows);
+                                   })
+          ->UseManualTime()
+          ->Unit(benchmark::kMillisecond);
     }
-    const uint64_t logical_bytes = static_cast<uint64_t>(logical_size);
-    ARROW_ASSIGN_OR_RAISE(const auto sniffer, MedianMeasurement(options.iterations, [&]() {
-                            return MeasureSnifferOnce(sniffer_path, scenario, options);
-                          }));
-    ARROW_ASSIGN_OR_RAISE(const auto ipc, MedianMeasurement(options.iterations, [&]() {
-                            return MeasureArrowIpcOnce(ipc_path, scenario, options,
-                                                       arrow::Compression::UNCOMPRESSED);
-                          }));
-    ARROW_ASSIGN_OR_RAISE(const auto ipc_zstd, MedianMeasurement(options.iterations, [&]() {
-                            return MeasureArrowIpcOnce(ipc_zstd_path, scenario, options,
-                                                       arrow::Compression::ZSTD);
-                          }));
-    if (!options.output_json) {
-      PrintResult(scenario.name, "sniffer", options.rows, logical_bytes, sniffer);
-      PrintResult(scenario.name, "arrow_ipc", options.rows, logical_bytes, ipc);
-      PrintResult(scenario.name, "arrow_ipc_zstd", options.rows, logical_bytes, ipc_zstd);
-    }
-    results.push_back({scenario.name, logical_bytes, sniffer, ipc, ipc_zstd});
-    total_logical += logical_bytes;
-    total_sniffer.file_bytes += sniffer.file_bytes;
-    AccumulateSamples(sniffer.encode_write_stats, &total_sniffer_encode_samples);
-    AccumulateSamples(sniffer.decode_read_stats, &total_sniffer_decode_samples);
-    total_ipc.file_bytes += ipc.file_bytes;
-    AccumulateSamples(ipc.encode_write_stats, &total_ipc_encode_samples);
-    AccumulateSamples(ipc.decode_read_stats, &total_ipc_decode_samples);
-    total_ipc_zstd.file_bytes += ipc_zstd.file_bytes;
-    AccumulateSamples(ipc_zstd.encode_write_stats, &total_ipc_zstd_encode_samples);
-    AccumulateSamples(ipc_zstd.decode_read_stats, &total_ipc_zstd_decode_samples);
+  }
+  return arrow::Status::OK();
+}
 
-    std::error_code ignored;
-    std::filesystem::remove(sniffer_path, ignored);
-    std::filesystem::remove(ipc_path, ignored);
-    std::filesystem::remove(ipc_zstd_path, ignored);
-  }
-  FinalizeAggregate(std::move(total_sniffer_encode_samples),
-                    std::move(total_sniffer_decode_samples), &total_sniffer);
-  FinalizeAggregate(std::move(total_ipc_encode_samples), std::move(total_ipc_decode_samples),
-                    &total_ipc);
-  FinalizeAggregate(std::move(total_ipc_zstd_encode_samples),
-                    std::move(total_ipc_zstd_decode_samples), &total_ipc_zstd);
-  const int64_t total_rows = options.rows * static_cast<int64_t>(scenarios.size());
-  if (options.output_json) {
-    PrintJsonReport(argc, argv, options, kBuildMode, results, total_rows, total_logical,
-                    total_sniffer, total_ipc, total_ipc_zstd);
-  } else {
-    PrintResult("all", "sniffer", total_rows, total_logical, total_sniffer);
-    PrintResult("all", "arrow_ipc", total_rows, total_logical, total_ipc);
-    PrintResult("all", "arrow_ipc_zstd", total_rows, total_logical, total_ipc_zstd);
-    std::cout << "scenario=all sniffer_size_ratio_vs_arrow_ipc="
-              << static_cast<double>(total_sniffer.file_bytes) /
-                     static_cast<double>(total_ipc.file_bytes)
-              << " sniffer_size_ratio_vs_arrow_ipc_zstd="
-              << static_cast<double>(total_sniffer.file_bytes) /
-                     static_cast<double>(total_ipc_zstd.file_bytes)
-              << '\n';
-  }
-  return 0;
+void AddBenchmarkContext() {
+#ifdef NDEBUG
+  benchmark::AddCustomContext("build_mode", "release");
+#else
+  benchmark::AddCustomContext("build_mode", "debug");
+#endif
+  benchmark::AddCustomContext("source_revision", SNIFFER_BENCHMARK_SOURCE_REVISION);
+  benchmark::AddCustomContext("compiler", SNIFFER_BENCHMARK_COMPILER);
+  benchmark::AddCustomContext("arrow_version", ARROW_VERSION_STRING);
+  benchmark::AddCustomContext("rows", std::to_string(kDefaultRows));
+  benchmark::AddCustomContext("row_group_rows", std::to_string(kDefaultRowGroupRows));
+  benchmark::AddCustomContext("logical_size", "Arrow TotalBufferSize of input RecordBatch");
 }
 
 }  // namespace
 
 int main(int argc, char** argv) {
-  auto result = RunBenchmark(argc, argv);
-  if (!result.ok()) {
-    std::cerr << result.status().ToString() << '\n';
+  const auto status = RegisterBenchmarks();
+  if (!status.ok()) {
+    std::cerr << status.ToString() << '\n';
     return 1;
   }
-  return *result;
+  AddBenchmarkContext();
+  benchmark::Initialize(&argc, argv);
+  if (benchmark::ReportUnrecognizedArguments(argc, argv)) {
+    return 1;
+  }
+  benchmark::RunSpecifiedBenchmarks();
+  benchmark::Shutdown();
+  return 0;
 }

@@ -53,14 +53,17 @@ Writer 默认根据固定样本和固定阈值确定性选择编码，也可以�
 - CMake 3.20+
 - `pkg-config`
 - Apache Arrow C++
+- GoogleTest（构建测试时）
+- Google Benchmark（构建 benchmark 时）
 
 macOS/Homebrew 环境可以使用：
 
 ```bash
-brew install apache-arrow cmake pkg-config
+brew install apache-arrow cmake pkg-config googletest google-benchmark
 ```
 
-其他平台只需确保 `pkg-config --cflags --libs arrow` 能找到 Arrow C++。
+其他平台需确保 `pkg-config --cflags --libs arrow` 能找到 Arrow C++，且 CMake 的
+`find_package(GTest CONFIG)` 与 `find_package(benchmark CONFIG)` 能找到对应包。
 
 ## 构建与测试
 
@@ -68,6 +71,12 @@ brew install apache-arrow cmake pkg-config
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j
 ctest --test-dir build --output-on-failure
+```
+
+核心测试使用 GoogleTest，并通过 CTest 自动发现；例如只运行编码相关用例：
+
+```bash
+./build/sniffer_core_tests --gtest_filter='SnifferCoreTest.*Encoding*'
 ```
 
 可用构建选项：
@@ -151,18 +160,19 @@ ARROW_ASSIGN_OR_RAISE(auto batches, reader->Scan(std::move(plan), metrics));
 
 ```bash
 ./build/sniffer_core_performance_benchmark \
-  --rows=100000 \
-  --iterations=5 \
-  --row-group=4096
+  --benchmark_repetitions=5 \
+  --benchmark_report_aggregates_only=true
 ```
 
-两个 benchmark 均可追加 `--output-format=json`，输出包含原始样本、统计值、源码 revision、
-编译器、Arrow 版本和完整命令参数的机器可读结果；默认保持逐行文本格式。
+三个 benchmark 均使用 Google Benchmark 的标准 CLI。可用 `--benchmark_filter` 选择 case，使用
+`--benchmark_repetitions` 重复测量，并追加 `--benchmark_format=json` 输出机器可读结果。JSON 的
+`context` 包含源码 revision、编译器、Arrow 版本与构建模式；`benchmarks` 包含标准时间、重复聚合
+和 Sniffer 自定义 counters。
 
 性能对照使用相同输入、相同 Row Group/RecordBatch 切分和相同过滤投影，同时运行 Sniffer、
-未压缩 Arrow IPC 和 Arrow IPC + ZSTD。输出包括各阶段的原始耗时、P50、P95、最小值、变异
-系数、吞吐、文件大小、剪枝和读取字节数。输入 batch 构造不计时，编码、压缩和解压均设置为
-单线程。
+未压缩 Arrow IPC 和 Arrow IPC + ZSTD。输出包括 Google Benchmark 的时间与吞吐，以及写入、
+扫描、文件大小、剪枝、读取字节数和 Sniffer 内部分阶段 counters。输入 batch 构造不计时，编码、
+压缩和解压均设置为单线程。
 固定的测试口径、环境和参考结果见 [`bench/BENCHMARK_V1.md`](bench/BENCHMARK_V1.md)。
 
 压缩能力 benchmark 分别测试递增整数、窄值域整数、长 RLE、含 null 偏斜整数、低基数
@@ -170,34 +180,32 @@ ARROW_ASSIGN_OR_RAISE(auto batches, reader->Scan(std::move(plan), metrics));
 
 ```bash
 ./build/sniffer_core_compression_benchmark \
-  --rows=100000 \
-  --iterations=5 \
-  --row-group=4096
+  --benchmark_repetitions=5 \
+  --benchmark_report_aggregates_only=true
 ```
 
 压缩比定义为 `logical_bytes / file_bytes`，数值越大表示空间效率越高；`storage_ratio` 定义为
 `file_bytes / logical_bytes`，数值越小越好。`logical_bytes` 使用 Arrow 对输入 RecordBatch 引用
 的去重 buffer 总大小，不包含 schema 和文件级元数据。压缩 benchmark 会逐个场景回读并比较
 完整 Arrow batch。每种格式重复运行并报告压缩写入和解压读取的中位耗时，以及按逻辑数据量
-计算的 MiB/s；输入构造、文件大小查询和回读正确性比较不计时。合计结果的耗时是各场景中位
-耗时之和。
+计算的吞吐；输入构造、文件大小查询和回读正确性比较不计时。每个数据分布与格式组合都是
+独立 case，例如可用 `--benchmark_filter='Compression/narrow_int64/.*'` 直接比较三种格式。
 
 纯内存 codec benchmark 单独测量生产代码中的 Plain、Dictionary、RLE 和 FOR + Bitpack，排除
 文件 I/O、索引和 checksum：
 
 ```bash
 ./build/sniffer_core_codec_benchmark \
-  --rows=100000 \
-  --iterations=7
+  --benchmark_repetitions=7 \
+  --benchmark_report_aggregates_only=true
 ```
 
-它报告各 codec 的 payload 大小、压缩比、encode/decode 吞吐和原始统计样本；round-trip 比较在
-计时区间外执行。该 benchmark 同样支持 `--output-format=json`。
+每个 codec 的 Encode 与 Decode 都是独立 case，报告 payload 大小、压缩比、吞吐和标准重复聚合；
+round-trip 比较在计时区间外执行。
 
-性能 benchmark 的 Sniffer 结果还包含 `phase_stats`：writer 的索引、编码选择、编码、checksum
+性能 benchmark 的 Sniffer 结果还包含 phase counters：writer 的索引、编码选择、编码、checksum
 与文件写入，以及 reader 的元数据、chunk I/O/checksum、解码、谓词、投影和 batch materialization。
-各阶段与总耗时一样报告所有轮次样本、P50/P95/min/CV；这些计时只在 benchmark 显式传入 metrics
-对象时启用。
+这些计时只在 benchmark 显式传入 metrics 对象时启用。
 
 Arrow IPC 对照使用类型化循环完成过滤和 projection materialization，但不提供 Sniffer 的编码
 选择、Row Group 索引、剪枝和各层 checksum，因此它是序列化/通用压缩基线，不是功能完全

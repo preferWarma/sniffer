@@ -161,6 +161,17 @@ v0.2 聚焦现有 Segment writer、reader、codec、scan 和文件 I/O 路径的
 
 ## 11. 执行记录
 
+### 2026-09-16：GoogleTest 与 Google Benchmark 迁移
+
+- 核心测试改由 GoogleTest 注册、过滤和报告，并通过 `gtest_discover_tests()` 映射到 CTest；原有
+  37 个测试场景及 Arrow `Result<T>` 辅助断言语义保持不变。
+- 性能、压缩和 codec 三个程序改用 Google Benchmark 管理迭代、重复测量、聚合、过滤和 JSON
+  输出；删除自建样本统计与 JSON writer。
+- 保留 Sniffer/Arrow IPC/Arrow IPC + ZSTD 对照、压缩比和内部阶段指标，并以 benchmark counters
+  输出。codec 的 Encode 与 Decode 拆分为独立 case，便于单独过滤和 profile。
+- CTest smoke 使用 `--benchmark_dry_run`，并校验标准 Google Benchmark JSON 的 `context`、
+  `benchmarks` 和构建复现元数据。
+
 ### 2026-09-16：测量输出与 writer 重复编码
 
 - 两个 benchmark 已保留每轮原始耗时，并输出 min、P50、P95 和变异系数；旧的 `*_ms` 字段

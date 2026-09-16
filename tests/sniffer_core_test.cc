@@ -1,5 +1,6 @@
 #include <arrow/api.h>
 #include <arrow/array/concatenate.h>
+#include <gtest/gtest.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -9,8 +10,6 @@
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
-#include <functional>
-#include <iostream>
 #include <limits>
 #include <optional>
 #include <random>
@@ -2024,62 +2023,47 @@ void TestDeterministicEncodingSelector() {
 
 }  // namespace
 
-int main() {
-  const std::vector<std::pair<std::string, std::function<void()>>> tests = {
-      {"round_trip_all_types_and_multiple_row_groups", TestRoundTripAllTypesAndMultipleRowGroups},
-      {"empty_batch_round_trip", TestEmptyBatchRoundTrip},
-      {"deterministic_output", TestDeterministicOutput},
-      {"deterministic_randomized_round_trip", TestDeterministicRandomizedRoundTrip},
-      {"header_corruption", TestHeaderCorruptionFailsOpen},
-      {"unsupported_version", TestUnsupportedVersionFailsOpen},
-      {"footer_corruption", TestFooterCorruptionFailsOpen},
-      {"chunk_corruption", TestChunkCorruptionFailsLazyReadAndFileVerify},
-      {"invalid_chunk_offset", TestInvalidChunkOffsetFailsOpen},
-      {"unknown_encoding", TestUnknownEncodingFailsOpen},
-      {"unknown_physical_type", TestUnknownPhysicalTypeFailsOpen},
-      {"truncation", TestTruncationFailsOpen},
-      {"schema_and_writer_state", TestSchemaAndWriterStateValidation},
-      {"io_plan_projection_predicates_limit", TestIOPlanProjectionPredicatesLimitAndBatching},
-      {"bloom_prunes_without_chunk_reads", TestBloomPrunesWithoutChunkReads},
-      {"sort_key_range_and_empty_projection", TestSortKeyRangeAndEmptyProjection},
-      {"all_predicate_operations_and_nulls", TestAllPredicateOperationsAndNulls},
-      {"typed_predicates_and_projection_all_types", TestTypedPredicatesAndProjectionAllTypes},
-      {"optional_phase_metrics", TestOptionalPhaseMetrics},
-      {"sequential_fallback_and_plan_validation", TestSequentialFallbackAndPlanValidation},
-      {"sort_order_and_index_corruption", TestSortOrderAndIndexCorruptionValidation},
-      {"bloom_signed_zero_equality", TestBloomSignedZeroEquality},
-      {"legacy_footer_scan_fallback", TestLegacyFooterScanFallback},
-      {"unknown_index_version", TestUnknownIndexVersionFailsExplicitly},
-      {"composite_sort_key_range", TestCompositeSortKeyRange},
-      {"forced_dictionary_round_trip_and_scan", TestForcedDictionaryRoundTripAndScan},
-      {"typed_array_hash_matches_scalar_reference", TestTypedArrayHashMatchesScalarReference},
-      {"plain_variable_bulk_copy_matches_reference", TestPlainVariableBulkCopyMatchesReference},
-      {"plain_selected_typed_decode_matches_reference",
-       TestPlainSelectedTypedDecodeMatchesReference},
-      {"typed_dictionary_matches_scalar_reference", TestTypedDictionaryMatchesScalarReference},
-      {"non_plain_selection_validation", TestNonPlainSelectionValidation},
-      {"forced_rle_round_trip_and_scan", TestForcedRleRoundTripAndScan},
-      {"typed_rle_matches_scalar_reference", TestTypedRleMatchesScalarReference},
-      {"forced_for_bitpack_round_trip_and_scan", TestForcedForBitpackRoundTripAndScan},
-      {"typed_for_matches_scalar_reference", TestTypedForMatchesScalarReference},
-      {"forced_encoding_randomized_property", TestForcedEncodingRandomizedProperty},
-      {"deterministic_encoding_selector", TestDeterministicEncodingSelector},
-  };
+#define SNIFFER_TEST(name, function) \
+  TEST(SnifferCoreTest, name) { function(); }
 
-  int failures = 0;
-  for (const auto& [name, test] : tests) {
-    try {
-      test();
-      std::cout << "PASS " << name << '\n';
-    } catch (const std::exception& error) {
-      ++failures;
-      std::cerr << "FAIL " << name << ": " << error.what() << '\n';
-    }
-  }
-  if (failures != 0) {
-    std::cerr << failures << " test(s) failed\n";
-    return 1;
-  }
-  std::cout << tests.size() << " test(s) passed\n";
-  return 0;
-}
+SNIFFER_TEST(RoundTripAllTypesAndMultipleRowGroups, TestRoundTripAllTypesAndMultipleRowGroups)
+SNIFFER_TEST(EmptyBatchRoundTrip, TestEmptyBatchRoundTrip)
+SNIFFER_TEST(DeterministicOutput, TestDeterministicOutput)
+SNIFFER_TEST(DeterministicRandomizedRoundTrip, TestDeterministicRandomizedRoundTrip)
+SNIFFER_TEST(HeaderCorruptionFailsOpen, TestHeaderCorruptionFailsOpen)
+SNIFFER_TEST(UnsupportedVersionFailsOpen, TestUnsupportedVersionFailsOpen)
+SNIFFER_TEST(FooterCorruptionFailsOpen, TestFooterCorruptionFailsOpen)
+SNIFFER_TEST(ChunkCorruptionFailsLazyReadAndFileVerify,
+             TestChunkCorruptionFailsLazyReadAndFileVerify)
+SNIFFER_TEST(InvalidChunkOffsetFailsOpen, TestInvalidChunkOffsetFailsOpen)
+SNIFFER_TEST(UnknownEncodingFailsOpen, TestUnknownEncodingFailsOpen)
+SNIFFER_TEST(UnknownPhysicalTypeFailsOpen, TestUnknownPhysicalTypeFailsOpen)
+SNIFFER_TEST(TruncationFailsOpen, TestTruncationFailsOpen)
+SNIFFER_TEST(SchemaAndWriterStateValidation, TestSchemaAndWriterStateValidation)
+SNIFFER_TEST(IOPlanProjectionPredicatesLimitAndBatching,
+             TestIOPlanProjectionPredicatesLimitAndBatching)
+SNIFFER_TEST(BloomPrunesWithoutChunkReads, TestBloomPrunesWithoutChunkReads)
+SNIFFER_TEST(SortKeyRangeAndEmptyProjection, TestSortKeyRangeAndEmptyProjection)
+SNIFFER_TEST(AllPredicateOperationsAndNulls, TestAllPredicateOperationsAndNulls)
+SNIFFER_TEST(TypedPredicatesAndProjectionAllTypes, TestTypedPredicatesAndProjectionAllTypes)
+SNIFFER_TEST(OptionalPhaseMetrics, TestOptionalPhaseMetrics)
+SNIFFER_TEST(SequentialFallbackAndPlanValidation, TestSequentialFallbackAndPlanValidation)
+SNIFFER_TEST(SortOrderAndIndexCorruptionValidation, TestSortOrderAndIndexCorruptionValidation)
+SNIFFER_TEST(BloomSignedZeroEquality, TestBloomSignedZeroEquality)
+SNIFFER_TEST(LegacyFooterScanFallback, TestLegacyFooterScanFallback)
+SNIFFER_TEST(UnknownIndexVersionFailsExplicitly, TestUnknownIndexVersionFailsExplicitly)
+SNIFFER_TEST(CompositeSortKeyRange, TestCompositeSortKeyRange)
+SNIFFER_TEST(ForcedDictionaryRoundTripAndScan, TestForcedDictionaryRoundTripAndScan)
+SNIFFER_TEST(TypedArrayHashMatchesScalarReference, TestTypedArrayHashMatchesScalarReference)
+SNIFFER_TEST(PlainVariableBulkCopyMatchesReference, TestPlainVariableBulkCopyMatchesReference)
+SNIFFER_TEST(PlainSelectedTypedDecodeMatchesReference, TestPlainSelectedTypedDecodeMatchesReference)
+SNIFFER_TEST(TypedDictionaryMatchesScalarReference, TestTypedDictionaryMatchesScalarReference)
+SNIFFER_TEST(NonPlainSelectionValidation, TestNonPlainSelectionValidation)
+SNIFFER_TEST(ForcedRleRoundTripAndScan, TestForcedRleRoundTripAndScan)
+SNIFFER_TEST(TypedRleMatchesScalarReference, TestTypedRleMatchesScalarReference)
+SNIFFER_TEST(ForcedForBitpackRoundTripAndScan, TestForcedForBitpackRoundTripAndScan)
+SNIFFER_TEST(TypedForMatchesScalarReference, TestTypedForMatchesScalarReference)
+SNIFFER_TEST(ForcedEncodingRandomizedProperty, TestForcedEncodingRandomizedProperty)
+SNIFFER_TEST(DeterministicEncodingSelector, TestDeterministicEncodingSelector)
+
+#undef SNIFFER_TEST

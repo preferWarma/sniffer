@@ -1,59 +1,24 @@
 #include <arrow/api.h>
 #include <arrow/util/byte_size.h>
 #include <arrow/util/config.h>
+#include <benchmark/benchmark.h>
 
 #include <algorithm>
-#include <chrono>
 #include <cstdint>
 #include <iostream>
 #include <memory>
 #include <optional>
+#include <span>
 #include <string>
-#include <string_view>
-#include <thread>
-#include <type_traits>
 #include <utility>
 #include <vector>
 
 #include "benchmark_build_config.h"
-#include "benchmark_stats.h"
 #include "codec_internal.h"
 
 namespace {
 
-struct Options {
-  int64_t rows = 100000;
-  int iterations = 7;
-  bool output_json = false;
-};
-
-Options ParseOptions(int argc, char** argv) {
-  Options options;
-  for (int index = 1; index < argc; ++index) {
-    const std::string argument = argv[index];
-    const auto parse = [&argument](std::string_view prefix, auto* destination) {
-      if (argument.starts_with(prefix)) {
-        using Value = std::remove_reference_t<decltype(*destination)>;
-        *destination = static_cast<Value>(std::stoll(argument.substr(prefix.size())));
-        return true;
-      }
-      return false;
-    };
-    if (parse("--rows=", &options.rows)) {
-      continue;
-    }
-    if (parse("--iterations=", &options.iterations)) {
-      continue;
-    }
-    if (argument == "--output-format=json") {
-      options.output_json = true;
-      continue;
-    }
-  }
-  options.rows = std::max<int64_t>(1, options.rows);
-  options.iterations = std::max(1, options.iterations);
-  return options;
-}
+constexpr int64_t kDefaultRows = 100000;
 
 struct Scenario {
   std::string name;
@@ -181,18 +146,25 @@ arrow::Result<std::vector<Scenario>> MakeScenarios(int64_t rows) {
   return scenarios;
 }
 
-struct Measurement {
-  uint64_t logical_bytes = 0;
-  uint64_t encoded_bytes = 0;
-  sniffer::benchmark::SampleStats encode_stats;
-  sniffer::benchmark::SampleStats decode_stats;
-};
-
 arrow::Result<std::vector<uint8_t>> Encode(const Scenario& scenario) {
   if (scenario.encoding_id == sniffer::internal::kPlainEncodingId) {
     return sniffer::internal::EncodePlain(scenario.field, *scenario.array);
   }
   return sniffer::internal::EncodeNonPlain(scenario.encoding_id, scenario.field, *scenario.array);
+}
+
+arrow::Result<sniffer::internal::ColumnChunkMeta> MakeChunk(const Scenario& scenario,
+                                                            uint64_t payload_size) {
+  ARROW_ASSIGN_OR_RAISE(const auto physical_type,
+                        sniffer::internal::PhysicalTypeFor(*scenario.field.type));
+  sniffer::internal::ColumnChunkMeta chunk;
+  chunk.field_id = scenario.field.field_id;
+  chunk.physical_type = physical_type;
+  chunk.encoding_id = scenario.encoding_id;
+  chunk.row_count = static_cast<uint64_t>(scenario.array->length());
+  chunk.null_count = static_cast<uint64_t>(scenario.array->null_count());
+  chunk.length = payload_size;
+  return chunk;
 }
 
 arrow::Result<std::shared_ptr<arrow::Array>> Decode(const Scenario& scenario,
@@ -208,156 +180,131 @@ arrow::Result<std::shared_ptr<arrow::Array>> Decode(const Scenario& scenario,
   return sniffer::internal::DecodeNonPlain(scenario.field, chunk, payload);
 }
 
-arrow::Result<Measurement> Measure(const Scenario& scenario, int iterations) {
-  std::vector<double> encode_times;
-  std::vector<double> decode_times;
-  encode_times.reserve(static_cast<size_t>(iterations));
-  decode_times.reserve(static_cast<size_t>(iterations));
-  ARROW_ASSIGN_OR_RAISE(const auto physical_type,
-                        sniffer::internal::PhysicalTypeFor(*scenario.field.type));
-  sniffer::internal::ColumnChunkMeta chunk;
-  chunk.field_id = scenario.field.field_id;
-  chunk.physical_type = physical_type;
-  chunk.encoding_id = scenario.encoding_id;
-  chunk.row_count = static_cast<uint64_t>(scenario.array->length());
-  chunk.null_count = static_cast<uint64_t>(scenario.array->null_count());
-  uint64_t encoded_bytes = 0;
-  for (int iteration = 0; iteration < iterations; ++iteration) {
-    const auto encode_start = std::chrono::steady_clock::now();
-    ARROW_ASSIGN_OR_RAISE(auto payload, Encode(scenario));
-    const auto encode_end = std::chrono::steady_clock::now();
-    if (iteration != 0 && payload.size() != encoded_bytes) {
-      return arrow::Status::Invalid("codec benchmark produced a non-deterministic payload size");
-    }
-    encoded_bytes = static_cast<uint64_t>(payload.size());
-    chunk.length = encoded_bytes;
-
-    const auto decode_start = std::chrono::steady_clock::now();
-    ARROW_ASSIGN_OR_RAISE(auto decoded, Decode(scenario, chunk, payload));
-    const auto decode_end = std::chrono::steady_clock::now();
-    const auto& expected = scenario.expected ? scenario.expected : scenario.array;
-    if (!decoded->Equals(*expected)) {
-      return arrow::Status::Invalid("codec benchmark round-trip mismatch for ", scenario.name);
-    }
-    encode_times.push_back(
-        std::chrono::duration<double, std::milli>(encode_end - encode_start).count());
-    decode_times.push_back(
-        std::chrono::duration<double, std::milli>(decode_end - decode_start).count());
+arrow::Status ValidateRoundTrip(const Scenario& scenario, std::span<const uint8_t> payload) {
+  ARROW_ASSIGN_OR_RAISE(auto chunk, MakeChunk(scenario, payload.size()));
+  ARROW_ASSIGN_OR_RAISE(auto decoded, Decode(scenario, chunk, payload));
+  const auto& expected = scenario.expected ? scenario.expected : scenario.array;
+  if (!decoded->Equals(*expected)) {
+    return arrow::Status::Invalid("codec benchmark round-trip mismatch for ", scenario.name);
   }
-  const int64_t logical_size = arrow::util::TotalBufferSize(*scenario.array);
-  if (logical_size <= 0) {
-    return arrow::Status::Invalid("codec benchmark logical size must be positive");
+  return arrow::Status::OK();
+}
+
+void SetCodecCounters(benchmark::State& state, const Scenario& scenario, int64_t logical_bytes,
+                      uint64_t encoded_bytes) {
+  state.counters["input_rows"] = static_cast<double>(scenario.array->length());
+  state.counters["output_rows"] = static_cast<double>(
+      scenario.expected ? scenario.expected->length() : scenario.array->length());
+  state.counters["encoding_id"] = static_cast<double>(scenario.encoding_id);
+  state.counters["logical_bytes"] = static_cast<double>(logical_bytes);
+  state.counters["encoded_bytes"] = static_cast<double>(encoded_bytes);
+  state.counters["compression_ratio"] =
+      static_cast<double>(logical_bytes) / static_cast<double>(encoded_bytes);
+  state.SetBytesProcessed(state.iterations() * logical_bytes);
+  state.SetItemsProcessed(state.iterations() * scenario.array->length());
+}
+
+void RunEncodeBenchmark(benchmark::State& state, const Scenario& scenario) {
+  const int64_t logical_bytes = arrow::util::TotalBufferSize(*scenario.array);
+  auto baseline = Encode(scenario);
+  if (!baseline.ok()) {
+    state.SkipWithError(baseline.status().ToString());
+    return;
   }
-  return Measurement{static_cast<uint64_t>(logical_size), encoded_bytes,
-                     sniffer::benchmark::SummarizeSamples(std::move(encode_times)),
-                     sniffer::benchmark::SummarizeSamples(std::move(decode_times))};
+  const auto validation = ValidateRoundTrip(scenario, *baseline);
+  if (!validation.ok()) {
+    state.SkipWithError(validation.ToString());
+    return;
+  }
+  const uint64_t encoded_bytes = static_cast<uint64_t>(baseline->size());
+  for (auto _ : state) {
+    (void)_;
+    auto payload = Encode(scenario);
+    if (!payload.ok()) {
+      state.SkipWithError(payload.status().ToString());
+      break;
+    }
+    if (payload->size() != encoded_bytes) {
+      state.SkipWithError("codec produced a non-deterministic payload size");
+      break;
+    }
+    benchmark::DoNotOptimize(payload->data());
+    benchmark::ClobberMemory();
+  }
+  SetCodecCounters(state, scenario, logical_bytes, encoded_bytes);
 }
 
-double LogicalMiBPerSecond(uint64_t logical_bytes, double milliseconds) {
-  constexpr double kBytesPerMiB = 1024.0 * 1024.0;
-  return static_cast<double>(logical_bytes) / kBytesPerMiB / (milliseconds / 1000.0);
+void RunDecodeBenchmark(benchmark::State& state, const Scenario& scenario) {
+  const int64_t logical_bytes = arrow::util::TotalBufferSize(*scenario.array);
+  auto payload = Encode(scenario);
+  if (!payload.ok()) {
+    state.SkipWithError(payload.status().ToString());
+    return;
+  }
+  auto chunk = MakeChunk(scenario, payload->size());
+  if (!chunk.ok()) {
+    state.SkipWithError(chunk.status().ToString());
+    return;
+  }
+  const auto validation = ValidateRoundTrip(scenario, *payload);
+  if (!validation.ok()) {
+    state.SkipWithError(validation.ToString());
+    return;
+  }
+  for (auto _ : state) {
+    (void)_;
+    auto decoded = Decode(scenario, *chunk, *payload);
+    if (!decoded.ok()) {
+      state.SkipWithError(decoded.status().ToString());
+      break;
+    }
+    benchmark::DoNotOptimize(decoded->get());
+    benchmark::ClobberMemory();
+  }
+  SetCodecCounters(state, scenario, logical_bytes, static_cast<uint64_t>(payload->size()));
 }
 
-void PrintTextResult(const Scenario& scenario, const Measurement& measurement) {
-  std::cout << "scenario=" << scenario.name << " encoding=" << scenario.encoding_name
-            << " encoding_id=" << scenario.encoding_id << " rows=" << scenario.array->length()
-            << " output_rows="
-            << (scenario.expected ? scenario.expected->length() : scenario.array->length())
-            << " logical_bytes=" << measurement.logical_bytes
-            << " encoded_bytes=" << measurement.encoded_bytes << " compression_ratio="
-            << static_cast<double>(measurement.logical_bytes) /
-                   static_cast<double>(measurement.encoded_bytes)
-            << " encode_ms=" << measurement.encode_stats.p50 << " encode_mib_per_second="
-            << LogicalMiBPerSecond(measurement.logical_bytes, measurement.encode_stats.p50)
-            << " decode_ms=" << measurement.decode_stats.p50 << " decode_mib_per_second="
-            << LogicalMiBPerSecond(measurement.logical_bytes, measurement.decode_stats.p50);
-  sniffer::benchmark::PrintSampleStats(std::cout, "encode", measurement.encode_stats);
-  sniffer::benchmark::PrintSampleStats(std::cout, "decode", measurement.decode_stats);
-  std::cout << '\n';
-}
-
-void PrintJsonResult(const Scenario& scenario, const Measurement& measurement) {
-  std::cout << "    {\"scenario\":";
-  sniffer::benchmark::PrintJsonString(std::cout, scenario.name);
-  std::cout << ",\"encoding\":";
-  sniffer::benchmark::PrintJsonString(std::cout, scenario.encoding_name);
-  std::cout << ",\"encoding_id\":" << scenario.encoding_id
-            << ",\"rows\":" << scenario.array->length() << ",\"output_rows\":"
-            << (scenario.expected ? scenario.expected->length() : scenario.array->length())
-            << ",\"logical_bytes\":" << measurement.logical_bytes
-            << ",\"encoded_bytes\":" << measurement.encoded_bytes << ",\"compression_ratio\":"
-            << static_cast<double>(measurement.logical_bytes) /
-                   static_cast<double>(measurement.encoded_bytes)
-            << ",\"encode_mib_per_second\":"
-            << LogicalMiBPerSecond(measurement.logical_bytes, measurement.encode_stats.p50)
-            << ",\"decode_mib_per_second\":"
-            << LogicalMiBPerSecond(measurement.logical_bytes, measurement.decode_stats.p50)
-            << ",\"encode_stats\":";
-  sniffer::benchmark::PrintJsonSampleStats(std::cout, measurement.encode_stats);
-  std::cout << ",\"decode_stats\":";
-  sniffer::benchmark::PrintJsonSampleStats(std::cout, measurement.decode_stats);
-  std::cout << '}';
-}
-
-arrow::Result<int> RunBenchmark(int argc, char** argv) {
-  const Options options = ParseOptions(argc, argv);
-  ARROW_ASSIGN_OR_RAISE(auto scenarios, MakeScenarios(options.rows));
-  std::vector<Measurement> measurements;
-  measurements.reserve(scenarios.size());
+arrow::Status RegisterBenchmarks() {
+  ARROW_ASSIGN_OR_RAISE(auto scenarios, MakeScenarios(kDefaultRows));
   for (const auto& scenario : scenarios) {
-    ARROW_ASSIGN_OR_RAISE(auto measurement, Measure(scenario, options.iterations));
-    measurements.push_back(std::move(measurement));
+    const std::string prefix = "Codec/" + scenario.name + "/";
+    benchmark::RegisterBenchmark((prefix + "Encode").c_str(), [scenario](benchmark::State& state) {
+      RunEncodeBenchmark(state, scenario);
+    })->Unit(benchmark::kMicrosecond);
+    benchmark::RegisterBenchmark((prefix + "Decode").c_str(), [scenario](benchmark::State& state) {
+      RunDecodeBenchmark(state, scenario);
+    })->Unit(benchmark::kMicrosecond);
   }
+  return arrow::Status::OK();
+}
+
+void AddBenchmarkContext() {
 #ifdef NDEBUG
-  constexpr std::string_view kBuildMode = "release";
+  benchmark::AddCustomContext("build_mode", "release");
 #else
-  constexpr std::string_view kBuildMode = "debug";
+  benchmark::AddCustomContext("build_mode", "debug");
 #endif
-  if (options.output_json) {
-    std::cout << "{\n  \"benchmark\":\"codec\",\n  \"source_revision\":";
-    sniffer::benchmark::PrintJsonString(std::cout, SNIFFER_BENCHMARK_SOURCE_REVISION);
-    std::cout << ",\n  \"compiler\":";
-    sniffer::benchmark::PrintJsonString(std::cout, SNIFFER_BENCHMARK_COMPILER);
-    std::cout << ",\n  \"arrow_version\":";
-    sniffer::benchmark::PrintJsonString(std::cout, ARROW_VERSION_STRING);
-    std::cout << ",\n  \"build_mode\":";
-    sniffer::benchmark::PrintJsonString(std::cout, kBuildMode);
-    std::cout << ",\n  \"command_arguments\":";
-    sniffer::benchmark::PrintJsonArguments(std::cout, argc, argv);
-    std::cout << ",\n  \"configuration\":{\"rows\":" << options.rows
-              << ",\"iterations\":" << options.iterations
-              << ",\"execution\":\"single_thread\",\"scope\":"
-                 "\"memory_only_no_io_index_or_checksum\",\"hardware_threads\":"
-              << std::thread::hardware_concurrency() << "},\n  \"scenarios\":[\n";
-    for (size_t index = 0; index < scenarios.size(); ++index) {
-      if (index != 0) {
-        std::cout << ",\n";
-      }
-      PrintJsonResult(scenarios[index], measurements[index]);
-    }
-    std::cout << "\n  ]\n}\n";
-  } else {
-    std::cout << "benchmark=codec rows=" << options.rows << " iterations=" << options.iterations
-              << " execution=single_thread scope=memory_only_no_io_index_or_checksum"
-              << " build_mode=" << kBuildMode
-              << " hardware_threads=" << std::thread::hardware_concurrency()
-              << " source_revision=" << SNIFFER_BENCHMARK_SOURCE_REVISION << " compiler=\""
-              << SNIFFER_BENCHMARK_COMPILER << "\""
-              << " arrow_version=" << ARROW_VERSION_STRING << '\n';
-    for (size_t index = 0; index < scenarios.size(); ++index) {
-      PrintTextResult(scenarios[index], measurements[index]);
-    }
-  }
-  return 0;
+  benchmark::AddCustomContext("source_revision", SNIFFER_BENCHMARK_SOURCE_REVISION);
+  benchmark::AddCustomContext("compiler", SNIFFER_BENCHMARK_COMPILER);
+  benchmark::AddCustomContext("arrow_version", ARROW_VERSION_STRING);
+  benchmark::AddCustomContext("rows", std::to_string(kDefaultRows));
+  benchmark::AddCustomContext("scope", "memory_only_no_io_index_or_checksum");
 }
 
 }  // namespace
 
 int main(int argc, char** argv) {
-  auto result = RunBenchmark(argc, argv);
-  if (!result.ok()) {
-    std::cerr << result.status().ToString() << '\n';
+  const auto status = RegisterBenchmarks();
+  if (!status.ok()) {
+    std::cerr << status.ToString() << '\n';
     return 1;
   }
-  return *result;
+  AddBenchmarkContext();
+  benchmark::Initialize(&argc, argv);
+  if (benchmark::ReportUnrecognizedArguments(argc, argv)) {
+    return 1;
+  }
+  benchmark::RunSpecifiedBenchmarks();
+  benchmark::Shutdown();
+  return 0;
 }
