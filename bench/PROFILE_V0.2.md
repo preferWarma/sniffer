@@ -103,3 +103,27 @@ encoding，而不是只看端到端吞吐。
 暂不优先实现 SIMD 或 CRC32C 专项：当前最大已解析 self hotspot 是 `EncodeNonPlain`，而 CRC32C
 只有 2.40%。也不根据本次 profile 给出精确的全路径百分比分解，因为仍有 25.38% 样本未完成符号
 解析，且 inclusive time 存在重叠。
+
+## 6. `e0e3467` 后的热点复查
+
+ARM CRC32C、FOR bytewise pack 和 typed index 优化完成后，在相同的 100,000 行、Row Group 4,096、
+50% 选择率场景上重新采样。`sample` 以 1 ms 周期采集 5 秒，目标主线程获得 4,280 个样本；
+top-of-stack 前列为：
+
+| 符号 | top-of-stack 样本 |
+|---|---:|
+| `HashArrayValuePair` | 451 |
+| `EncodeNonPlain` | 395 |
+| FOR typed decode | 277 |
+| `BuildRowGroupIndex` | 231 |
+| `Crc32c` | 92 |
+| `SelectEncoding` | 89 |
+
+对应的分阶段 P50 为：writer 约 7.00 ms，其中 encoding 2.39 ms、encoding selection 1.80 ms、
+index 1.62 ms、checksum 0.12 ms。CRC 已不再是优先瓶颈；writer 的重复列分析仍是最明确的下一项。
+
+第一步只让 FOR encoder 复用已持久化 statistics 的 minimum，跳过自身的 base 查找遍历；没有
+statistics 的字段继续使用原安全路径。11 次同机 Release P50 显示 encoding 从 2.3872 ms 降至
+1.7444 ms（-26.9%），writer 从 6.9960 ms 降至 6.3436 ms（-9.3%），端到端从 8.2511 ms
+降至 7.6080 ms（-7.8%）。文件仍为 663,679 字节，Arrow 分配、剪枝结果、ColumnChunk 读取数与
+读取字节均不变。

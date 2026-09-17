@@ -69,6 +69,8 @@ v0.2 聚焦现有 Segment writer、reader、codec、scan 和文件 I/O 路径的
       非 Plain 编码命中时又编码一次；改为用无分配的长度计算得到 `uncompressed_length`。
 - [ ] 合并编码选择采样、statistics、sort-key 和实际编码可复用的数据遍历，避免同一列重复
       `GetScalar()`、序列化和比较。
+  - [x] 第一小步：FOR encoder 复用 statistics minimum，移除一次完整的 base 查找遍历；无统计列
+        保留原回退路径，所有整数宽度、timestamp 和 all-null 均有逐字节等价测试。
 - [x] 为整数、timestamp、bool、string/binary 增加 typed encoder 路径，避免逐值构造
       `arrow::Scalar` 和调用 `SerializeScalar()`。
 - [x] 为 `ByteWriter` 增加可计算的容量预留和批量 append，减少 vector 扩容及中间 payload 拷贝。
@@ -620,3 +622,26 @@ Row Group 行数线性增长的临时内存，同时保持 payload、输出数�
 | P95 | 2.1270 ms | 0.1736 ms | -91.8% |
 
 该 microbenchmark 不包含文件 I/O、索引或 checksum；收益只归因于 selected decode kernel。
+
+### 2026-09-17：FOR 复用 statistics minimum
+
+- 在 `e0e3467` 后重新采样固定性能场景；`HashArrayValuePair`、`EncodeNonPlain`、FOR decode、
+  `BuildRowGroupIndex` 和 `SelectEncoding` 仍位于 top-of-stack 前列，CRC 已降为次要热点。原始热点
+  摘要更新于 [`bench/PROFILE_V0.2.md`](../bench/PROFILE_V0.2.md)。
+- 当字段配置了 statistics 且最终选择 FOR + Bitpack 时，encoder 直接复用 statistics 的 minimum
+  作为 base，不再重新遍历整列寻找最小值。没有 statistics、字段不匹配或统计不可用时继续走原
+  泛化扫描；格式和错误语义不变。
+- 新增逐字节参考测试，覆盖全部 FOR 支持的整数宽度、timestamp、null、极值和 all-null。测试首次
+  暴露了窄有符号整数的符号扩展要求，最终实现严格沿用原编码位语义。
+
+同机 Release、100,000 行、Row Group 4,096、50% 选择率、11 次 P50：
+
+| 指标 | Before | After | 变化 |
+|---|---:|---:|---:|
+| writer encoding | 2.3872 ms | 1.7444 ms | -26.9% |
+| writer 总耗时 | 6.9960 ms | 6.3436 ms | -9.3% |
+| 端到端耗时 / 吞吐 | 8.2511 ms / 12.120 M rows/s | 7.6080 ms / 13.144 M rows/s | 吞吐 +8.5% |
+
+文件保持 663,679 字节，Arrow 分配仍为 114 次 / 1,624,450 bytes；仍剪枝 12/25 Row Group，
+读取 26 个 ColumnChunk 和 172,228 字节。下一小步继续处理 selector 与 index 的样本分析复用，
+重点是当前 Bloom string 与整数 statistics 路径。

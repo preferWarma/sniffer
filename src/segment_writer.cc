@@ -345,7 +345,15 @@ class SegmentWriter::Impl {
           uncompressed_length = static_cast<uint64_t>(payload.size());
         } else {
           ARROW_ASSIGN_OR_RAISE(uncompressed_length, internal::PlainEncodedSize(field, *array));
-          ARROW_ASSIGN_OR_RAISE(payload, internal::EncodeNonPlain(encoding_id, field, *array));
+          const internal::StatisticsMeta* statistics = nullptr;
+          for (const auto& candidate : indexes.statistics) {
+            if (candidate.field_id == field.field_id) {
+              statistics = &candidate;
+              break;
+            }
+          }
+          ARROW_ASSIGN_OR_RAISE(payload,
+                                internal::EncodeNonPlain(encoding_id, field, *array, statistics));
         }
       }
       ARROW_ASSIGN_OR_RAISE(const auto physical_type, internal::PhysicalTypeFor(*field.type));

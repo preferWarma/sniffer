@@ -149,6 +149,34 @@ arrow::Result<uint64_t> ArrayIntegralBits(const arrow::Array& array, int64_t row
   }
 }
 
+arrow::Result<uint64_t> ScalarIntegralBits(const FieldSpec& field, const arrow::Scalar& scalar) {
+  if (!scalar.is_valid || !scalar.type->Equals(field.type)) {
+    return InvalidCodec("FOR statistics minimum does not match field type");
+  }
+  switch (field.type->id()) {
+    case arrow::Type::INT8:
+      return static_cast<uint64_t>(static_cast<const arrow::Int8Scalar&>(scalar).value);
+    case arrow::Type::INT16:
+      return static_cast<uint64_t>(static_cast<const arrow::Int16Scalar&>(scalar).value);
+    case arrow::Type::INT32:
+      return static_cast<uint64_t>(static_cast<const arrow::Int32Scalar&>(scalar).value);
+    case arrow::Type::INT64:
+      return static_cast<uint64_t>(static_cast<const arrow::Int64Scalar&>(scalar).value);
+    case arrow::Type::UINT8:
+      return static_cast<const arrow::UInt8Scalar&>(scalar).value;
+    case arrow::Type::UINT16:
+      return static_cast<const arrow::UInt16Scalar&>(scalar).value;
+    case arrow::Type::UINT32:
+      return static_cast<const arrow::UInt32Scalar&>(scalar).value;
+    case arrow::Type::UINT64:
+      return static_cast<const arrow::UInt64Scalar&>(scalar).value;
+    case arrow::Type::TIMESTAMP:
+      return static_cast<uint64_t>(static_cast<const arrow::TimestampScalar&>(scalar).value);
+    default:
+      return InvalidCodec("FOR statistics minimum is not integral or timestamp");
+  }
+}
+
 template <typename Value>
 int CompareValues(Value left, Value right) {
   return left < right ? -1 : (left > right ? 1 : 0);
@@ -395,24 +423,33 @@ arrow::Result<std::vector<uint8_t>> EncodeRle(const FieldSpec& field, const arro
 }
 
 arrow::Result<std::vector<uint8_t>> EncodeForBitpack(const FieldSpec& field,
-                                                     const arrow::Array& array) {
+                                                     const arrow::Array& array,
+                                                     const StatisticsMeta* statistics) {
   ARROW_ASSIGN_OR_RAISE(const auto physical_type, PhysicalTypeFor(*field.type));
   const uint32_t width = FixedWidthBytes(physical_type);
   const auto validity = EncodeValidity(array);
   uint64_t base_bits = 0;
   bool have_base = false;
-  for (int64_t row = 0; row < array.length(); ++row) {
-    if (array.IsNull(row)) {
-      continue;
-    }
-    ARROW_ASSIGN_OR_RAISE(const uint64_t bits, ArrayIntegralBits(array, row));
-    if (!have_base) {
-      base_bits = bits;
-      have_base = true;
-    } else {
-      ARROW_ASSIGN_OR_RAISE(const int order, CompareIntegralBits(*field.type, bits, base_bits));
-      if (order < 0) {
+  const bool matching_statistics = statistics && statistics->field_id == field.field_id &&
+                                   statistics->null_count <= static_cast<uint64_t>(array.length());
+  if (matching_statistics && statistics->min) {
+    ARROW_ASSIGN_OR_RAISE(base_bits, ScalarIntegralBits(field, *statistics->min));
+    have_base = true;
+  } else if (!(matching_statistics &&
+               statistics->null_count == static_cast<uint64_t>(array.length()))) {
+    for (int64_t row = 0; row < array.length(); ++row) {
+      if (array.IsNull(row)) {
+        continue;
+      }
+      ARROW_ASSIGN_OR_RAISE(const uint64_t bits, ArrayIntegralBits(array, row));
+      if (!have_base) {
         base_bits = bits;
+        have_base = true;
+      } else {
+        ARROW_ASSIGN_OR_RAISE(const int order, CompareIntegralBits(*field.type, bits, base_bits));
+        if (order < 0) {
+          base_bits = bits;
+        }
       }
     }
   }
@@ -1120,7 +1157,8 @@ arrow::Result<uint16_t> SelectEncoding(const FieldSpec& field, const arrow::Arra
 }
 
 arrow::Result<std::vector<uint8_t>> EncodeNonPlain(uint16_t encoding_id, const FieldSpec& field,
-                                                   const arrow::Array& array) {
+                                                   const arrow::Array& array,
+                                                   const StatisticsMeta* statistics) {
   if (!EncodingSupports(encoding_id, *field.type)) {
     return arrow::Status::NotImplemented("[sniffer.codec.encoding] unsupported type/encoding");
   }
@@ -1130,7 +1168,7 @@ arrow::Result<std::vector<uint8_t>> EncodeNonPlain(uint16_t encoding_id, const F
     case kRleEncodingId:
       return EncodeRle(field, array);
     case kForBitpackEncodingId:
-      return EncodeForBitpack(field, array);
+      return EncodeForBitpack(field, array, statistics);
     default:
       return arrow::Status::NotImplemented("[sniffer.codec.encoding] unknown non-Plain encoding");
   }

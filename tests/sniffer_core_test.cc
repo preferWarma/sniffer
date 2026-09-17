@@ -561,6 +561,63 @@ TEST(SnifferCoreTest, SortedPrimaryStatisticsFastPathMatchesGenericIndex) {
       << "floating sort-key statistics preserve signed-zero index bytes";
 }
 
+TEST(SnifferCoreTest, ForEncodingReusesStatisticsWithoutChangingBytes) {
+  const auto data = MakeAllTypesBatch();
+  sniffer::LayoutPolicy layout;
+  for (const auto& field : data.table_schema.fields) {
+    if (sniffer::internal::EncodingSupports(sniffer::internal::kForBitpackEncodingId,
+                                            *field.type)) {
+      layout.statistics_field_ids.push_back(field.field_id);
+    }
+  }
+  const auto indexes =
+      ValueOrThrow(sniffer::internal::BuildRowGroupIndex(data.table_schema, layout, *data.batch),
+                   "build FOR statistics");
+  for (size_t column = 0; column < data.table_schema.fields.size(); ++column) {
+    const auto& field = data.table_schema.fields[column];
+    if (!sniffer::internal::EncodingSupports(sniffer::internal::kForBitpackEncodingId,
+                                             *field.type)) {
+      continue;
+    }
+    const auto statistics =
+        std::find_if(indexes.statistics.begin(), indexes.statistics.end(),
+                     [&field](const sniffer::internal::StatisticsMeta& candidate) {
+                       return candidate.field_id == field.field_id;
+                     });
+    ASSERT_NE(statistics, indexes.statistics.end());
+    const auto& array = *data.batch->column(static_cast<int>(column));
+    const auto reference = ValueOrThrow(
+        sniffer::internal::EncodeNonPlain(sniffer::internal::kForBitpackEncodingId, field, array),
+        "encode FOR reference");
+    const auto reused =
+        ValueOrThrow(sniffer::internal::EncodeNonPlain(sniffer::internal::kForBitpackEncodingId,
+                                                       field, array, &*statistics),
+                     "encode FOR with statistics");
+    EXPECT_EQ(reused, reference) << "statistics reuse preserves FOR bytes for " << field.name;
+  }
+
+  const sniffer::TableSchema null_schema{1, {{100, "all_null", arrow::int64(), true, nullptr}}};
+  const auto null_arrow_schema = ValueOrThrow(null_schema.ToArrowSchema(), "create null schema");
+  const auto null_values =
+      BuildArray<arrow::Int64Builder, int64_t>({std::nullopt, std::nullopt, std::nullopt});
+  const auto null_batch =
+      arrow::RecordBatch::Make(null_arrow_schema, null_values->length(), {null_values});
+  layout.statistics_field_ids = {100};
+  const auto null_indexes =
+      ValueOrThrow(sniffer::internal::BuildRowGroupIndex(null_schema, layout, *null_batch),
+                   "build all-null FOR statistics");
+  const auto null_reference =
+      ValueOrThrow(sniffer::internal::EncodeNonPlain(sniffer::internal::kForBitpackEncodingId,
+                                                     null_schema.fields.front(), *null_values),
+                   "encode all-null FOR reference");
+  const auto null_reused =
+      ValueOrThrow(sniffer::internal::EncodeNonPlain(sniffer::internal::kForBitpackEncodingId,
+                                                     null_schema.fields.front(), *null_values,
+                                                     &null_indexes.statistics.front()),
+                   "encode all-null FOR with statistics");
+  EXPECT_EQ(null_reused, null_reference) << "all-null statistics reuse preserves FOR bytes";
+}
+
 TEST(SnifferCoreTest, TypedStatisticsMatchScalarReference) {
   const auto expect_matches = [](const sniffer::TableSchema& schema,
                                  const std::shared_ptr<arrow::RecordBatch>& batch) {
