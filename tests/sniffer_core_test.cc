@@ -1008,6 +1008,27 @@ uint32_t Crc32c(std::span<const uint8_t> bytes, uint32_t previous = 0) {
   return ~crc;
 }
 
+TEST(SnifferCoreTest, ProductionCrc32cMatchesBitwiseReference) {
+  std::vector<uint8_t> bytes(8193);
+  for (size_t index = 0; index < bytes.size(); ++index) {
+    bytes[index] = static_cast<uint8_t>((index * 131U + index / 7U) & 0xFFU);
+  }
+  constexpr std::array<size_t, 15> kLengths = {0,  1,  2,  3,  7,   8,    9,   15,
+                                               16, 17, 31, 32, 255, 4096, 8193};
+  for (const size_t length : kLengths) {
+    const auto input = std::span<const uint8_t>(bytes.data(), length);
+    EXPECT_EQ(sniffer::internal::Crc32c(input), Crc32c(input))
+        << "CRC32C differs at length " << length;
+
+    const size_t split = length / 3U;
+    uint32_t production = sniffer::internal::Crc32c(input.first(split));
+    production = sniffer::internal::Crc32c(input.subspan(split), production);
+    uint32_t reference = Crc32c(input.first(split));
+    reference = Crc32c(input.subspan(split), reference);
+    EXPECT_EQ(production, reference) << "incremental CRC32C differs at length " << length;
+  }
+}
+
 uint64_t ReadU64(const std::vector<uint8_t>& bytes, size_t offset) {
   uint64_t value = 0;
   for (uint32_t index = 0; index < 8; ++index) {

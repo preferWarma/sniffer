@@ -4,10 +4,16 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
+#include <cstring>
 #include <limits>
 #include <string_view>
 #include <unordered_map>
 #include <unordered_set>
+
+#if defined(__aarch64__) && defined(__ARM_FEATURE_CRC32)
+#include <arm_acle.h>
+#endif
 
 #include "scalar_internal.h"
 
@@ -35,7 +41,19 @@ constexpr std::array<uint32_t, 256> MakeCrc32cTable() {
   return table;
 }
 
-inline constexpr auto kCrc32cTable = MakeCrc32cTable();
+constexpr std::array<std::array<uint32_t, 256>, 8> MakeCrc32cTables() {
+  std::array<std::array<uint32_t, 256>, 8> tables{};
+  tables[0] = MakeCrc32cTable();
+  for (size_t slice = 1; slice < tables.size(); ++slice) {
+    for (size_t index = 0; index < tables[slice].size(); ++index) {
+      const uint32_t previous = tables[slice - 1][index];
+      tables[slice][index] = tables[0][previous & 0xFFU] ^ (previous >> 8U);
+    }
+  }
+  return tables;
+}
+
+inline constexpr auto kCrc32cTables = MakeCrc32cTables();
 
 arrow::Result<std::vector<uint8_t>> SerializeTypeParameters(const arrow::DataType& type) {
   ByteWriter writer;
@@ -173,12 +191,63 @@ arrow::Result<uint64_t> CheckedMultiply(uint64_t left, uint64_t right) {
   return left * right;
 }
 
-uint32_t Crc32c(std::span<const uint8_t> bytes, uint32_t previous) {
+namespace {
+
+[[maybe_unused]] uint32_t Crc32cSlicingBy8(std::span<const uint8_t> bytes, uint32_t previous) {
   uint32_t crc = ~previous;
-  for (const uint8_t byte : bytes) {
-    crc = kCrc32cTable[(crc ^ byte) & 0xFFU] ^ (crc >> 8U);
+  size_t offset = 0;
+  while (bytes.size() - offset >= 8U) {
+    const uint32_t first = static_cast<uint32_t>(bytes[offset]) |
+                           (static_cast<uint32_t>(bytes[offset + 1U]) << 8U) |
+                           (static_cast<uint32_t>(bytes[offset + 2U]) << 16U) |
+                           (static_cast<uint32_t>(bytes[offset + 3U]) << 24U);
+    const uint32_t second = static_cast<uint32_t>(bytes[offset + 4U]) |
+                            (static_cast<uint32_t>(bytes[offset + 5U]) << 8U) |
+                            (static_cast<uint32_t>(bytes[offset + 6U]) << 16U) |
+                            (static_cast<uint32_t>(bytes[offset + 7U]) << 24U);
+    crc ^= first;
+    crc = kCrc32cTables[7][crc & 0xFFU] ^ kCrc32cTables[6][(crc >> 8U) & 0xFFU] ^
+          kCrc32cTables[5][(crc >> 16U) & 0xFFU] ^ kCrc32cTables[4][crc >> 24U] ^
+          kCrc32cTables[3][second & 0xFFU] ^ kCrc32cTables[2][(second >> 8U) & 0xFFU] ^
+          kCrc32cTables[1][(second >> 16U) & 0xFFU] ^ kCrc32cTables[0][second >> 24U];
+    offset += 8U;
+  }
+  while (offset < bytes.size()) {
+    crc = kCrc32cTables[0][(crc ^ bytes[offset]) & 0xFFU] ^ (crc >> 8U);
+    ++offset;
   }
   return ~crc;
+}
+
+#if defined(__aarch64__) && defined(__ARM_FEATURE_CRC32)
+uint32_t Crc32cArm(std::span<const uint8_t> bytes, uint32_t previous) {
+  uint32_t crc = ~previous;
+  size_t offset = 0;
+  while (bytes.size() - offset >= 8U) {
+    uint64_t word = 0;
+    std::memcpy(&word, bytes.data() + offset, sizeof(word));
+    if constexpr (std::endian::native == std::endian::big) {
+      word = __builtin_bswap64(word);
+    }
+    crc = __crc32cd(crc, word);
+    offset += 8U;
+  }
+  while (offset < bytes.size()) {
+    crc = __crc32cb(crc, bytes[offset]);
+    ++offset;
+  }
+  return ~crc;
+}
+#endif
+
+}  // namespace
+
+uint32_t Crc32c(std::span<const uint8_t> bytes, uint32_t previous) {
+#if defined(__aarch64__) && defined(__ARM_FEATURE_CRC32)
+  return Crc32cArm(bytes, previous);
+#else
+  return Crc32cSlicingBy8(bytes, previous);
+#endif
 }
 
 std::vector<uint8_t> SerializeHeader() {

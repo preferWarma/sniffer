@@ -15,6 +15,7 @@
 
 #include "benchmark_build_config.h"
 #include "codec_internal.h"
+#include "format_internal.h"
 
 namespace {
 
@@ -87,6 +88,17 @@ uint64_t Mix(uint64_t value) {
   value = (value ^ (value >> 30U)) * 0xBF58476D1CE4E5B9ULL;
   value = (value ^ (value >> 27U)) * 0x94D049BB133111EBULL;
   return value ^ (value >> 31U);
+}
+
+const std::vector<uint8_t>& CrcPayload() {
+  static const auto payload = [] {
+    std::vector<uint8_t> bytes(1024U * 1024U);
+    for (size_t index = 0; index < bytes.size(); ++index) {
+      bytes[index] = static_cast<uint8_t>(Mix(static_cast<uint64_t>(index)));
+    }
+    return bytes;
+  }();
+  return payload;
 }
 
 arrow::Result<std::vector<Scenario>> MakeScenarios(int64_t rows) {
@@ -295,6 +307,22 @@ void Codec(benchmark::State& state, size_t scenario_index, bool encode) {
   }
 }
 
+void Crc32c(benchmark::State& state) {
+  const auto& payload = CrcPayload();
+  const uint32_t expected = sniffer::internal::Crc32c(payload);
+  for (auto _ : state) {
+    (void)_;
+    uint32_t checksum = sniffer::internal::Crc32c(payload);
+    if (checksum != expected) {
+      state.SkipWithError("CRC32C result changed between iterations");
+      break;
+    }
+    benchmark::DoNotOptimize(checksum);
+  }
+  state.counters["payload_bytes"] = static_cast<double>(payload.size());
+  state.SetBytesProcessed(state.iterations() * static_cast<int64_t>(payload.size()));
+}
+
 BENCHMARK_CAPTURE(Codec, plain_random_int64_Encode, 0U, true)->Unit(benchmark::kMicrosecond);
 BENCHMARK_CAPTURE(Codec, plain_random_int64_Decode, 0U, false)->Unit(benchmark::kMicrosecond);
 BENCHMARK_CAPTURE(Codec, plain_selected_int64_50pct_Encode, 1U, true)
@@ -308,6 +336,7 @@ BENCHMARK_CAPTURE(Codec, rle_128_runs_Decode, 3U, false)->Unit(benchmark::kMicro
 BENCHMARK_CAPTURE(Codec, rle_selected_int64_1pct_Decode, 4U, false)->Unit(benchmark::kMicrosecond);
 BENCHMARK_CAPTURE(Codec, for_bitpack_128_range_Encode, 5U, true)->Unit(benchmark::kMicrosecond);
 BENCHMARK_CAPTURE(Codec, for_bitpack_128_range_Decode, 5U, false)->Unit(benchmark::kMicrosecond);
+BENCHMARK(Crc32c)->Name("Codec/crc32c_1MiB")->Unit(benchmark::kMicrosecond);
 
 void AddBenchmarkContext() {
 #ifdef NDEBUG
@@ -319,7 +348,7 @@ void AddBenchmarkContext() {
   benchmark::AddCustomContext("compiler", SNIFFER_BENCHMARK_COMPILER);
   benchmark::AddCustomContext("arrow_version", ARROW_VERSION_STRING);
   benchmark::AddCustomContext("rows", std::to_string(kDefaultRows));
-  benchmark::AddCustomContext("scope", "memory_only_no_io_index_or_checksum");
+  benchmark::AddCustomContext("scope", "memory_only_no_io_or_index");
 }
 
 }  // namespace

@@ -114,7 +114,7 @@ v0.2 聚焦现有 Segment writer、reader、codec、scan 和文件 I/O 路径的
       backend，且所有 offset/length 仍先做溢出与边界检查。
 - [ ] 避免文件 checksum 验证和后续 chunk 读取造成不必要的重复拷贝；允许缓存“已验证”状态，
       但每个新 Reader 仍必须按格式契约完成验证。
-- [ ] 使用批量或硬件加速 CRC32C 前先建立独立 benchmark；实现必须与当前 CRC32C 字节结果一致。
+- [x] 使用批量或硬件加速 CRC32C 前先建立独立 benchmark；实现必须与当前 CRC32C 字节结果一致。
 - [ ] Writer 增大顺序写缓冲、减少小 write；`Finish()` 的 durability 语义不得被悄然改变。
 
 ## 7. P2：编码选择与空间效率
@@ -164,6 +164,31 @@ v0.2 聚焦现有 Segment writer、reader、codec、scan 和文件 I/O 路径的
 - [ ] 更新 README 的性能状态，不把合成 benchmark 结果表述为通用生产性能。
 
 ## 11. 执行记录
+
+### 2026-09-17：CRC32C slicing-by-8 与 ARM hardware path
+
+- codec microbenchmark 新增固定 1 MiB CRC32C case，独立于文件 I/O、编码和索引。生产实现从逐字节
+  单表更新改为可移植 slicing-by-8 fallback，每轮显式 little-endian 读取 8 字节。
+- AArch64 且编译器定义 `__ARM_FEATURE_CRC32` 时使用 `__crc32cd`/`__crc32cb`；8 字节读取通过
+  `memcpy` 避免未对齐访问，big-endian 构建显式 byteswap。其他 ARM 目标和 x86 继续使用
+  slicing-by-8，不提高最低 CPU 要求。
+- 新增独立逐 bit Castagnoli reference，对 0/1/边界/尾部/8,193 字节长度验证 one-shot 与增量
+  checksum。Header、Footer、ColumnChunk、index block 和全文件 checksum 的既有损坏测试继续通过，
+  算法和持久化字节未改变。
+
+同机 Release before/after（microbenchmark 与完整场景各 11 次，均取 P50）：
+
+| 指标 | 单表 baseline | slicing-by-8 | ARM CRC | ARM 相对 slicing |
+|---|---:|---:|---:|---:|
+| CRC32C 1 MiB | 545.6 MiB/s | 2.335 GiB/s | 10.528 GiB/s | 约 4.51x |
+| writer checksum 阶段 | 2.4242 ms | 0.5637 ms | 0.1240 ms | -78.0% |
+| reader chunk checksum | 0.3103 ms | 0.0729 ms | 0.0159 ms | -78.2% |
+| reader index checksum | 0.3514 ms | 0.0857 ms | 0.0192 ms | -77.6% |
+| 完整写入 | 9.1581 ms | 7.4458 ms | 7.0489 ms | -5.3% |
+| 端到端吞吐 | 9.054 M rows/s | 11.319 M rows/s | 12.032 M rows/s | +6.3% |
+
+文件仍为 663,679 bytes，Arrow allocation、剪枝数、ColumnChunk 读取数和读取字节均未变化。
+Debug、Release、ASan+UBSan 三套构建均为 50/50 通过，`git diff --check` 通过。
 
 ### 2026-09-17：typed statistics min/max
 
