@@ -602,6 +602,7 @@ TEST(SnifferCoreTest, ForEncodingReusesStatisticsWithoutChangingBytes) {
       BuildArray<arrow::Int64Builder, int64_t>({std::nullopt, std::nullopt, std::nullopt});
   const auto null_batch =
       arrow::RecordBatch::Make(null_arrow_schema, null_values->length(), {null_values});
+  layout.encoding_sample_rows = 2;
   layout.statistics_field_ids = {100};
   const auto null_indexes =
       ValueOrThrow(sniffer::internal::BuildRowGroupIndex(null_schema, layout, *null_batch),
@@ -616,6 +617,77 @@ TEST(SnifferCoreTest, ForEncodingReusesStatisticsWithoutChangingBytes) {
                                                      &null_indexes.statistics.front()),
                    "encode all-null FOR with statistics");
   EXPECT_EQ(null_reused, null_reference) << "all-null statistics reuse preserves FOR bytes";
+}
+
+TEST(SnifferCoreTest, EncodingSelectorReusesIntegralStatisticsSample) {
+  const auto data = MakeAllTypesBatch();
+  sniffer::LayoutPolicy layout;
+  layout.encoding_sample_rows = 4;
+  for (const auto& field : data.table_schema.fields) {
+    if (field.type->id() == arrow::Type::BOOL || arrow::is_integer(field.type->id()) ||
+        field.type->id() == arrow::Type::TIMESTAMP) {
+      layout.statistics_field_ids.push_back(field.field_id);
+    }
+  }
+  sniffer::internal::RowGroupAnalysis analysis;
+  analysis.encoding_sample_rows = layout.encoding_sample_rows;
+  const auto reference_indexes =
+      ValueOrThrow(sniffer::internal::BuildRowGroupIndex(data.table_schema, layout, *data.batch),
+                   "build selector reference indexes");
+  const auto reused_indexes =
+      ValueOrThrow(sniffer::internal::BuildRowGroupIndex(data.table_schema, layout, *data.batch,
+                                                         false, &analysis),
+                   "build indexes with selector analysis");
+  EXPECT_EQ(
+      ValueOrThrow(sniffer::internal::SerializeIndexBlock(data.table_schema, reused_indexes),
+                   "serialize reused selector indexes"),
+      ValueOrThrow(sniffer::internal::SerializeIndexBlock(data.table_schema, reference_indexes),
+                   "serialize reference selector indexes"))
+      << "transient selector analysis does not change persisted indexes";
+
+  for (size_t column = 0; column < data.table_schema.fields.size(); ++column) {
+    const auto& field = data.table_schema.fields[column];
+    const auto sample =
+        std::find_if(analysis.encoding_samples.begin(), analysis.encoding_samples.end(),
+                     [&field](const sniffer::internal::EncodingSampleAnalysis& candidate) {
+                       return candidate.field_id == field.field_id;
+                     });
+    const bool supports_analysis = field.type->id() == arrow::Type::BOOL ||
+                                   arrow::is_integer(field.type->id()) ||
+                                   field.type->id() == arrow::Type::TIMESTAMP;
+    EXPECT_EQ(sample != analysis.encoding_samples.end(), supports_analysis);
+    if (!supports_analysis) {
+      continue;
+    }
+    const auto& array = *data.batch->column(static_cast<int>(column));
+    const auto reference = ValueOrThrow(sniffer::internal::SelectEncoding(field, array, layout),
+                                        "select encoding from array sample");
+    const auto reused =
+        ValueOrThrow(sniffer::internal::SelectEncoding(field, array, layout, &*sample),
+                     "select encoding from statistics sample");
+    EXPECT_EQ(reused, reference) << "sample reuse preserves encoding for " << field.name;
+  }
+
+  const sniffer::TableSchema null_schema{1, {{100, "all_null", arrow::int64(), true, nullptr}}};
+  const auto null_arrow_schema = ValueOrThrow(null_schema.ToArrowSchema(), "create null schema");
+  const auto null_values =
+      BuildArray<arrow::Int64Builder, int64_t>({std::nullopt, std::nullopt, std::nullopt});
+  const auto null_batch =
+      arrow::RecordBatch::Make(null_arrow_schema, null_values->length(), {null_values});
+  layout.statistics_field_ids = {100};
+  sniffer::internal::RowGroupAnalysis null_analysis;
+  null_analysis.encoding_sample_rows = 2;
+  ValueOrThrow(sniffer::internal::BuildRowGroupIndex(null_schema, layout, *null_batch, false,
+                                                     &null_analysis),
+               "build all-null selector analysis");
+  ASSERT_EQ(null_analysis.encoding_samples.size(), 1U);
+  EXPECT_EQ(ValueOrThrow(
+                sniffer::internal::SelectEncoding(null_schema.fields.front(), *null_values, layout),
+                "select all-null reference encoding"),
+            ValueOrThrow(
+                sniffer::internal::SelectEncoding(null_schema.fields.front(), *null_values, layout,
+                                                  &null_analysis.encoding_samples.front()),
+                "select all-null reused encoding"));
 }
 
 TEST(SnifferCoreTest, TypedStatisticsMatchScalarReference) {

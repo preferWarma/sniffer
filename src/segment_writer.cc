@@ -319,10 +319,12 @@ class SegmentWriter::Impl {
  private:
   arrow::Status WriteRowGroup(const std::shared_ptr<arrow::RecordBatch>& batch) {
     internal::RowGroupIndex indexes;
+    internal::RowGroupAnalysis analysis;
+    analysis.encoding_sample_rows = layout_policy_.encoding_sample_rows;
     {
       internal::NanosecondTimer timer(metrics_ ? &metrics_->index_nanoseconds : nullptr);
-      ARROW_ASSIGN_OR_RAISE(indexes,
-                            internal::BuildRowGroupIndex(schema_, layout_policy_, *batch, true));
+      ARROW_ASSIGN_OR_RAISE(
+          indexes, internal::BuildRowGroupIndex(schema_, layout_policy_, *batch, true, &analysis));
     }
     internal::RowGroupMeta row_group;
     row_group.row_count = static_cast<uint64_t>(batch->num_rows());
@@ -334,7 +336,15 @@ class SegmentWriter::Impl {
       {
         internal::NanosecondTimer timer(metrics_ ? &metrics_->encoding_selection_nanoseconds
                                                  : nullptr);
-        ARROW_ASSIGN_OR_RAISE(encoding_id, internal::SelectEncoding(field, *array, layout_policy_));
+        const internal::EncodingSampleAnalysis* sample = nullptr;
+        for (const auto& candidate : analysis.encoding_samples) {
+          if (candidate.field_id == field.field_id) {
+            sample = &candidate;
+            break;
+          }
+        }
+        ARROW_ASSIGN_OR_RAISE(encoding_id,
+                              internal::SelectEncoding(field, *array, layout_policy_, sample));
       }
       std::vector<uint8_t> payload;
       uint64_t uncompressed_length = 0;

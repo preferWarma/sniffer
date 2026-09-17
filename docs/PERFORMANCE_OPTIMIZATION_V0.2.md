@@ -71,6 +71,8 @@ v0.2 聚焦现有 Segment writer、reader、codec、scan 和文件 I/O 路径的
       `GetScalar()`、序列化和比较。
   - [x] 第一小步：FOR encoder 复用 statistics minimum，移除一次完整的 base 查找遍历；无统计列
         保留原回退路径，所有整数宽度、timestamp 和 all-null 均有逐字节等价测试。
+  - [x] 第二小步：非排序整数、bool 和 timestamp statistics 在原 typed min/max 遍历中同时生成
+        selector sample 摘要；排序键 endpoint 快速路径和无 statistics 字段不额外扫描。
 - [x] 为整数、timestamp、bool、string/binary 增加 typed encoder 路径，避免逐值构造
       `arrow::Scalar` 和调用 `SerializeScalar()`。
 - [x] 为 `ByteWriter` 增加可计算的容量预留和批量 append，减少 vector 扩容及中间 payload 拷贝。
@@ -645,3 +647,27 @@ Row Group 行数线性增长的临时内存，同时保持 payload、输出数�
 文件保持 663,679 字节，Arrow 分配仍为 114 次 / 1,624,450 bytes；仍剪枝 12/25 Row Group，
 读取 26 个 ColumnChunk 和 172,228 字节。下一小步继续处理 selector 与 index 的样本分析复用，
 重点是当前 Bloom string 与整数 statistics 路径。
+
+### 2026-09-17：整数 statistics 复用 selector sample
+
+- `BuildRowGroupIndex()` 可选地产生不落盘的 Row Group 分析结果。非排序整数、bool 和 timestamp
+  statistics 在既有 typed min/max 遍历的前 `encoding_sample_rows` 行同步统计 distinct、run 和
+  extrema，`SelectEncoding()` 直接消费该摘要。
+- 排序主键 statistics 仍使用 endpoint 快速路径，没有为了 selector 新增完整扫描；未配置
+  statistics、string/binary 和不可复用的输入继续使用原 selector 路径。
+- reference test 比较复用前后的编码 ID 和序列化 index bytes，覆盖所有整数宽度、bool、timestamp、
+  null 和极值；分析结果不进入 Segment 格式。
+
+同机 Release、100,000 行、Row Group 4,096、50% 选择率、11 次 P50：
+
+| 指标 | Before | After | 变化 |
+|---|---:|---:|---:|
+| encoding selection | 1.8225 ms | 1.0945 ms | -39.9% |
+| index | 1.6207 ms | 2.1369 ms | +31.8% |
+| selection + index | 3.4432 ms | 3.2314 ms | -6.2% |
+| writer 总耗时 | 6.3436 ms | 6.1797 ms | -2.6% |
+| 端到端耗时 / 吞吐 | 7.6080 ms / 13.144 M rows/s | 7.4572 ms / 13.410 M rows/s | 吞吐 +2.0% |
+
+单阶段时间发生了预期迁移，因此收益以 selection + index 合计和 writer 总耗时判断。文件仍为
+663,679 字节，Arrow 分配、剪枝数量、ColumnChunk 读取数与读取字节不变。下一小步可把相同模型
+扩展到 Bloom string 的 selector dictionary/run 样本，当前 `HashArrayValuePair` 仍是 profile 首位。

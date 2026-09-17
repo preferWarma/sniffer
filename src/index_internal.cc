@@ -6,6 +6,7 @@
 #include <limits>
 #include <string_view>
 #include <type_traits>
+#include <unordered_set>
 
 #include "scalar_internal.h"
 
@@ -121,6 +122,13 @@ bool ArrayValueHasNaN(const arrow::Array& array, int64_t row) {
   return false;
 }
 
+bool SupportsEncodingSampleAnalysis(arrow::Type::type type) {
+  return type == arrow::Type::BOOL || type == arrow::Type::INT8 || type == arrow::Type::INT16 ||
+         type == arrow::Type::INT32 || type == arrow::Type::INT64 || type == arrow::Type::UINT8 ||
+         type == arrow::Type::UINT16 || type == arrow::Type::UINT32 ||
+         type == arrow::Type::UINT64 || type == arrow::Type::TIMESTAMP;
+}
+
 arrow::Status ValidateSingleSortKey(const TableSchema& schema, uint32_t field_id,
                                     const arrow::RecordBatch& batch,
                                     std::vector<std::shared_ptr<arrow::Scalar>>* previous_key) {
@@ -215,15 +223,64 @@ arrow::Result<StatisticsMeta> FinishStatistics(StatisticsMeta statistics, const 
 
 template <typename ArrayType>
 arrow::Result<StatisticsMeta> BuildPrimitiveStatistics(uint32_t field_id,
-                                                       const arrow::Array& untyped) {
+                                                       const arrow::Array& untyped,
+                                                       int64_t sample_rows,
+                                                       EncodingSampleAnalysis* analysis) {
   const auto& array = static_cast<const ArrayType&>(untyped);
   StatisticsMeta statistics;
   statistics.field_id = field_id;
   statistics.null_count = static_cast<uint64_t>(array.null_count());
   int64_t min_row = -1;
   int64_t max_row = -1;
+  std::unordered_set<uint64_t> sample_distinct;
+  bool sample_first = true;
+  bool sample_previous_valid = false;
+  uint64_t sample_previous = 0;
+  using SampleValue = std::remove_cv_t<decltype(array.Value(0))>;
+  SampleValue sample_minimum{};
+  SampleValue sample_maximum{};
+  const bool collect_distinct =
+      array.type_id() != arrow::Type::BOOL && array.type_id() != arrow::Type::TIMESTAMP;
+  if (analysis) {
+    analysis->field_id = field_id;
+    analysis->sample_rows = sample_rows;
+  }
   for (int64_t row = 0; row < array.length(); ++row) {
-    if (array.IsNull(row)) {
+    const bool valid = array.IsValid(row);
+    if constexpr (std::is_integral_v<decltype(array.Value(row))>) {
+      if (analysis && row < sample_rows) {
+        const uint64_t bits = valid ? static_cast<uint64_t>(array.Value(row)) : 0;
+        if (valid) {
+          if (collect_distinct) {
+            sample_distinct.insert(bits);
+          }
+          if (!analysis->have_extrema) {
+            sample_minimum = array.Value(row);
+            sample_maximum = array.Value(row);
+            analysis->minimum_bits = bits;
+            analysis->maximum_bits = bits;
+            analysis->have_extrema = true;
+          } else {
+            const auto value = array.Value(row);
+            if (value < sample_minimum) {
+              sample_minimum = value;
+              analysis->minimum_bits = bits;
+            }
+            if (value > sample_maximum) {
+              sample_maximum = value;
+              analysis->maximum_bits = bits;
+            }
+          }
+        }
+        if (sample_first || valid != sample_previous_valid || (valid && bits != sample_previous)) {
+          ++analysis->runs;
+        }
+        sample_first = false;
+        sample_previous_valid = valid;
+        sample_previous = bits;
+      }
+    }
+    if (!valid) {
       continue;
     }
     const auto value = array.Value(row);
@@ -243,6 +300,9 @@ arrow::Result<StatisticsMeta> BuildPrimitiveStatistics(uint32_t field_id,
     if (value > array.Value(max_row)) {
       max_row = row;
     }
+  }
+  if (analysis) {
+    analysis->dictionary_count = static_cast<uint64_t>(sample_distinct.size());
   }
   return FinishStatistics(std::move(statistics), array, min_row, max_row);
 }
@@ -275,32 +335,35 @@ arrow::Result<StatisticsMeta> BuildVariableStatistics(uint32_t field_id,
   return FinishStatistics(std::move(statistics), array, min_row, max_row);
 }
 
-arrow::Result<StatisticsMeta> BuildStatistics(uint32_t field_id, const arrow::Array& array) {
+arrow::Result<StatisticsMeta> BuildStatistics(uint32_t field_id, const arrow::Array& array,
+                                              int64_t sample_rows,
+                                              EncodingSampleAnalysis* analysis) {
   switch (array.type_id()) {
     case arrow::Type::BOOL:
-      return BuildPrimitiveStatistics<arrow::BooleanArray>(field_id, array);
+      return BuildPrimitiveStatistics<arrow::BooleanArray>(field_id, array, sample_rows, analysis);
     case arrow::Type::INT8:
-      return BuildPrimitiveStatistics<arrow::Int8Array>(field_id, array);
+      return BuildPrimitiveStatistics<arrow::Int8Array>(field_id, array, sample_rows, analysis);
     case arrow::Type::INT16:
-      return BuildPrimitiveStatistics<arrow::Int16Array>(field_id, array);
+      return BuildPrimitiveStatistics<arrow::Int16Array>(field_id, array, sample_rows, analysis);
     case arrow::Type::INT32:
-      return BuildPrimitiveStatistics<arrow::Int32Array>(field_id, array);
+      return BuildPrimitiveStatistics<arrow::Int32Array>(field_id, array, sample_rows, analysis);
     case arrow::Type::INT64:
-      return BuildPrimitiveStatistics<arrow::Int64Array>(field_id, array);
+      return BuildPrimitiveStatistics<arrow::Int64Array>(field_id, array, sample_rows, analysis);
     case arrow::Type::UINT8:
-      return BuildPrimitiveStatistics<arrow::UInt8Array>(field_id, array);
+      return BuildPrimitiveStatistics<arrow::UInt8Array>(field_id, array, sample_rows, analysis);
     case arrow::Type::UINT16:
-      return BuildPrimitiveStatistics<arrow::UInt16Array>(field_id, array);
+      return BuildPrimitiveStatistics<arrow::UInt16Array>(field_id, array, sample_rows, analysis);
     case arrow::Type::UINT32:
-      return BuildPrimitiveStatistics<arrow::UInt32Array>(field_id, array);
+      return BuildPrimitiveStatistics<arrow::UInt32Array>(field_id, array, sample_rows, analysis);
     case arrow::Type::UINT64:
-      return BuildPrimitiveStatistics<arrow::UInt64Array>(field_id, array);
+      return BuildPrimitiveStatistics<arrow::UInt64Array>(field_id, array, sample_rows, analysis);
     case arrow::Type::FLOAT:
-      return BuildPrimitiveStatistics<arrow::FloatArray>(field_id, array);
+      return BuildPrimitiveStatistics<arrow::FloatArray>(field_id, array, 0, nullptr);
     case arrow::Type::DOUBLE:
-      return BuildPrimitiveStatistics<arrow::DoubleArray>(field_id, array);
+      return BuildPrimitiveStatistics<arrow::DoubleArray>(field_id, array, 0, nullptr);
     case arrow::Type::TIMESTAMP:
-      return BuildPrimitiveStatistics<arrow::TimestampArray>(field_id, array);
+      return BuildPrimitiveStatistics<arrow::TimestampArray>(field_id, array, sample_rows,
+                                                             analysis);
     case arrow::Type::STRING:
       return BuildVariableStatistics<arrow::StringArray>(field_id, array);
     case arrow::Type::BINARY:
@@ -362,11 +425,16 @@ arrow::Status ValidateAndUpdateSortOrder(
 arrow::Result<RowGroupIndex> BuildRowGroupIndex(const TableSchema& schema,
                                                 const LayoutPolicy& layout,
                                                 const arrow::RecordBatch& batch,
-                                                bool sort_order_validated) {
+                                                bool sort_order_validated,
+                                                RowGroupAnalysis* analysis) {
   RowGroupIndex result;
   result.statistics.reserve(layout.statistics_field_ids.size());
   result.blooms.reserve(layout.bloom_field_ids.size());
   result.sort_keys.reserve(layout.sort_key_field_ids.size());
+  if (analysis) {
+    analysis->encoding_samples.clear();
+    analysis->encoding_samples.reserve(layout.statistics_field_ids.size());
+  }
 
   for (const uint32_t field_id : layout.statistics_field_ids) {
     ARROW_ASSIGN_OR_RAISE(const size_t field_index, FieldIndex(schema, field_id));
@@ -375,7 +443,18 @@ arrow::Result<RowGroupIndex> BuildRowGroupIndex(const TableSchema& schema,
     if (CanUseSortedPrimaryStatistics(layout, field_id, *array, sort_order_validated)) {
       ARROW_ASSIGN_OR_RAISE(statistics, BuildSortedPrimaryStatistics(field_id, *array));
     } else {
-      ARROW_ASSIGN_OR_RAISE(statistics, BuildStatistics(field_id, *array));
+      EncodingSampleAnalysis sample;
+      EncodingSampleAnalysis* sample_output = nullptr;
+      int64_t sample_rows = 0;
+      if (analysis && SupportsEncodingSampleAnalysis(array->type_id())) {
+        sample_rows = std::min<int64_t>(array->length(), analysis->encoding_sample_rows);
+        sample_output = &sample;
+      }
+      ARROW_ASSIGN_OR_RAISE(statistics,
+                            BuildStatistics(field_id, *array, sample_rows, sample_output));
+      if (sample_output) {
+        analysis->encoding_samples.push_back(std::move(sample));
+      }
     }
     result.statistics.push_back(std::move(statistics));
   }

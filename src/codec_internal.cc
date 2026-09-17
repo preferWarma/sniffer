@@ -1030,7 +1030,8 @@ arrow::Result<uint64_t> PlainEncodedSize(const FieldSpec& field, const arrow::Ar
 }
 
 arrow::Result<uint16_t> SelectEncoding(const FieldSpec& field, const arrow::Array& array,
-                                       const LayoutPolicy& layout) {
+                                       const LayoutPolicy& layout,
+                                       const EncodingSampleAnalysis* analysis) {
   const auto forced = std::find_if(
       layout.field_encodings.begin(), layout.field_encodings.end(),
       [&field](const FieldEncoding& candidate) { return candidate.field_id == field.field_id; });
@@ -1087,6 +1088,17 @@ arrow::Result<uint16_t> SelectEncoding(const FieldSpec& field, const arrow::Arra
       previous = value;
     }
     dictionary_count = static_cast<uint64_t>(distinct.size());
+  } else if (analysis && analysis->field_id == field.field_id &&
+             analysis->sample_rows == sample_rows) {
+    dictionary_count = analysis->dictionary_count;
+    runs = analysis->runs;
+    minimum_bits = analysis->minimum_bits;
+    maximum_bits = analysis->maximum_bits;
+    have_extrema = analysis->have_extrema;
+    ARROW_ASSIGN_OR_RAISE(const auto physical_type, PhysicalTypeFor(*field.type));
+    ARROW_ASSIGN_OR_RAISE(
+        dictionary_values_size,
+        CheckedMultiply(dictionary_count, static_cast<uint64_t>(FixedWidthBytes(physical_type))));
   } else {
     std::unordered_set<uint64_t> distinct;
     uint64_t previous = 0;
