@@ -561,6 +561,68 @@ TEST(SnifferCoreTest, SortedPrimaryStatisticsFastPathMatchesGenericIndex) {
       << "floating sort-key statistics preserve signed-zero index bytes";
 }
 
+TEST(SnifferCoreTest, TypedStatisticsMatchScalarReference) {
+  const auto expect_matches = [](const sniffer::TableSchema& schema,
+                                 const std::shared_ptr<arrow::RecordBatch>& batch) {
+    sniffer::LayoutPolicy layout;
+    for (const auto& field : schema.fields) {
+      layout.statistics_field_ids.push_back(field.field_id);
+    }
+    const auto actual = ValueOrThrow(sniffer::internal::BuildRowGroupIndex(schema, layout, *batch),
+                                     "build typed statistics index");
+    sniffer::internal::RowGroupIndex expected;
+    for (size_t column = 0; column < schema.fields.size(); ++column) {
+      const auto& field = schema.fields[column];
+      const auto& array = *batch->column(static_cast<int>(column));
+      sniffer::internal::StatisticsMeta statistics;
+      statistics.field_id = field.field_id;
+      statistics.null_count = static_cast<uint64_t>(array.null_count());
+      for (int64_t row = 0; row < array.length(); ++row) {
+        if (array.IsNull(row)) {
+          continue;
+        }
+        const auto value = ValueOrThrow(array.GetScalar(row), "get statistics reference scalar");
+        if (sniffer::internal::ScalarHasNaN(*value)) {
+          statistics.min.reset();
+          statistics.max.reset();
+          break;
+        }
+        if (!statistics.min) {
+          statistics.min = value;
+          statistics.max = value;
+          continue;
+        }
+        if (ValueOrThrow(sniffer::internal::CompareScalars(*value, *statistics.min),
+                         "compare statistics reference minimum") < 0) {
+          statistics.min = value;
+        }
+        if (ValueOrThrow(sniffer::internal::CompareScalars(*value, *statistics.max),
+                         "compare statistics reference maximum") > 0) {
+          statistics.max = value;
+        }
+      }
+      expected.statistics.push_back(std::move(statistics));
+    }
+    const auto actual_bytes = ValueOrThrow(sniffer::internal::SerializeIndexBlock(schema, actual),
+                                           "serialize typed statistics index");
+    const auto expected_bytes =
+        ValueOrThrow(sniffer::internal::SerializeIndexBlock(schema, expected),
+                     "serialize scalar-reference statistics index");
+    EXPECT_TRUE(actual_bytes == expected_bytes)
+        << "typed statistics preserve scalar-reference index bytes";
+  };
+
+  const auto all_types = MakeAllTypesBatch();
+  expect_matches(all_types.table_schema, all_types.batch);
+
+  const sniffer::TableSchema nan_schema{1, {{1, "value", arrow::float64(), true, nullptr}}};
+  const auto nan_arrow_schema = ValueOrThrow(nan_schema.ToArrowSchema(), "create NaN schema");
+  const auto nan_values = BuildArray<arrow::DoubleBuilder, double>(
+      {1.0, std::numeric_limits<double>::quiet_NaN(), std::nullopt, -2.0});
+  expect_matches(nan_schema,
+                 arrow::RecordBatch::Make(nan_arrow_schema, nan_values->length(), {nan_values}));
+}
+
 TEST(SnifferCoreTest, PlainVariableBulkCopyMatchesReference) {
   const auto strings = BuildStringArray({"discard", "alpha", "beta", "gamma", "tail"});
   const auto sliced = strings->Slice(1, 3);

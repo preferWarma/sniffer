@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <limits>
 #include <string_view>
+#include <type_traits>
 
 #include "scalar_internal.h"
 
@@ -203,7 +204,19 @@ arrow::Status BloomInsertArrayValue(const FieldSpec& field, const arrow::Array& 
   return arrow::Status::OK();
 }
 
-arrow::Result<StatisticsMeta> BuildStatistics(uint32_t field_id, const arrow::Array& array) {
+arrow::Result<StatisticsMeta> FinishStatistics(StatisticsMeta statistics, const arrow::Array& array,
+                                               int64_t min_row, int64_t max_row) {
+  if (min_row >= 0) {
+    ARROW_ASSIGN_OR_RAISE(statistics.min, array.GetScalar(min_row));
+    ARROW_ASSIGN_OR_RAISE(statistics.max, array.GetScalar(max_row));
+  }
+  return statistics;
+}
+
+template <typename ArrayType>
+arrow::Result<StatisticsMeta> BuildPrimitiveStatistics(uint32_t field_id,
+                                                       const arrow::Array& untyped) {
+  const auto& array = static_cast<const ArrayType&>(untyped);
   StatisticsMeta statistics;
   statistics.field_id = field_id;
   statistics.null_count = static_cast<uint64_t>(array.null_count());
@@ -213,28 +226,89 @@ arrow::Result<StatisticsMeta> BuildStatistics(uint32_t field_id, const arrow::Ar
     if (array.IsNull(row)) {
       continue;
     }
-    if (ArrayValueHasNaN(array, row)) {
-      return statistics;
+    const auto value = array.Value(row);
+    if constexpr (std::is_floating_point_v<std::remove_cv_t<decltype(value)>>) {
+      if (std::isnan(value)) {
+        return statistics;
+      }
     }
     if (min_row < 0) {
       min_row = row;
       max_row = row;
       continue;
     }
-    ARROW_ASSIGN_OR_RAISE(const int min_order, CompareArrayRows(array, row, min_row));
-    ARROW_ASSIGN_OR_RAISE(const int max_order, CompareArrayRows(array, row, max_row));
-    if (min_order < 0) {
+    if (value < array.Value(min_row)) {
       min_row = row;
     }
-    if (max_order > 0) {
+    if (value > array.Value(max_row)) {
       max_row = row;
     }
   }
-  if (min_row >= 0) {
-    ARROW_ASSIGN_OR_RAISE(statistics.min, array.GetScalar(min_row));
-    ARROW_ASSIGN_OR_RAISE(statistics.max, array.GetScalar(max_row));
+  return FinishStatistics(std::move(statistics), array, min_row, max_row);
+}
+
+template <typename ArrayType>
+arrow::Result<StatisticsMeta> BuildVariableStatistics(uint32_t field_id,
+                                                      const arrow::Array& untyped) {
+  const auto& array = static_cast<const ArrayType&>(untyped);
+  StatisticsMeta statistics;
+  statistics.field_id = field_id;
+  statistics.null_count = static_cast<uint64_t>(array.null_count());
+  int64_t min_row = -1;
+  int64_t max_row = -1;
+  for (int64_t row = 0; row < array.length(); ++row) {
+    if (array.IsNull(row)) {
+      continue;
+    }
+    if (min_row < 0) {
+      min_row = row;
+      max_row = row;
+      continue;
+    }
+    if (CompareByteViews(array.GetView(row), array.GetView(min_row)) < 0) {
+      min_row = row;
+    }
+    if (CompareByteViews(array.GetView(row), array.GetView(max_row)) > 0) {
+      max_row = row;
+    }
   }
-  return statistics;
+  return FinishStatistics(std::move(statistics), array, min_row, max_row);
+}
+
+arrow::Result<StatisticsMeta> BuildStatistics(uint32_t field_id, const arrow::Array& array) {
+  switch (array.type_id()) {
+    case arrow::Type::BOOL:
+      return BuildPrimitiveStatistics<arrow::BooleanArray>(field_id, array);
+    case arrow::Type::INT8:
+      return BuildPrimitiveStatistics<arrow::Int8Array>(field_id, array);
+    case arrow::Type::INT16:
+      return BuildPrimitiveStatistics<arrow::Int16Array>(field_id, array);
+    case arrow::Type::INT32:
+      return BuildPrimitiveStatistics<arrow::Int32Array>(field_id, array);
+    case arrow::Type::INT64:
+      return BuildPrimitiveStatistics<arrow::Int64Array>(field_id, array);
+    case arrow::Type::UINT8:
+      return BuildPrimitiveStatistics<arrow::UInt8Array>(field_id, array);
+    case arrow::Type::UINT16:
+      return BuildPrimitiveStatistics<arrow::UInt16Array>(field_id, array);
+    case arrow::Type::UINT32:
+      return BuildPrimitiveStatistics<arrow::UInt32Array>(field_id, array);
+    case arrow::Type::UINT64:
+      return BuildPrimitiveStatistics<arrow::UInt64Array>(field_id, array);
+    case arrow::Type::FLOAT:
+      return BuildPrimitiveStatistics<arrow::FloatArray>(field_id, array);
+    case arrow::Type::DOUBLE:
+      return BuildPrimitiveStatistics<arrow::DoubleArray>(field_id, array);
+    case arrow::Type::TIMESTAMP:
+      return BuildPrimitiveStatistics<arrow::TimestampArray>(field_id, array);
+    case arrow::Type::STRING:
+      return BuildVariableStatistics<arrow::StringArray>(field_id, array);
+    case arrow::Type::BINARY:
+      return BuildVariableStatistics<arrow::BinaryArray>(field_id, array);
+    default:
+      return arrow::Status::NotImplemented("[sniffer.layout.statistics] unsupported type ",
+                                           array.type()->ToString());
+  }
 }
 
 bool CanUseSortedPrimaryStatistics(const LayoutPolicy& layout, uint32_t field_id,

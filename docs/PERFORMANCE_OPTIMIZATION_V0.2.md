@@ -165,6 +165,26 @@ v0.2 聚焦现有 Segment writer、reader、codec、scan 和文件 I/O 路径的
 
 ## 11. 执行记录
 
+### 2026-09-17：typed statistics min/max
+
+- 通用 statistics 原来每行分别通过 `CompareArrayRows()` 比较 min 和 max，每次比较都重新执行类型
+  switch。现在按列类型一次绑定 bool、整数、浮点、timestamp、string/binary 的 typed 循环，循环内
+  直接读取 Arrow value/view；只在最终 min/max 行构造 Scalar。
+- NaN 仍使该 Row Group 的 min/max 缺失，null count、首个等价值胜出、string/binary 无符号字节序、
+  `-0/+0` bit pattern 均保持原语义。新增全类型 scalar-reference index block 逐字节测试，并单独覆盖
+  NaN、null 和 signed zero。
+
+同机 Release、10 万行、Row Group 4,096、11 次重复的 P50：
+
+| 指标 | Before | After | 变化 |
+|---|---:|---:|---:|
+| writer index 阶段 | 1.8001 ms | 1.5590 ms | -13.4% |
+| 完整写入 | 9.4931 ms | 9.1581 ms | -3.5% |
+| 端到端 | 11.3627 ms / 8.801 M rows/s | 11.0443 ms / 9.054 M rows/s | 吞吐 +2.9% |
+
+文件仍为 663,679 bytes，Arrow allocation、剪枝和读取量均未变化。Debug、Release、ASan+UBSan
+三套构建均为 49/49 通过，`git diff --check` 通过。
+
 ### 2026-09-17：复用已验证主排序键的 statistics
 
 - writer 在切分 Row Group 前已经验证整批 sort-key 顺序。主排序键同时配置 statistics 时，整数、
