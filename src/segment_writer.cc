@@ -321,7 +321,8 @@ class SegmentWriter::Impl {
     internal::RowGroupIndex indexes;
     {
       internal::NanosecondTimer timer(metrics_ ? &metrics_->index_nanoseconds : nullptr);
-      ARROW_ASSIGN_OR_RAISE(indexes, internal::BuildRowGroupIndex(schema_, layout_policy_, *batch));
+      ARROW_ASSIGN_OR_RAISE(indexes,
+                            internal::BuildRowGroupIndex(schema_, layout_policy_, *batch, true));
     }
     internal::RowGroupMeta row_group;
     row_group.row_count = static_cast<uint64_t>(batch->num_rows());

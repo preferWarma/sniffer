@@ -22,6 +22,7 @@
 #include <vector>
 
 #include "codec_internal.h"
+#include "index_internal.h"
 #include "scalar_internal.h"
 #include "sniffer/segment_reader.h"
 #include "sniffer/segment_writer.h"
@@ -499,6 +500,65 @@ TEST(SnifferCoreTest, TypedArrayHashMatchesScalarReference) {
           << "paired typed array hash matches independent scalar hashes";
     }
   }
+}
+
+TEST(SnifferCoreTest, SortedPrimaryStatisticsFastPathMatchesGenericIndex) {
+  const sniffer::TableSchema schema{
+      1, {{1, "id", arrow::int64(), false, nullptr}, {2, "value", arrow::int32(), true, nullptr}}};
+  const auto arrow_schema = ValueOrThrow(schema.ToArrowSchema(), "create sorted index schema");
+  const auto ids = BuildArray<arrow::Int64Builder, int64_t>({-5, -5, 0, 7, 9, 9});
+  const auto values =
+      BuildArray<arrow::Int32Builder, int32_t>({4, std::nullopt, -3, 8, std::nullopt, 2});
+  const auto batch = arrow::RecordBatch::Make(arrow_schema, ids->length(), {ids, values});
+  sniffer::LayoutPolicy layout;
+  layout.sort_key_field_ids = {1};
+  layout.statistics_field_ids = {1, 2};
+  layout.bloom_field_ids = {2};
+
+  std::vector<std::shared_ptr<arrow::Scalar>> previous_key;
+  RequireOk(sniffer::internal::ValidateAndUpdateSortOrder(schema, layout, *batch, &previous_key),
+            "validate sorted index input");
+  const auto generic =
+      ValueOrThrow(sniffer::internal::BuildRowGroupIndex(schema, layout, *batch, false),
+                   "build generic row-group index");
+  const auto optimized =
+      ValueOrThrow(sniffer::internal::BuildRowGroupIndex(schema, layout, *batch, true),
+                   "build sorted-primary row-group index");
+  const auto generic_bytes = ValueOrThrow(sniffer::internal::SerializeIndexBlock(schema, generic),
+                                          "serialize generic row-group index");
+  const auto optimized_bytes =
+      ValueOrThrow(sniffer::internal::SerializeIndexBlock(schema, optimized),
+                   "serialize sorted-primary row-group index");
+  EXPECT_TRUE(optimized_bytes == generic_bytes)
+      << "sorted-primary statistics fast path preserves index bytes";
+
+  const sniffer::TableSchema floating_schema{2, {{3, "key", arrow::float64(), false, nullptr}}};
+  const auto floating_arrow_schema =
+      ValueOrThrow(floating_schema.ToArrowSchema(), "create floating sorted index schema");
+  const auto keys = BuildArray<arrow::DoubleBuilder, double>({-0.0, 0.0, 1.0});
+  const auto floating_batch =
+      arrow::RecordBatch::Make(floating_arrow_schema, keys->length(), {keys});
+  sniffer::LayoutPolicy floating_layout;
+  floating_layout.sort_key_field_ids = {3};
+  floating_layout.statistics_field_ids = {3};
+  previous_key.clear();
+  RequireOk(sniffer::internal::ValidateAndUpdateSortOrder(floating_schema, floating_layout,
+                                                          *floating_batch, &previous_key),
+            "validate floating sorted index input");
+  const auto floating_generic =
+      ValueOrThrow(sniffer::internal::BuildRowGroupIndex(floating_schema, floating_layout,
+                                                         *floating_batch, false),
+                   "build generic floating row-group index");
+  const auto floating_optimized =
+      ValueOrThrow(sniffer::internal::BuildRowGroupIndex(floating_schema, floating_layout,
+                                                         *floating_batch, true),
+                   "build floating fallback row-group index");
+  EXPECT_TRUE(
+      ValueOrThrow(sniffer::internal::SerializeIndexBlock(floating_schema, floating_optimized),
+                   "serialize floating fallback index") ==
+      ValueOrThrow(sniffer::internal::SerializeIndexBlock(floating_schema, floating_generic),
+                   "serialize generic floating index"))
+      << "floating sort-key statistics preserve signed-zero index bytes";
 }
 
 TEST(SnifferCoreTest, PlainVariableBulkCopyMatchesReference) {

@@ -165,6 +165,26 @@ v0.2 聚焦现有 Segment writer、reader、codec、scan 和文件 I/O 路径的
 
 ## 11. 执行记录
 
+### 2026-09-17：复用已验证主排序键的 statistics
+
+- writer 在切分 Row Group 前已经验证整批 sort-key 顺序。主排序键同时配置 statistics 时，整数、
+  bool、timestamp、string/binary 现在直接以 Row Group 首尾值生成 min/max，不再逐行重复比较；
+  `BuildRowGroupIndex()` 通过显式 `sort_order_validated` 参数启用该路径，未验证的调用仍走通用实现。
+- float/double 刻意保留通用路径：排序比较认为 `-0` 和 `+0` 相等，首尾替换可能改变持久化标量的
+  bit pattern。新增 reference test 将 fast path 与通用路径的完整 index block 逐字节比较，并覆盖
+  signed-zero fallback。
+
+同机 Release、10 万行、Row Group 4,096、11 次重复的 P50：
+
+| 指标 | Before | After | 变化 |
+|---|---:|---:|---:|
+| writer index 阶段 | 2.2134 ms | 1.8142 ms | -18.0% |
+| 完整写入 | 9.9440 ms | 9.5825 ms | -3.6% |
+| 端到端 | 11.8320 ms / 8.452 M rows/s | 11.4767 ms / 8.713 M rows/s | 吞吐 +3.1% |
+
+文件仍为 663,679 bytes，Arrow allocation、剪枝数、ColumnChunk 读取数和读取字节均未变化。
+Debug、Release、ASan+UBSan 三套构建均为 48/48 通过，`git diff --check` 通过。
+
 ### 2026-09-17：FOR + Bitpack 按 byte 打包
 
 - profiler 将 `EncodeNonPlain` 定位为最大已解析 self hotspot。FOR encoder 原来对每个 delta 的每个

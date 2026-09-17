@@ -16,7 +16,8 @@ namespace sniffer::internal {
     std::vector<std::shared_ptr<arrow::Scalar>>* previous_key);
 [[nodiscard]] arrow::Result<RowGroupIndex> BuildRowGroupIndex(const TableSchema& schema,
                                                               const LayoutPolicy& layout,
-                                                              const arrow::RecordBatch& batch);
+                                                              const arrow::RecordBatch& batch,
+                                                              bool sort_order_validated = false);
 [[nodiscard]] arrow::Result<bool> BloomMayContain(const FieldSpec& field, const BloomMeta& bloom,
                                                   const arrow::Scalar& value);
 

@@ -237,6 +237,27 @@ arrow::Result<StatisticsMeta> BuildStatistics(uint32_t field_id, const arrow::Ar
   return statistics;
 }
 
+bool CanUseSortedPrimaryStatistics(const LayoutPolicy& layout, uint32_t field_id,
+                                   const arrow::Array& array, bool sort_order_validated) {
+  if (!sort_order_validated || layout.sort_key_field_ids.empty() ||
+      layout.sort_key_field_ids.front() != field_id || array.length() == 0 ||
+      array.null_count() != 0) {
+    return false;
+  }
+  // CompareArrayRows treats signed zeroes as equal, so endpoint substitution could change the
+  // persisted min/max bit pattern for an otherwise equivalent FLOAT/DOUBLE sequence.
+  return array.type_id() != arrow::Type::FLOAT && array.type_id() != arrow::Type::DOUBLE;
+}
+
+arrow::Result<StatisticsMeta> BuildSortedPrimaryStatistics(uint32_t field_id,
+                                                           const arrow::Array& array) {
+  StatisticsMeta statistics;
+  statistics.field_id = field_id;
+  ARROW_ASSIGN_OR_RAISE(statistics.min, array.GetScalar(0));
+  ARROW_ASSIGN_OR_RAISE(statistics.max, array.GetScalar(array.length() - 1));
+  return statistics;
+}
+
 }  // namespace
 
 arrow::Status ValidateAndUpdateSortOrder(
@@ -266,7 +287,8 @@ arrow::Status ValidateAndUpdateSortOrder(
 
 arrow::Result<RowGroupIndex> BuildRowGroupIndex(const TableSchema& schema,
                                                 const LayoutPolicy& layout,
-                                                const arrow::RecordBatch& batch) {
+                                                const arrow::RecordBatch& batch,
+                                                bool sort_order_validated) {
   RowGroupIndex result;
   result.statistics.reserve(layout.statistics_field_ids.size());
   result.blooms.reserve(layout.bloom_field_ids.size());
@@ -275,7 +297,12 @@ arrow::Result<RowGroupIndex> BuildRowGroupIndex(const TableSchema& schema,
   for (const uint32_t field_id : layout.statistics_field_ids) {
     ARROW_ASSIGN_OR_RAISE(const size_t field_index, FieldIndex(schema, field_id));
     const auto& array = batch.column(static_cast<int>(field_index));
-    ARROW_ASSIGN_OR_RAISE(auto statistics, BuildStatistics(field_id, *array));
+    StatisticsMeta statistics;
+    if (CanUseSortedPrimaryStatistics(layout, field_id, *array, sort_order_validated)) {
+      ARROW_ASSIGN_OR_RAISE(statistics, BuildSortedPrimaryStatistics(field_id, *array));
+    } else {
+      ARROW_ASSIGN_OR_RAISE(statistics, BuildStatistics(field_id, *array));
+    }
     result.statistics.push_back(std::move(statistics));
   }
 
