@@ -435,15 +435,28 @@ arrow::Result<std::vector<uint8_t>> EncodeForBitpack(const FieldSpec& field,
     return InvalidCodec("packed FOR payload exceeds platform limit");
   }
   std::vector<uint8_t> packed(static_cast<size_t>(packed_length), 0);
-  for (uint64_t row = 0; row < deltas.size(); ++row) {
-    const uint64_t delta = deltas[static_cast<size_t>(row)];
-    for (uint32_t bit = 0; bit < bit_width; ++bit) {
-      if (((delta >> bit) & 1U) != 0) {
-        const uint64_t position = row * bit_width + bit;
-        packed[static_cast<size_t>(position / 8U)] |=
-            static_cast<uint8_t>(1U << static_cast<uint32_t>(position % 8U));
-      }
+  uint64_t bit_offset = 0;
+  for (const uint64_t delta : deltas) {
+    uint64_t remaining_value = delta;
+    uint32_t remaining_bits = bit_width;
+    size_t byte_index = static_cast<size_t>(bit_offset / 8U);
+    const uint32_t first_bit = static_cast<uint32_t>(bit_offset % 8U);
+    if (remaining_bits != 0) {
+      const uint32_t first_bits = std::min<uint32_t>(remaining_bits, 8U - first_bit);
+      packed[byte_index] |= static_cast<uint8_t>(remaining_value << first_bit);
+      remaining_value >>= first_bits;
+      remaining_bits -= first_bits;
+      ++byte_index;
     }
+    while (remaining_bits >= 8U) {
+      packed[byte_index++] = static_cast<uint8_t>(remaining_value);
+      remaining_value >>= 8U;
+      remaining_bits -= 8U;
+    }
+    if (remaining_bits != 0) {
+      packed[byte_index] = static_cast<uint8_t>(remaining_value);
+    }
+    bit_offset += bit_width;
   }
   ByteWriter base_bytes;
   WriteWidth(&base_bytes, base_bits, width);

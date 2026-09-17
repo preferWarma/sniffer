@@ -653,6 +653,34 @@ TEST(SnifferCoreTest, TypedForMatchesScalarReference) {
   }
 }
 
+TEST(SnifferCoreTest, ForBitpackAllBitWidthsMatchReference) {
+  const sniffer::FieldSpec field{1, "value", arrow::uint64(), true, nullptr};
+  for (uint32_t bit_width = 0; bit_width <= 64; ++bit_width) {
+    const uint64_t maximum = bit_width == 64
+                                 ? std::numeric_limits<uint64_t>::max()
+                                 : (bit_width == 0 ? 0 : (uint64_t{1} << bit_width) - 1U);
+    const auto array = BuildArray<arrow::UInt64Builder, uint64_t>(
+        {uint64_t{0}, maximum, std::nullopt, maximum / 3U, maximum});
+    const auto expected =
+        ValueOrThrow(ReferenceEncodeFor(field, *array), "reference FOR bit-width encode");
+    const auto actual = ValueOrThrow(
+        sniffer::internal::EncodeNonPlain(sniffer::internal::kForBitpackEncodingId, field, *array),
+        "typed FOR bit-width encode");
+    EXPECT_TRUE(actual == expected) << "FOR payload differs at bit width " << bit_width;
+
+    sniffer::internal::ColumnChunkMeta chunk;
+    chunk.field_id = field.field_id;
+    chunk.physical_type = sniffer::internal::PhysicalTypeId::kUInt64;
+    chunk.encoding_id = sniffer::internal::kForBitpackEncodingId;
+    chunk.row_count = static_cast<uint64_t>(array->length());
+    chunk.null_count = static_cast<uint64_t>(array->null_count());
+    chunk.length = static_cast<uint64_t>(actual.size());
+    const auto decoded = ValueOrThrow(sniffer::internal::DecodeNonPlain(field, chunk, actual),
+                                      "decode FOR bit-width payload");
+    EXPECT_TRUE(decoded->Equals(array)) << "FOR round-trip differs at bit width " << bit_width;
+  }
+}
+
 TEST(SnifferCoreTest, TypedDictionaryMatchesScalarReference) {
   const auto data = MakeAllTypesBatch();
   const std::array<size_t, 10> field_indexes = {1, 2, 3, 4, 5, 6, 7, 8, 12, 13};

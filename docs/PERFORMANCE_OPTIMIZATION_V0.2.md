@@ -53,7 +53,7 @@ v0.2 聚焦现有 Segment writer、reader、codec、scan 和文件 I/O 路径的
       footer/trailer。
 - [x] 增加 reader 分阶段计时：Open/全文件校验、索引解析、chunk I/O、chunk checksum、解码、
       谓词、selection materialization、RecordBatch 拼接。
-- [ ] 使用 Instruments 或等价 profiler 保存 CPU flamegraph 摘要和 allocation hot spots；先证明
+- [x] 使用 Instruments 或等价 profiler 保存 CPU flamegraph 摘要和 allocation hot spots；先证明
       热点，再修改实现。
 - [x] 增加峰值 RSS、Arrow memory pool 峰值和每输入行分配次数指标。
 - [x] 扩展固定矩阵：Row Group 1K/8K/64K/256K，选择率 1%/10%/50%/100%，单列/多列/全列投影。
@@ -164,6 +164,43 @@ v0.2 聚焦现有 Segment writer、reader、codec、scan 和文件 I/O 路径的
 - [ ] 更新 README 的性能状态，不把合成 benchmark 结果表述为通用生产性能。
 
 ## 11. 执行记录
+
+### 2026-09-17：FOR + Bitpack 按 byte 打包
+
+- profiler 将 `EncodeNonPlain` 定位为最大已解析 self hotspot。FOR encoder 原来对每个 delta 的每个
+  bit 分支并写入目标 byte；现在保持相同 LSB-first 字节布局，按当前 byte、完整 byte 和尾部 byte
+  分段写入。base/delta 计算、encoding ID、payload header 和 decoder 均未改变。
+- 新增 0–64 全部 bit width 的逐字节 reference 对照与 round-trip，包含 null；既有整数宽度、
+  timestamp、极值和随机 property tests 继续通过。第一版试图移除 delta buffer，但因额外 min/max
+  比较造成回退，已在提交前弃用。
+
+同机 Release before/after（10 万行，11 次重复，均取 P50）：
+
+| 指标 | Before | After | 变化 |
+|---|---:|---:|---:|
+| FOR encode microbenchmark | 710.6 MiB/s | 1.107 GiB/s | 约 +59% |
+| writer encoding 阶段 | 6.2222 ms | 2.3235 ms | -62.7% |
+| 完整写入 | 13.4723 ms | 9.7804 ms | -27.4% |
+| 端到端 | 15.3318 ms / 6.522 M rows/s | 11.6660 ms / 8.572 M rows/s | 吞吐 +31.4% |
+
+文件仍为 663,679 bytes，仍剪枝 12/25 Row Group、读取 26 个 ColumnChunk 和 172,228 bytes；
+Arrow allocation 指标仍为 114 次和 1,624,448 bytes/iteration。三个 FOR 相关压缩场景的文件大小
+分别保持 153,882、91,594 和 54,094 bytes。Debug、Release、ASan+UBSan 最终均为 47/47 通过；
+Debug JSON smoke 在三套构建并行时曾因 allocation 采样竞争失败一次，串行重跑通过。
+
+### 2026-09-17：CPU 与 allocation profile
+
+- Instruments Time Profiler 的完整工作负载窗口累计 4,582 ms 样本；最大已解析 self hotspot 为
+  `EncodeNonPlain`（32.13%），其次是 `HashArrayValuePair`（4.76%）、`BuildRowGroupIndex`
+  （4.71%）、FOR selected decode（3.10%）和 CRC32C（2.40%）。另有 25.38% 样本未解析符号，
+  所以不把 inclusive time 当作可相加的精确阶段占比。
+- Instruments Allocations 在本机无法稳定附加，改用 `MallocStackLogging`/`malloc_history` 获取 live
+  allocation 快照；项目内最大归属同样是 `EncodeNonPlain`（57,344 bytes）和
+  `BuildRowGroupIndex`（10,864 bytes）。mimalloc 的虚拟 arena 预留已排除，带 stack logging 的耗时
+  不用于吞吐结论。
+- 详细场景、命令、CPU/allocation 表和限制记录在
+  [`bench/PROFILE_V0.2.md`](../bench/PROFILE_V0.2.md)。profile 支持下一项优先合并 writer 的选择器、
+  索引和编码遍历；当前不优先做 SIMD 或 CRC32C 专项。
 
 ### 2026-09-17：Arrow allocation 与峰值 RSS 指标
 
