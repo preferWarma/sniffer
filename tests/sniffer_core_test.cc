@@ -940,6 +940,15 @@ TEST(SnifferCoreTest, ForBitpackAllBitWidthsMatchReference) {
     const auto decoded = ValueOrThrow(sniffer::internal::DecodeNonPlain(field, chunk, actual),
                                       "decode FOR bit-width payload");
     EXPECT_TRUE(decoded->Equals(array)) << "FOR round-trip differs at bit width " << bit_width;
+
+    const std::vector<uint64_t> selection = {0, 2, 3, 4};
+    const auto selected =
+        ValueOrThrow(sniffer::internal::DecodeNonPlain(field, chunk, actual, &selection),
+                     "decode selected FOR bit-width payload");
+    const auto selected_expected = BuildArray<arrow::UInt64Builder, uint64_t>(
+        {uint64_t{0}, std::nullopt, maximum / 3U, maximum});
+    EXPECT_TRUE(selected->Equals(selected_expected))
+        << "FOR selected round-trip differs at bit width " << bit_width;
   }
 }
 

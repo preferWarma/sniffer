@@ -695,3 +695,30 @@ Row Group 行数线性增长的临时内存，同时保持 payload、输出数�
 
 文件仍为 663,679 字节，Arrow 分配、剪枝数量、ColumnChunk 读取数与读取字节不变。该收益大于本轮
 P50 运行波动，且实现比字符串遍历融合更小；后续重新 profile 后再选择下一热点。
+
+### 2026-09-18：FOR bytewise unpack
+
+- 在绑定 Bloom typed hasher 的版本上重新采样后，Bloom 的剩余成本主要是实际双哈希计算，FOR typed
+  decode 已成为第二大已解析 top-of-stack 热点。原 decoder 虽已移除 Scalar，但每个值仍逐 bit
+  读取 payload。
+- 新 decoder 按首个非对齐字节、连续完整字节和末尾残余 bit 三段读取 delta；不改变 base、validity、
+  payload 边界验证或 Arrow builder 路径。全部 bit width 0–64 同时覆盖 full decode 和包含 null、
+  非对齐 row 的 selected decode。
+
+同机 Release 的 FOR codec decode microbenchmark（100,000 个 `uint64`、128 值范围、21 次 P50）：
+
+| 指标 | Before | After | 变化 |
+|---|---:|---:|---:|
+| decode latency | 383 us | 314 us | -18.0% |
+| logical throughput | 1.979 GiB/s | 2.412 GiB/s | +21.9% |
+
+固定文件场景（100,000 行、Row Group 4,096、50% 选择率、11 次 P50）：
+
+| 指标 | Before | After | 变化 |
+|---|---:|---:|---:|
+| scan | 1.2681 ms | 0.9628 ms | -24.1% |
+| writer 总耗时 | 6.0562 ms | 5.9326 ms | -2.0% |
+| 端到端耗时 / 吞吐 | 7.3221 ms / 13.657 M rows/s | 6.8913 ms / 14.511 M rows/s | 吞吐 +6.3% |
+
+文件仍为 663,679 字节；Arrow 分配、12/25 Row Group 剪枝、26 个 ColumnChunk 和 172,228 个读取字节
+均保持不变。microbenchmark CPU CV 为 3.51%，完整场景 CPU CV 为 1.04%。

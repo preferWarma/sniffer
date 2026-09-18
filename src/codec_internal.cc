@@ -824,6 +824,36 @@ arrow::Result<std::shared_ptr<arrow::Array>> DecodeRle(const FieldSpec& field,
   }
 }
 
+uint64_t ReadPackedDelta(std::span<const uint8_t> packed, uint64_t row, uint8_t bit_width) {
+  if (bit_width == 0) {
+    return 0;
+  }
+  const uint64_t bit_offset = row * bit_width;
+  size_t byte_index = static_cast<size_t>(bit_offset / 8U);
+  const uint32_t first_bit = static_cast<uint32_t>(bit_offset % 8U);
+  uint32_t remaining_bits = bit_width;
+  uint32_t output_bits = 0;
+  uint64_t delta = 0;
+
+  const uint32_t first_bits = std::min<uint32_t>(remaining_bits, 8U - first_bit);
+  const uint64_t first_mask = (uint64_t{1} << first_bits) - 1U;
+  delta = (static_cast<uint64_t>(packed[byte_index]) >> first_bit) & first_mask;
+  remaining_bits -= first_bits;
+  output_bits += first_bits;
+  ++byte_index;
+
+  while (remaining_bits >= 8U) {
+    delta |= static_cast<uint64_t>(packed[byte_index++]) << output_bits;
+    remaining_bits -= 8U;
+    output_bits += 8U;
+  }
+  if (remaining_bits != 0) {
+    const uint64_t mask = (uint64_t{1} << remaining_bits) - 1U;
+    delta |= (static_cast<uint64_t>(packed[byte_index]) & mask) << output_bits;
+  }
+  return delta;
+}
+
 template <typename Rows, typename Builder, typename Convert>
 arrow::Result<std::shared_ptr<arrow::Array>> DecodeForRows(const Rows& rows,
                                                            std::span<const uint8_t> validity,
@@ -841,14 +871,7 @@ arrow::Result<std::shared_ptr<arrow::Array>> DecodeForRows(const Rows& rows,
       ARROW_RETURN_NOT_OK(builder->AppendNull());
       continue;
     }
-    uint64_t delta = 0;
-    for (uint32_t bit = 0; bit < bit_width; ++bit) {
-      const uint64_t position = row * bit_width + bit;
-      if ((packed[static_cast<size_t>(position / 8U)] &
-           static_cast<uint8_t>(1U << static_cast<uint32_t>(position % 8U))) != 0) {
-        delta |= uint64_t{1} << bit;
-      }
-    }
+    const uint64_t delta = ReadPackedDelta(packed, row, bit_width);
     if (delta > maximum_delta) {
       return InvalidCodec("FOR delta exceeds physical type domain");
     }

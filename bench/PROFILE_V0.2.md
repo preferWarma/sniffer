@@ -137,3 +137,31 @@ Bloom string 与 selector 的完整遍历融合在两版实现中均未产生稳
 Bloom 的字段、array 和 physical type，保留原哈希字节与双种子算法；index P50 从 2.1369 ms 降至
 1.9700 ms，writer 从 6.1797 ms 降至 6.0562 ms，端到端从 7.4572 ms 降至 7.3221 ms。下一轮
 profile 应基于该版本重新采样，不再沿用本节开头 `e0e3467` 的热点占比。
+
+## 7. `984d3c5` 后的热点复查
+
+在相同的 100,000 行、Row Group 4,096、50% 选择率 Release 场景上重新采样，主线程主要
+top-of-stack 样本为：
+
+| 符号 | top-of-stack 样本 |
+|---|---:|
+| `ArrayValuePairHasher::Hash` | 455 |
+| FOR typed decode | 321 |
+| `BuildRowGroupIndex` | 298 |
+| `EncodeNonPlain` | 273 |
+| file write syscall | 219 |
+| UTF-8 validation | 114 |
+| sort validation | 105 |
+| string hash-map insertion | 104 |
+| CRC32C | 94 |
+| `BuildStatistics` | 93 |
+| `ArrayIntegralBits` | 92 |
+| `SelectEncoding` | 76 |
+
+Bloom 排名第一，但该路径现在主要执行格式要求的实际双哈希；FOR decode 则仍逐 bit 读取 delta，
+因此选择后者作为下一项局部优化。将 unpack 改为首尾 partial byte 加中间 whole bytes 后，FOR decode
+microbenchmark P50 从 383 us 降至 314 us（-18.0%），吞吐从 1.979 GiB/s 升至 2.412 GiB/s。
+
+完整固定场景 11 次 P50 中，scan 从 1.2681 ms 降至 0.9628 ms，端到端从 7.3221 ms 降至
+6.8913 ms，吞吐从 13.657 M rows/s 升至 14.511 M rows/s。文件字节、分配、剪枝和读取量均不变；
+全部 bit width 0–64 的 full/selected decode 测试用于验证非对齐读取与 null 语义。
