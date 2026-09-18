@@ -701,6 +701,50 @@ TEST(SnifferCoreTest, EncodingSelectorReusesIntegralStatisticsSample) {
                 sniffer::internal::SelectEncoding(null_schema.fields.front(), *null_values, layout,
                                                   &null_analysis.encoding_samples.front()),
                 "select all-null reused encoding"));
+
+  std::vector<std::optional<int64_t>> many_values;
+  many_values.reserve(6000);
+  for (int64_t row = 0; row < 6000; ++row) {
+    many_values.push_back(row % 19 == 0 ? std::optional<int64_t>()
+                                        : std::optional<int64_t>((row * 37) % 257 - 128));
+  }
+  const sniffer::TableSchema many_schema{1, {{200, "many", arrow::int64(), true, nullptr}}};
+  const auto many_arrow_schema = ValueOrThrow(many_schema.ToArrowSchema(), "create many schema");
+  const auto many_array = BuildArray<arrow::Int64Builder, int64_t>(many_values);
+  const auto many_batch =
+      arrow::RecordBatch::Make(many_arrow_schema, many_array->length(), {many_array});
+  layout.encoding_sample_rows = 1024;
+  layout.statistics_field_ids = {200};
+  sniffer::internal::RowGroupAnalysis many_analysis;
+  many_analysis.encoding_sample_rows = layout.encoding_sample_rows;
+  ValueOrThrow(sniffer::internal::BuildRowGroupIndex(many_schema, layout, *many_batch, false,
+                                                     &many_analysis),
+               "build large selector analysis");
+  ASSERT_EQ(many_analysis.encoding_samples.size(), 1U);
+  EXPECT_EQ(many_analysis.encoding_samples.front().dictionary_count, 257U);
+  EXPECT_EQ(ValueOrThrow(
+                sniffer::internal::SelectEncoding(many_schema.fields.front(), *many_array, layout),
+                "select large reference encoding"),
+            ValueOrThrow(
+                sniffer::internal::SelectEncoding(many_schema.fields.front(), *many_array, layout,
+                                                  &many_analysis.encoding_samples.front()),
+                "select large reused encoding"));
+
+  layout.encoding_sample_rows = 5000;
+  sniffer::internal::RowGroupAnalysis fallback_analysis;
+  fallback_analysis.encoding_sample_rows = layout.encoding_sample_rows;
+  ValueOrThrow(sniffer::internal::BuildRowGroupIndex(many_schema, layout, *many_batch, false,
+                                                     &fallback_analysis),
+               "build fallback selector analysis");
+  ASSERT_EQ(fallback_analysis.encoding_samples.size(), 1U);
+  EXPECT_EQ(fallback_analysis.encoding_samples.front().dictionary_count, 257U);
+  EXPECT_EQ(ValueOrThrow(
+                sniffer::internal::SelectEncoding(many_schema.fields.front(), *many_array, layout),
+                "select fallback reference encoding"),
+            ValueOrThrow(
+                sniffer::internal::SelectEncoding(many_schema.fields.front(), *many_array, layout,
+                                                  &fallback_analysis.encoding_samples.front()),
+                "select fallback reused encoding"));
 }
 
 TEST(SnifferCoreTest, TypedStatisticsMatchScalarReference) {

@@ -792,3 +792,23 @@ P50 运行波动，且实现比字符串遍历融合更小；后续重新 profil
 
 文件、Arrow 分配、剪枝和读取指标不变。microbenchmark CPU CV 为 0.77%，完整场景 CPU CV 为
 1.03%。
+
+### 2026-09-18：连续存储 statistics distinct sample
+
+- 整数 statistics 与 encoding selector 共用的最多 4,096 行 sample 不再用 node-based
+  `unordered_set<uint64_t>` 逐 distinct value 分配；改为预留连续 vector、收集有效 bits，再排序去重。
+- 超过 4,096 行的用户配置继续使用原 hash-set 路径，避免把任意大 sample 强制变成 O(n log n)。
+  1,024 行快路径和 5,000 行 fallback 都与直接 selector 的 encoding ID 一致；持久化 statistics bytes
+  不变。
+
+同机 Release、100,000 行、Row Group 4,096、50% 选择率、11 次 P50；采用加入大 sample fallback
+后的最终确认运行：
+
+| 指标 | Before | After | 变化 |
+|---|---:|---:|---:|
+| writer index | 1.7176 ms | 1.2402 ms | -27.8% |
+| writer 总耗时 | 5.3795 ms | 4.9502 ms | -8.0% |
+| 端到端耗时 / 吞吐 | 6.3531 ms / 15.740 M rows/s | 5.9501 ms / 16.807 M rows/s | 吞吐 +6.8% |
+
+前两轮 index P50 为 1.2281 ms 和 1.2274 ms，最终保守值仍明显高于运行波动；最终 wall/CPU CV 为
+0.54%/0.55%。文件、Arrow 分配、剪枝和读取指标不变。

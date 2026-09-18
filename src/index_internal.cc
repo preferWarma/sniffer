@@ -7,6 +7,7 @@
 #include <string_view>
 #include <type_traits>
 #include <unordered_set>
+#include <vector>
 
 #include "scalar_internal.h"
 
@@ -229,7 +230,8 @@ arrow::Result<StatisticsMeta> BuildPrimitiveStatistics(uint32_t field_id,
   statistics.null_count = static_cast<uint64_t>(array.null_count());
   int64_t min_row = -1;
   int64_t max_row = -1;
-  std::unordered_set<uint64_t> sample_distinct;
+  std::vector<uint64_t> sample_values;
+  std::unordered_set<uint64_t> sample_distinct_fallback;
   bool sample_first = true;
   bool sample_previous_valid = false;
   uint64_t sample_previous = 0;
@@ -238,9 +240,14 @@ arrow::Result<StatisticsMeta> BuildPrimitiveStatistics(uint32_t field_id,
   SampleValue sample_maximum{};
   const bool collect_distinct =
       array.type_id() != arrow::Type::BOOL && array.type_id() != arrow::Type::TIMESTAMP;
+  constexpr int64_t kSortedDistinctSampleRows = 4096;
+  const bool use_sorted_distinct = collect_distinct && sample_rows <= kSortedDistinctSampleRows;
   if (analysis) {
     analysis->field_id = field_id;
     analysis->sample_rows = sample_rows;
+    if (use_sorted_distinct) {
+      sample_values.reserve(static_cast<size_t>(sample_rows));
+    }
   }
   for (int64_t row = 0; row < array.length(); ++row) {
     const bool valid = array.IsValid(row);
@@ -249,7 +256,11 @@ arrow::Result<StatisticsMeta> BuildPrimitiveStatistics(uint32_t field_id,
         const uint64_t bits = valid ? static_cast<uint64_t>(array.Value(row)) : 0;
         if (valid) {
           if (collect_distinct) {
-            sample_distinct.insert(bits);
+            if (use_sorted_distinct) {
+              sample_values.push_back(bits);
+            } else {
+              sample_distinct_fallback.insert(bits);
+            }
           }
           if (!analysis->have_extrema) {
             sample_minimum = array.Value(row);
@@ -299,7 +310,13 @@ arrow::Result<StatisticsMeta> BuildPrimitiveStatistics(uint32_t field_id,
     }
   }
   if (analysis) {
-    analysis->dictionary_count = static_cast<uint64_t>(sample_distinct.size());
+    if (use_sorted_distinct) {
+      std::sort(sample_values.begin(), sample_values.end());
+      analysis->dictionary_count = static_cast<uint64_t>(
+          std::unique(sample_values.begin(), sample_values.end()) - sample_values.begin());
+    } else {
+      analysis->dictionary_count = static_cast<uint64_t>(sample_distinct_fallback.size());
+    }
   }
   return FinishStatistics(std::move(statistics), array, min_row, max_row);
 }

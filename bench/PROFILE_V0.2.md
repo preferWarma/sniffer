@@ -225,3 +225,15 @@ Bloom known-valid 快路径合入后重新采样，排除 benchmark 启动样本
 bitmap 批量复制并支持非 byte-aligned slice 后，nullable FOR encode P50 从 575 us 降至 400 us
 （-30.4%），writer encoding 从 1.5698 ms 降至 1.4255 ms。完整场景端到端从 6.4561 ms 降至
 6.3531 ms；文件字节、分配、剪枝和读取量不变。
+
+## 11. `07b2302` 后的 statistics sample 分配
+
+validity bitmap 优化合入后重新采样，`BuildRowGroupIndex` 以 256 个 top-of-stack 样本成为首位。
+调用树显示 `BuildStatistics` 的整数 sample distinct 统计产生大量 `unordered_set<uint64_t>` node
+分配和释放；默认每个 Row Group 对 nullable value 列分析 1,024 行。
+
+小 sample 改为预留连续 vector 并在遍历后排序去重；超过 4,096 行继续使用原 hash-set fallback。
+固定场景的三轮 writer index P50 为 1.2281、1.2274 和 1.2402 ms，相对 1.7176 ms 基线保守降低
+27.8%。最终确认运行的 writer 从 5.3795 ms 降至 4.9502 ms，端到端从 6.3531 ms 降至
+5.9501 ms，吞吐从 15.740 M rows/s 升至 16.807 M rows/s。持久化 bytes、编码选择、分配指标、
+剪枝和读取量不变。
