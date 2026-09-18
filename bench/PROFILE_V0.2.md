@@ -237,3 +237,21 @@ validity bitmap 优化合入后重新采样，`BuildRowGroupIndex` 以 256 个 t
 27.8%。最终确认运行的 writer 从 5.3795 ms 降至 4.9502 ms，端到端从 6.3531 ms 降至
 5.9501 ms，吞吐从 15.740 M rows/s 升至 16.807 M rows/s。持久化 bytes、编码选择、分配指标、
 剪枝和读取量不变。
+
+## 12. `d289ccb` 后的 Dictionary index 写入
+
+statistics sample 优化合入后重新采样，主要 top-of-stack 包括 `ByteWriter::WriteU8` 336、
+`EncodeNonPlain` 281、`BuildRowGroupIndex` 253、`ArrayValuePairHasher::HashKnownValid` 164、文件写入
+156、FOR decode 112、sort validation 102、Dictionary string hash-map insertion 98、UTF-8 validation
+79、`PlainSampleSize` 66、`BuildStatistics` 59 和 CRC32C 54。调用树进一步确认，234 个以上的
+`WriteU8` 样本来自 Dictionary index 的逐行写入。
+
+按 index width 一次分配并直接写 little-endian bytes 后，Dictionary string encode microbenchmark
+P50 从 783 us 降至 639 us（-18.4%），吞吐从 1.354 GiB/s 升至 1.656 GiB/s；CPU CV 为 0.46%。
+257 和 65,537 distinct value 的 Scalar reference 对比覆盖 2/4 字节宽度边界，既有 case 覆盖
+1 字节宽度。
+
+固定场景确认运行中，writer encoding 从 1.4614 ms 降至 1.2513 ms，writer 从 4.9502 ms 降至
+4.7825 ms，端到端从 5.9501 ms 降至 5.7627 ms，吞吐从 16.807 M rows/s 升至 17.353 M rows/s。
+完整场景 wall/CPU CV 为 1.56%/1.64%，writer encoding CPU CV 为 0.77%。Dictionary payload、Segment
+文件、Arrow 分配、剪枝和读取量均不变。

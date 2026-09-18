@@ -812,3 +812,32 @@ P50 运行波动，且实现比字符串遍历融合更小；后续重新 profil
 
 前两轮 index P50 为 1.2281 ms 和 1.2274 ms，最终保守值仍明显高于运行波动；最终 wall/CPU CV 为
 0.54%/0.55%。文件、Arrow 分配、剪枝和读取指标不变。
+
+### 2026-09-18：批量写入 Dictionary index
+
+- `d289ccb` 后的 profile 显示，Dictionary payload 仍逐个 index 调用 `ByteWriter::WriteU8()`；调用树中
+  该路径占 234 个以上样本。现在按已确定的 1/2/4/8 字节宽度一次分配目标 buffer，并直接写入规范的
+  little-endian 字节，避免每行函数调用与 vector 增长检查。
+- reference test 在既有全部字段类型基础上增加 257 和 65,537 个 distinct value，覆盖 2 字节和
+  4 字节宽度边界；既有低基数输入覆盖 1 字节宽度。8 字节宽度需要超过 `uint32_t` 上限的 distinct
+  value，无法作为常规单元测试构造，但由同一通用写入循环处理。
+
+同机 Release 的 Dictionary string encode microbenchmark（100,000 行、32 个 distinct value、21 次
+P50）：
+
+| 指标 | Before | After | 变化 |
+|---|---:|---:|---:|
+| encode latency | 783 us | 639 us | -18.4% |
+| logical throughput | 1.354 GiB/s | 1.656 GiB/s | +22.3% |
+
+固定文件场景（100,000 行、Row Group 4,096、50% 选择率、11 次 P50）：
+
+| 指标 | Before | After | 变化 |
+|---|---:|---:|---:|
+| writer encoding | 1.4614 ms | 1.2513 ms | -14.4% |
+| writer 总耗时 | 4.9502 ms | 4.7825 ms | -3.4% |
+| 端到端耗时 / 吞吐 | 5.9501 ms / 16.807 M rows/s | 5.7627 ms / 17.353 M rows/s | 吞吐 +3.3% |
+
+确认运行的 wall/CPU CV 为 1.56%/1.64%，其中 writer encoding CPU CV 为 0.77%；microbenchmark CPU
+CV 为 0.46%。Dictionary payload 仍为 113,058 字节，完整 Segment 仍为 663,679 字节；Arrow 分配、
+12/25 Row Group 剪枝、26 个 ColumnChunk 和 172,228 个读取字节均保持不变。

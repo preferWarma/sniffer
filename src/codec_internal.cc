@@ -120,6 +120,24 @@ arrow::Result<uint64_t> ReadWidth(ByteReader* reader, uint32_t width) {
   }
 }
 
+arrow::Result<std::vector<uint8_t>> EncodeWidths(std::span<const uint64_t> values, uint32_t width) {
+  if (width != 1 && width != 2 && width != 4 && width != 8) {
+    return InvalidCodec("invalid integer width");
+  }
+  if (values.size() > std::numeric_limits<size_t>::max() / width) {
+    return InvalidCodec("encoded integer buffer exceeds platform limit");
+  }
+  std::vector<uint8_t> bytes(values.size() * width);
+  for (size_t index = 0; index < values.size(); ++index) {
+    const uint64_t value = values[index];
+    const size_t offset = index * width;
+    for (uint32_t byte = 0; byte < width; ++byte) {
+      bytes[offset + byte] = static_cast<uint8_t>(value >> (byte * 8U));
+    }
+  }
+  return bytes;
+}
+
 arrow::Result<uint64_t> ArrayIntegralBits(const arrow::Array& array, int64_t row) {
   switch (array.type_id()) {
     case arrow::Type::BOOL:
@@ -405,10 +423,7 @@ arrow::Result<std::vector<uint8_t>> EncodeDictionary(const FieldSpec& field,
     dictionary_count = static_cast<uint64_t>(dictionary.size());
   }
   const uint32_t index_width = IndexWidth(dictionary_count);
-  ByteWriter encoded_indices;
-  for (const uint64_t index : indices) {
-    WriteWidth(&encoded_indices, index, index_width);
-  }
+  ARROW_ASSIGN_OR_RAISE(auto encoded_indices, EncodeWidths(indices, index_width));
   ByteWriter payload;
   payload.WriteU64(static_cast<uint64_t>(validity.size()));
   payload.WriteU64(dictionary_count);
@@ -418,11 +433,11 @@ arrow::Result<std::vector<uint8_t>> EncodeDictionary(const FieldSpec& field,
   }
   payload.WriteU64(static_cast<uint64_t>(dictionary_offsets.data().size()));
   payload.WriteU64(static_cast<uint64_t>(dictionary_values.data().size()));
-  payload.WriteU64(static_cast<uint64_t>(encoded_indices.data().size()));
+  payload.WriteU64(static_cast<uint64_t>(encoded_indices.size()));
   payload.WriteBytes(validity);
   payload.WriteBytes(dictionary_offsets.data());
   payload.WriteBytes(dictionary_values.data());
-  payload.WriteBytes(encoded_indices.data());
+  payload.WriteBytes(encoded_indices);
   return std::move(payload).Finish();
 }
 

@@ -1052,6 +1052,24 @@ TEST(SnifferCoreTest, TypedDictionaryMatchesScalarReference) {
     EXPECT_TRUE(selected->Equals(selected_expected))
         << "typed Dictionary selected decode matches scalar reference for " + field.name;
   }
+
+  const sniffer::FieldSpec wide_field{200, "wide", arrow::uint32(), false, nullptr};
+  for (const uint32_t dictionary_count : {257U, 65537U}) {
+    std::vector<std::optional<uint32_t>> values;
+    values.reserve(dictionary_count);
+    for (uint32_t value = 0; value < dictionary_count; ++value) {
+      values.emplace_back(value);
+    }
+    const auto array = BuildArray<arrow::UInt32Builder, uint32_t>(values);
+    const auto expected =
+        ValueOrThrow(ReferenceEncodeDictionary(wide_field, *array), "wide Dictionary reference");
+    const auto actual =
+        ValueOrThrow(sniffer::internal::EncodeNonPlain(sniffer::internal::kDictionaryEncodingId,
+                                                       wide_field, *array),
+                     "wide typed Dictionary encode");
+    EXPECT_EQ(actual, expected) << "Dictionary index width preserves bytes at count "
+                                << dictionary_count;
+  }
 }
 
 TEST(SnifferCoreTest, NonPlainSelectionValidation) {
