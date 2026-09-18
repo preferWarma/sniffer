@@ -1,5 +1,7 @@
 #include "codec_internal.h"
 
+#include <arrow/util/bitmap_ops.h>
+
 #include <algorithm>
 #include <bit>
 #include <cstddef>
@@ -39,12 +41,8 @@ std::vector<uint8_t> EncodeValidity(const arrow::Array& array) {
   }
   const uint64_t rows = static_cast<uint64_t>(array.length());
   std::vector<uint8_t> validity(static_cast<size_t>(rows / 8U + (rows % 8U != 0)), 0);
-  for (int64_t row = 0; row < array.length(); ++row) {
-    if (array.IsValid(row)) {
-      validity[static_cast<size_t>(row / 8)] |=
-          static_cast<uint8_t>(1U << static_cast<uint32_t>(row % 8));
-    }
-  }
+  arrow::internal::CopyBitmap(array.null_bitmap_data(), array.offset(), array.length(),
+                              validity.data(), 0);
   return validity;
 }
 

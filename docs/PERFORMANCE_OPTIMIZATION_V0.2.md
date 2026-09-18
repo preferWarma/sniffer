@@ -767,3 +767,28 @@ P50 运行波动，且实现比字符串遍历融合更小；后续重新 profil
 
 文件仍为 663,679 字节；Arrow 分配、12/25 Row Group 剪枝、26 个 ColumnChunk 和 172,228 个读取字节
 均保持不变。
+
+### 2026-09-18：批量复制 Arrow validity bitmap
+
+- `EncodeValidity()` 原先逐行调用 `IsValid()` 再组装 bitmap。Plain、Dictionary 和 FOR 现在直接用
+  Arrow bitmap primitive 从 `array.offset()` 开始复制到零初始化的目标，保留尾部 padding bit 为零。
+- 新增 nullable sliced binary 的 Plain reference 比较；既有 sliced FOR、全部 bit width、all-null、
+  Dictionary 和确定性输出测试共同覆盖非 byte-aligned offset 与落盘字节一致性。
+
+同机 Release 的 nullable FOR codec encode microbenchmark（100,000 行、21 次 P50）：
+
+| 指标 | Before | After | 变化 |
+|---|---:|---:|---:|
+| encode latency | 575 us | 400 us | -30.4% |
+| logical throughput | 1.318 GiB/s | 1.892 GiB/s | +43.6% |
+
+固定文件场景（100,000 行、Row Group 4,096、50% 选择率、11 次 P50）：
+
+| 指标 | Before | After | 变化 |
+|---|---:|---:|---:|
+| writer encoding | 1.5698 ms | 1.4255 ms | -9.2% |
+| writer 总耗时 | 5.5224 ms | 5.3795 ms | -2.6% |
+| 端到端耗时 / 吞吐 | 6.4561 ms / 15.489 M rows/s | 6.3531 ms / 15.740 M rows/s | 吞吐 +1.6% |
+
+文件、Arrow 分配、剪枝和读取指标不变。microbenchmark CPU CV 为 0.77%，完整场景 CPU CV 为
+1.03%。

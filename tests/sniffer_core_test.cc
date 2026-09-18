@@ -779,13 +779,14 @@ TEST(SnifferCoreTest, PlainVariableBulkCopyMatchesReference) {
       {std::vector<uint8_t>{0, 1}, std::nullopt,
        std::vector<uint8_t>{static_cast<uint8_t>('a'), 0, static_cast<uint8_t>('b')},
        std::vector<uint8_t>{}, std::vector<uint8_t>{0xFF}});
+  const auto binary_slice = binary->Slice(1, 3);
   const sniffer::FieldSpec binary_field{2, "bytes", arrow::binary(), true, nullptr};
-  const auto nullable_expected =
-      ValueOrThrow(ReferenceEncodePlainVariable(*binary), "reference nullable Plain binary");
-  const auto nullable_actual =
-      ValueOrThrow(sniffer::internal::EncodePlain(binary_field, *binary), "nullable Plain binary");
+  const auto nullable_expected = ValueOrThrow(ReferenceEncodePlainVariable(*binary_slice),
+                                              "reference nullable sliced Plain binary");
+  const auto nullable_actual = ValueOrThrow(
+      sniffer::internal::EncodePlain(binary_field, *binary_slice), "nullable sliced Plain binary");
   EXPECT_TRUE(nullable_actual == nullable_expected)
-      << "nullable Plain binary bytes match row-wise reference";
+      << "nullable sliced Plain binary bytes match row-wise reference";
 }
 
 TEST(SnifferCoreTest, PlainSelectedTypedDecodeMatchesReference) {

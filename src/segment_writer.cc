@@ -1,5 +1,7 @@
 #include "sniffer/segment_writer.h"
 
+#include <arrow/util/bitmap_ops.h>
+
 #include <bit>
 #include <cstddef>
 #include <cstdint>
@@ -58,13 +60,8 @@ std::vector<uint8_t> EncodeValidity(const arrow::Array& array) {
   const uint64_t row_count = static_cast<uint64_t>(array.length());
   const auto byte_count = static_cast<size_t>(row_count / 8U + (row_count % 8U != 0));
   std::vector<uint8_t> validity(byte_count, 0);
-  for (int64_t index = 0; index < array.length(); ++index) {
-    if (array.IsValid(index)) {
-      const size_t byte_index = static_cast<size_t>(index / 8);
-      const uint32_t bit_index = static_cast<uint32_t>(index % 8);
-      validity[byte_index] |= static_cast<uint8_t>(1U << bit_index);
-    }
-  }
+  arrow::internal::CopyBitmap(array.null_bitmap_data(), array.offset(), array.length(),
+                              validity.data(), 0);
   return validity;
 }
 

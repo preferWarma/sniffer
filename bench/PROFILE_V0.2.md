@@ -202,3 +202,26 @@ Bloom 双哈希仍是首位，但当前样本主要对应实际哈希工作，�
 11 次测试中，writer index P50 分别为 1.7269 ms 和 1.7161 ms；相对 1.9879 ms 基线稳定降低约
 13%。第二轮 wall/CPU CV 为 0.46%/0.47%，端到端 P50 从 6.7926 ms 降至 6.4689 ms，吞吐从
 14.722 M rows/s 升至 15.459 M rows/s。文件字节、分配、剪枝和读取量不变。
+
+## 10. `f291d30` 后的热点复查与 validity bitmap
+
+Bloom known-valid 快路径合入后重新采样，排除 benchmark 启动样本后的 top-of-stack 前列为：
+
+| 符号 | top-of-stack 样本 |
+|---|---:|
+| `EncodeNonPlain` | 229 |
+| `ArrayValuePairHasher::HashKnownValid` | 225 |
+| `BuildRowGroupIndex` | 211 |
+| file write syscall | 169 |
+| allocator free | 140 |
+| `memcmp` | 121 |
+| FOR typed decode | 107 |
+| `BuildStatistics` | 93 |
+| CRC32C | 87 |
+| sort validation | 87 |
+| `EncodeValidity` | 77 |
+
+`EncodeValidity` 每个 nullable chunk 逐行构造 bitmap，但 Arrow 已持有相同位图。改为从 Arrow
+bitmap 批量复制并支持非 byte-aligned slice 后，nullable FOR encode P50 从 575 us 降至 400 us
+（-30.4%），writer encoding 从 1.5698 ms 降至 1.4255 ms。完整场景端到端从 6.4561 ms 降至
+6.3531 ms；文件字节、分配、剪枝和读取量不变。
