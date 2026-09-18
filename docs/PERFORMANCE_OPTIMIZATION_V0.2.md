@@ -73,6 +73,8 @@ v0.2 聚焦现有 Segment writer、reader、codec、scan 和文件 I/O 路径的
         保留原回退路径，所有整数宽度、timestamp 和 all-null 均有逐字节等价测试。
   - [x] 第二小步：非排序整数、bool 和 timestamp statistics 在原 typed min/max 遍历中同时生成
         selector sample 摘要；排序键 endpoint 快速路径和无 statistics 字段不额外扫描。
+- [x] Bloom 构建按列绑定数组类型和 physical type，逐行双哈希不再重复做类型一致性检查与
+      `PhysicalTypeFor()`；安全入口和绑定入口的哈希结果逐值一致。
 - [x] 为整数、timestamp、bool、string/binary 增加 typed encoder 路径，避免逐值构造
       `arrow::Scalar` 和调用 `SerializeScalar()`。
 - [x] 为 `ByteWriter` 增加可计算的容量预留和批量 append，减少 vector 扩容及中间 payload 拷贝。
@@ -671,3 +673,25 @@ Row Group 行数线性增长的临时内存，同时保持 payload、输出数�
 单阶段时间发生了预期迁移，因此收益以 selection + index 合计和 writer 总耗时判断。文件仍为
 663,679 字节，Arrow 分配、剪枝数量、ColumnChunk 读取数与读取字节不变。下一小步可把相同模型
 扩展到 Bloom string 的 selector dictionary/run 样本，当前 `HashArrayValuePair` 仍是 profile 首位。
+
+### 2026-09-18：绑定 Bloom typed hasher
+
+- 先尝试在 Bloom string 遍历中同步生成 dictionary/run 样本。第一版使 writer 回退约 2.9%；复用
+  Bloom 第一组哈希并拆分热循环后，阶段合计改善仍只有约 0.5%，端到端没有稳定收益，因此完整撤销，
+  未为微弱结果保留额外状态与分支。
+- 改为在每个 Bloom 列开始时绑定 `FieldSpec`、Arrow array 和 physical type。逐行仍执行原双种子
+  FNV/Mix64 算法并保留 row/null 边界检查，但不再重复调用 Arrow type equality 与
+  `PhysicalTypeFor()`。
+- reference test 对全部首期平铺类型比较安全入口、绑定入口和 Scalar reference，并覆盖 null、负数、
+  signed zero、越界 row 与类型不匹配；Bloom 字节和查询语义保持不变。
+
+同机 Release、100,000 行、Row Group 4,096、50% 选择率、11 次 P50：
+
+| 指标 | Before | After | 变化 |
+|---|---:|---:|---:|
+| writer index | 2.1369 ms | 1.9700 ms | -7.8% |
+| writer 总耗时 | 6.1797 ms | 6.0562 ms | -2.0% |
+| 端到端耗时 / 吞吐 | 7.4572 ms / 13.410 M rows/s | 7.3221 ms / 13.657 M rows/s | 吞吐 +1.8% |
+
+文件仍为 663,679 字节，Arrow 分配、剪枝数量、ColumnChunk 读取数与读取字节不变。该收益大于本轮
+P50 运行波动，且实现比字符串遍历融合更小；后续重新 profile 后再选择下一热点。

@@ -7,6 +7,7 @@
 #include <string>
 #include <string_view>
 #include <type_traits>
+#include <utility>
 
 #include "format_internal.h"
 
@@ -90,16 +91,9 @@ Unsigned ArrayBits(const arrow::Array& untyped, int64_t row) {
 }
 
 template <typename EmitByte>
-arrow::Status EmitArrayValueBytes(const FieldSpec& field, const arrow::Array& array, int64_t row,
-                                  EmitByte&& emit_byte) {
-  if (!array.type()->Equals(field.type)) {
-    return InvalidScalar(field, "array type does not match field");
-  }
-  if (row < 0 || row >= array.length() || array.IsNull(row)) {
-    return InvalidScalar(field, "cannot hash missing array value");
-  }
-
-  ARROW_ASSIGN_OR_RAISE(const auto physical_type, PhysicalTypeFor(*field.type));
+arrow::Status EmitArrayValueBytesBound(const FieldSpec& field, const arrow::Array& array,
+                                       int64_t row, PhysicalTypeId physical_type,
+                                       EmitByte&& emit_byte) {
   emit_byte(static_cast<uint8_t>(physical_type));
   switch (field.type->id()) {
     case arrow::Type::BOOL:
@@ -162,7 +156,45 @@ arrow::Status EmitArrayValueBytes(const FieldSpec& field, const arrow::Array& ar
   return arrow::Status::OK();
 }
 
+template <typename EmitByte>
+arrow::Status EmitArrayValueBytes(const FieldSpec& field, const arrow::Array& array, int64_t row,
+                                  EmitByte&& emit_byte) {
+  if (!array.type()->Equals(field.type)) {
+    return InvalidScalar(field, "array type does not match field");
+  }
+  if (row < 0 || row >= array.length() || array.IsNull(row)) {
+    return InvalidScalar(field, "cannot hash missing array value");
+  }
+  ARROW_ASSIGN_OR_RAISE(const auto physical_type, PhysicalTypeFor(*field.type));
+  return EmitArrayValueBytesBound(field, array, row, physical_type,
+                                  std::forward<EmitByte>(emit_byte));
+}
+
 }  // namespace
+
+arrow::Result<ArrayValuePairHasher> ArrayValuePairHasher::Bind(const FieldSpec& field,
+                                                               const arrow::Array& array) {
+  if (!array.type()->Equals(field.type)) {
+    return InvalidScalar(field, "array type does not match field");
+  }
+  ARROW_ASSIGN_OR_RAISE(const auto physical_type, PhysicalTypeFor(*field.type));
+  return ArrayValuePairHasher(&field, &array, static_cast<uint8_t>(physical_type));
+}
+
+arrow::Result<std::pair<uint64_t, uint64_t>> ArrayValuePairHasher::Hash(
+    int64_t row, uint64_t first_seed, uint64_t second_seed) const {
+  if (row < 0 || row >= array_->length() || array_->IsNull(row)) {
+    return InvalidScalar(*field_, "cannot hash missing array value");
+  }
+  uint64_t first = 1469598103934665603ULL ^ first_seed;
+  uint64_t second = 1469598103934665603ULL ^ second_seed;
+  ARROW_RETURN_NOT_OK(EmitArrayValueBytesBound(
+      *field_, *array_, row, static_cast<PhysicalTypeId>(physical_type_), [&](uint8_t byte) {
+        HashByte(byte, &first);
+        HashByte(byte, &second);
+      }));
+  return std::pair<uint64_t, uint64_t>{Mix64(first), Mix64(second)};
+}
 
 bool ScalarHasNaN(const arrow::Scalar& scalar) {
   if (!scalar.is_valid) {

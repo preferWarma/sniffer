@@ -12,6 +12,22 @@
 
 namespace sniffer::internal {
 
+class ArrayValuePairHasher {
+ public:
+  [[nodiscard]] static arrow::Result<ArrayValuePairHasher> Bind(const FieldSpec& field,
+                                                                const arrow::Array& array);
+  [[nodiscard]] arrow::Result<std::pair<uint64_t, uint64_t>> Hash(int64_t row, uint64_t first_seed,
+                                                                  uint64_t second_seed) const;
+
+ private:
+  ArrayValuePairHasher(const FieldSpec* field, const arrow::Array* array, uint8_t physical_type)
+      : field_(field), array_(array), physical_type_(physical_type) {}
+
+  const FieldSpec* field_;
+  const arrow::Array* array_;
+  uint8_t physical_type_;
+};
+
 [[nodiscard]] bool ScalarHasNaN(const arrow::Scalar& scalar);
 [[nodiscard]] arrow::Result<int> CompareScalars(const arrow::Scalar& left,
                                                 const arrow::Scalar& right);

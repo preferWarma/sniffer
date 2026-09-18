@@ -198,10 +198,10 @@ uint64_t BloomBitCount(uint64_t row_count) {
   return bits;
 }
 
-arrow::Status BloomInsertArrayValue(const FieldSpec& field, const arrow::Array& array, int64_t row,
+arrow::Status BloomInsertArrayValue(const ArrayValuePairHasher& hasher, int64_t row,
                                     BloomMeta* bloom) {
-  ARROW_ASSIGN_OR_RAISE(auto hashes, HashArrayValuePair(field, array, row, 0x243F6A8885A308D3ULL,
-                                                        0x13198A2E03707344ULL));
+  ARROW_ASSIGN_OR_RAISE(auto hashes,
+                        hasher.Hash(row, 0x243F6A8885A308D3ULL, 0x13198A2E03707344ULL));
   const auto [first, raw_second] = hashes;
   const uint64_t second = raw_second | 1U;
   for (uint32_t probe = 0; probe < bloom->hash_count; ++probe) {
@@ -471,12 +471,13 @@ arrow::Result<RowGroupIndex> BuildRowGroupIndex(const TableSchema& schema,
       return arrow::Status::Invalid("[sniffer.format.limit] Bloom filter exceeds platform limit");
     }
     bloom.bits.assign(static_cast<size_t>(bloom.bit_count / 8U), 0);
+    ARROW_ASSIGN_OR_RAISE(const auto bloom_hasher, ArrayValuePairHasher::Bind(field, *array));
     for (int64_t row = 0; row < array->length(); ++row) {
       if (array->IsNull(row)) {
         continue;
       }
       if (!ArrayValueHasNaN(*array, row)) {
-        ARROW_RETURN_NOT_OK(BloomInsertArrayValue(field, *array, row, &bloom));
+        ARROW_RETURN_NOT_OK(BloomInsertArrayValue(bloom_hasher, row, &bloom));
       }
     }
     result.blooms.push_back(std::move(bloom));

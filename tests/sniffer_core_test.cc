@@ -478,8 +478,11 @@ TEST(SnifferCoreTest, TypedArrayHashMatchesScalarReference) {
   for (size_t column = 0; column < data.table_schema.fields.size(); ++column) {
     const auto& field = data.table_schema.fields[column];
     const auto& array = *data.batch->column(static_cast<int>(column));
+    const auto bound_hasher = ValueOrThrow(
+        sniffer::internal::ArrayValuePairHasher::Bind(field, array), "bind typed array hasher");
     for (int64_t row = 0; row < array.length(); ++row) {
       if (array.IsNull(row)) {
+        EXPECT_FALSE(bound_hasher.Hash(row, kSeeds[0], kSeeds[1]).ok());
         continue;
       }
       const auto scalar = ValueOrThrow(array.GetScalar(row), "get scalar hash reference");
@@ -498,8 +501,16 @@ TEST(SnifferCoreTest, TypedArrayHashMatchesScalarReference) {
           "hash typed array value pair");
       EXPECT_TRUE(pair.first == expected_hashes[0] && pair.second == expected_hashes[1])
           << "paired typed array hash matches independent scalar hashes";
+      const auto bound_pair = ValueOrThrow(bound_hasher.Hash(row, kSeeds[0], kSeeds[1]),
+                                           "hash bound typed array value pair");
+      EXPECT_EQ(bound_pair, pair) << "bound typed array hash preserves Bloom bytes";
     }
+    EXPECT_FALSE(bound_hasher.Hash(-1, kSeeds[0], kSeeds[1]).ok());
+    EXPECT_FALSE(bound_hasher.Hash(array.length(), kSeeds[0], kSeeds[1]).ok());
   }
+  EXPECT_FALSE(sniffer::internal::ArrayValuePairHasher::Bind(data.table_schema.fields.front(),
+                                                             *data.batch->column(1))
+                   .ok());
 }
 
 TEST(SnifferCoreTest, SortedPrimaryStatisticsFastPathMatchesGenericIndex) {
