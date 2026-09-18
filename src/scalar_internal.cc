@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <bit>
+#include <cassert>
 #include <cmath>
 #include <cstdint>
 #include <string>
@@ -91,9 +92,8 @@ Unsigned ArrayBits(const arrow::Array& untyped, int64_t row) {
 }
 
 template <typename EmitByte>
-arrow::Status EmitArrayValueBytesBound(const FieldSpec& field, const arrow::Array& array,
-                                       int64_t row, PhysicalTypeId physical_type,
-                                       EmitByte&& emit_byte) {
+bool EmitArrayValueBytesBound(const FieldSpec& field, const arrow::Array& array, int64_t row,
+                              PhysicalTypeId physical_type, EmitByte&& emit_byte) {
   emit_byte(static_cast<uint8_t>(physical_type));
   switch (field.type->id()) {
     case arrow::Type::BOOL:
@@ -151,9 +151,9 @@ arrow::Status EmitArrayValueBytesBound(const FieldSpec& field, const arrow::Arra
       break;
     }
     default:
-      return InvalidScalar(field, "unsupported array type");
+      return false;
   }
-  return arrow::Status::OK();
+  return true;
 }
 
 template <typename EmitByte>
@@ -166,8 +166,11 @@ arrow::Status EmitArrayValueBytes(const FieldSpec& field, const arrow::Array& ar
     return InvalidScalar(field, "cannot hash missing array value");
   }
   ARROW_ASSIGN_OR_RAISE(const auto physical_type, PhysicalTypeFor(*field.type));
-  return EmitArrayValueBytesBound(field, array, row, physical_type,
-                                  std::forward<EmitByte>(emit_byte));
+  if (!EmitArrayValueBytesBound(field, array, row, physical_type,
+                                std::forward<EmitByte>(emit_byte))) {
+    return InvalidScalar(field, "unsupported array type");
+  }
+  return arrow::Status::OK();
 }
 
 }  // namespace
@@ -186,14 +189,21 @@ arrow::Result<std::pair<uint64_t, uint64_t>> ArrayValuePairHasher::Hash(
   if (row < 0 || row >= array_->length() || array_->IsNull(row)) {
     return InvalidScalar(*field_, "cannot hash missing array value");
   }
+  return HashKnownValid(row, first_seed, second_seed);
+}
+
+std::pair<uint64_t, uint64_t> ArrayValuePairHasher::HashKnownValid(int64_t row, uint64_t first_seed,
+                                                                   uint64_t second_seed) const {
   uint64_t first = 1469598103934665603ULL ^ first_seed;
   uint64_t second = 1469598103934665603ULL ^ second_seed;
-  ARROW_RETURN_NOT_OK(EmitArrayValueBytesBound(
+  const bool supported = EmitArrayValueBytesBound(
       *field_, *array_, row, static_cast<PhysicalTypeId>(physical_type_), [&](uint8_t byte) {
         HashByte(byte, &first);
         HashByte(byte, &second);
-      }));
-  return std::pair<uint64_t, uint64_t>{Mix64(first), Mix64(second)};
+      });
+  assert(supported);
+  (void)supported;
+  return {Mix64(first), Mix64(second)};
 }
 
 bool ScalarHasNaN(const arrow::Scalar& scalar) {

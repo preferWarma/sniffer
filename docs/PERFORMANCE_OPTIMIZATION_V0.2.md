@@ -747,3 +747,23 @@ P50 运行波动，且实现比字符串遍历融合更小；后续重新 profil
 | 端到端耗时 / 吞吐 | 6.8913 ms / 14.511 M rows/s | 6.7926 ms / 14.722 M rows/s | 吞吐 +1.5% |
 
 文件、分配、剪枝和读取指标不变。microbenchmark CPU CV 为 0.88%，完整场景 CPU CV 为 0.20%。
+
+### 2026-09-18：Bloom known-valid hash path
+
+- `BuildRowGroupIndex()` 已在进入 Bloom 插入前检查 row 边界、null 和 NaN，但绑定 hasher 的安全入口
+  又重复检查边界/null，并为每行构造 `Result<pair>`。新增带明确前置条件的 `HashKnownValid()`；只有
+  完成上述检查的索引热循环使用它，其他调用者仍使用返回结构化错误的 `Hash()`。
+- FNV 常量、physical-type 前缀、little-endian value bytes、signed-zero 归一化、两个 seed 与 Mix64
+  均未改变。全部平铺类型逐值比较安全入口、known-valid 入口和 Scalar reference。
+
+同机 Release、100,000 行、Row Group 4,096、50% 选择率、11 次 P50；首次运行受文件写入离群值
+影响，以下采用紧接着的确认运行（wall/CPU CV 0.46%/0.47%）：
+
+| 指标 | Before | After | 变化 |
+|---|---:|---:|---:|
+| writer index | 1.9879 ms | 1.7161 ms | -13.7% |
+| writer 总耗时 | 5.8406 ms | 5.5042 ms | -5.8% |
+| 端到端耗时 / 吞吐 | 6.7926 ms / 14.722 M rows/s | 6.4689 ms / 15.459 M rows/s | 吞吐 +5.0% |
+
+文件仍为 663,679 字节；Arrow 分配、12/25 Row Group 剪枝、26 个 ColumnChunk 和 172,228 个读取字节
+均保持不变。

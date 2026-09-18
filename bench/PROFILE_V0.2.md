@@ -191,3 +191,14 @@ delta 的 type switch 移到循环外后，encode microbenchmark P50 从 670 us 
 固定场景 writer encoding 从 1.7211 ms 降至 1.5797 ms，端到端从 6.8913 ms 降至 6.7926 ms。
 Bloom 双哈希仍是首位，但当前样本主要对应实际哈希工作，后续若继续优化必须保留完全相同的哈希字节
 与双种子结果。
+
+## 9. Bloom known-valid 快路径
+
+对 `6747ebf` 后的索引调用链检查显示，Bloom 外层循环与 bound hasher 都验证了一次 null；hasher
+还为每个已知有效的 row 构造 `Result<pair<uint64_t, uint64_t>>`。保留安全 `Hash()` 入口，同时让
+索引循环在检查 row 后调用无重复验证的 `HashKnownValid()`。
+
+全部平铺类型 reference test 证明两个入口与 Scalar reference 的双种子结果一致。固定场景的两轮
+11 次测试中，writer index P50 分别为 1.7269 ms 和 1.7161 ms；相对 1.9879 ms 基线稳定降低约
+13%。第二轮 wall/CPU CV 为 0.46%/0.47%，端到端 P50 从 6.7926 ms 降至 6.4689 ms，吞吐从
+14.722 M rows/s 升至 15.459 M rows/s。文件字节、分配、剪枝和读取量不变。

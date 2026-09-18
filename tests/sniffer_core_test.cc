@@ -504,6 +504,8 @@ TEST(SnifferCoreTest, TypedArrayHashMatchesScalarReference) {
       const auto bound_pair = ValueOrThrow(bound_hasher.Hash(row, kSeeds[0], kSeeds[1]),
                                            "hash bound typed array value pair");
       EXPECT_EQ(bound_pair, pair) << "bound typed array hash preserves Bloom bytes";
+      EXPECT_EQ(bound_hasher.HashKnownValid(row, kSeeds[0], kSeeds[1]), pair)
+          << "known-valid Bloom fast path preserves paired hash bytes";
     }
     EXPECT_FALSE(bound_hasher.Hash(-1, kSeeds[0], kSeeds[1]).ok());
     EXPECT_FALSE(bound_hasher.Hash(array.length(), kSeeds[0], kSeeds[1]).ok());

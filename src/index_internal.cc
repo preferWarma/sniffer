@@ -198,10 +198,8 @@ uint64_t BloomBitCount(uint64_t row_count) {
   return bits;
 }
 
-arrow::Status BloomInsertArrayValue(const ArrayValuePairHasher& hasher, int64_t row,
-                                    BloomMeta* bloom) {
-  ARROW_ASSIGN_OR_RAISE(auto hashes,
-                        hasher.Hash(row, 0x243F6A8885A308D3ULL, 0x13198A2E03707344ULL));
+void BloomInsertArrayValue(const ArrayValuePairHasher& hasher, int64_t row, BloomMeta* bloom) {
+  const auto hashes = hasher.HashKnownValid(row, 0x243F6A8885A308D3ULL, 0x13198A2E03707344ULL);
   const auto [first, raw_second] = hashes;
   const uint64_t second = raw_second | 1U;
   for (uint32_t probe = 0; probe < bloom->hash_count; ++probe) {
@@ -209,7 +207,6 @@ arrow::Status BloomInsertArrayValue(const ArrayValuePairHasher& hasher, int64_t 
     bloom->bits[static_cast<size_t>(bit / 8U)] |=
         static_cast<uint8_t>(1U << static_cast<uint32_t>(bit % 8U));
   }
-  return arrow::Status::OK();
 }
 
 arrow::Result<StatisticsMeta> FinishStatistics(StatisticsMeta statistics, const arrow::Array& array,
@@ -477,7 +474,7 @@ arrow::Result<RowGroupIndex> BuildRowGroupIndex(const TableSchema& schema,
         continue;
       }
       if (!ArrayValueHasNaN(*array, row)) {
-        ARROW_RETURN_NOT_OK(BloomInsertArrayValue(bloom_hasher, row, &bloom));
+        BloomInsertArrayValue(bloom_hasher, row, &bloom);
       }
     }
     result.blooms.push_back(std::move(bloom));

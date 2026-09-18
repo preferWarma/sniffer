@@ -18,6 +18,9 @@ class ArrayValuePairHasher {
                                                                 const arrow::Array& array);
   [[nodiscard]] arrow::Result<std::pair<uint64_t, uint64_t>> Hash(int64_t row, uint64_t first_seed,
                                                                   uint64_t second_seed) const;
+  // The caller must establish that row is in bounds and non-null.
+  [[nodiscard]] std::pair<uint64_t, uint64_t> HashKnownValid(int64_t row, uint64_t first_seed,
+                                                             uint64_t second_seed) const;
 
  private:
   ArrayValuePairHasher(const FieldSpec* field, const arrow::Array* array, uint8_t physical_type)
