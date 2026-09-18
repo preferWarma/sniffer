@@ -149,6 +149,49 @@ arrow::Result<uint64_t> ArrayIntegralBits(const arrow::Array& array, int64_t row
   }
 }
 
+template <typename ArrayType>
+uint64_t BuildForDeltasTyped(const arrow::Array& untyped, uint64_t base_bits,
+                             std::vector<uint64_t>* deltas) {
+  const auto& array = static_cast<const ArrayType&>(untyped);
+  uint64_t maximum_delta = 0;
+  for (int64_t row = 0; row < array.length(); ++row) {
+    if (array.IsNull(row)) {
+      continue;
+    }
+    const uint64_t bits = static_cast<uint64_t>(array.Value(row));
+    const uint64_t delta = bits - base_bits;
+    (*deltas)[static_cast<size_t>(row)] = delta;
+    maximum_delta = std::max(maximum_delta, delta);
+  }
+  return maximum_delta;
+}
+
+arrow::Result<uint64_t> BuildForDeltas(const arrow::Array& array, uint64_t base_bits,
+                                       std::vector<uint64_t>* deltas) {
+  switch (array.type_id()) {
+    case arrow::Type::INT8:
+      return BuildForDeltasTyped<arrow::Int8Array>(array, base_bits, deltas);
+    case arrow::Type::INT16:
+      return BuildForDeltasTyped<arrow::Int16Array>(array, base_bits, deltas);
+    case arrow::Type::INT32:
+      return BuildForDeltasTyped<arrow::Int32Array>(array, base_bits, deltas);
+    case arrow::Type::INT64:
+      return BuildForDeltasTyped<arrow::Int64Array>(array, base_bits, deltas);
+    case arrow::Type::UINT8:
+      return BuildForDeltasTyped<arrow::UInt8Array>(array, base_bits, deltas);
+    case arrow::Type::UINT16:
+      return BuildForDeltasTyped<arrow::UInt16Array>(array, base_bits, deltas);
+    case arrow::Type::UINT32:
+      return BuildForDeltasTyped<arrow::UInt32Array>(array, base_bits, deltas);
+    case arrow::Type::UINT64:
+      return BuildForDeltasTyped<arrow::UInt64Array>(array, base_bits, deltas);
+    case arrow::Type::TIMESTAMP:
+      return BuildForDeltasTyped<arrow::TimestampArray>(array, base_bits, deltas);
+    default:
+      return InvalidCodec("FOR delta source is not integral or timestamp");
+  }
+}
+
 arrow::Result<uint64_t> ScalarIntegralBits(const FieldSpec& field, const arrow::Scalar& scalar) {
   if (!scalar.is_valid || !scalar.type->Equals(field.type)) {
     return InvalidCodec("FOR statistics minimum does not match field type");
@@ -454,15 +497,7 @@ arrow::Result<std::vector<uint8_t>> EncodeForBitpack(const FieldSpec& field,
     }
   }
   std::vector<uint64_t> deltas(static_cast<size_t>(array.length()), 0);
-  uint64_t maximum_delta = 0;
-  for (int64_t row = 0; row < array.length(); ++row) {
-    if (array.IsValid(row)) {
-      ARROW_ASSIGN_OR_RAISE(const uint64_t bits, ArrayIntegralBits(array, row));
-      const uint64_t delta = bits - base_bits;
-      deltas[static_cast<size_t>(row)] = delta;
-      maximum_delta = std::max(maximum_delta, delta);
-    }
-  }
+  ARROW_ASSIGN_OR_RAISE(const uint64_t maximum_delta, BuildForDeltas(array, base_bits, &deltas));
   const uint8_t bit_width = static_cast<uint8_t>(std::bit_width(maximum_delta));
   ARROW_ASSIGN_OR_RAISE(const uint64_t total_bits,
                         CheckedMultiply(static_cast<uint64_t>(array.length()), bit_width));

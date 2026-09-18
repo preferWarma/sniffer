@@ -722,3 +722,28 @@ P50 运行波动，且实现比字符串遍历融合更小；后续重新 profil
 
 文件仍为 663,679 字节；Arrow 分配、12/25 Row Group 剪枝、26 个 ColumnChunk 和 172,228 个读取字节
 均保持不变。microbenchmark CPU CV 为 3.51%，完整场景 CPU CV 为 1.04%。
+
+### 2026-09-18：绑定 FOR delta typed loop
+
+- 在 `6747ebf` 上重新采样后，`EncodeNonPlain` 和 `ArrayIntegralBits` 仍位于 writer 热点前列。
+  FOR encoder 计算 delta 时原先每行进入 `ArrayIntegralBits()` 的 type switch；现在先按 Arrow type
+  绑定模板循环，再直接读取 typed array。base、delta 的无符号位语义和 payload 字节不变。
+- reference test 增加 Arrow sliced array，连同全部整数宽度、timestamp、null、极值和随机输入验证
+  typed loop 与 Scalar reference 的逐字节一致性。
+
+同机 Release 的 FOR codec encode microbenchmark（100,000 个 `uint64`、128 值范围、21 次 P50）：
+
+| 指标 | Before | After | 变化 |
+|---|---:|---:|---:|
+| encode latency | 670 us | 575 us | -14.2% |
+| logical throughput | 1.130 GiB/s | 1.318 GiB/s | +16.6% |
+
+固定文件场景（100,000 行、Row Group 4,096、50% 选择率、11 次 P50）：
+
+| 指标 | Before | After | 变化 |
+|---|---:|---:|---:|
+| writer encoding | 1.7211 ms | 1.5797 ms | -8.2% |
+| writer 总耗时 | 5.9326 ms | 5.8406 ms | -1.6% |
+| 端到端耗时 / 吞吐 | 6.8913 ms / 14.511 M rows/s | 6.7926 ms / 14.722 M rows/s | 吞吐 +1.5% |
+
+文件、分配、剪枝和读取指标不变。microbenchmark CPU CV 为 0.88%，完整场景 CPU CV 为 0.20%。

@@ -165,3 +165,29 @@ microbenchmark P50 从 383 us 降至 314 us（-18.0%），吞吐从 1.979 GiB/s 
 完整固定场景 11 次 P50 中，scan 从 1.2681 ms 降至 0.9628 ms，端到端从 7.3221 ms 降至
 6.8913 ms，吞吐从 13.657 M rows/s 升至 14.511 M rows/s。文件字节、分配、剪枝和读取量均不变；
 全部 bit width 0–64 的 full/selected decode 测试用于验证非对齐读取与 null 语义。
+
+## 8. `6747ebf` 后的热点复查
+
+FOR bytewise unpack 合入后，在固定场景重新采样。排除 benchmark 启动期的 CPU 信息探测和 dyld
+样本后，主要 top-of-stack 为：
+
+| 符号 | top-of-stack 样本 |
+|---|---:|
+| `ArrayValuePairHasher::Hash` | 294 |
+| `BuildRowGroupIndex` | 228 |
+| `EncodeNonPlain` | 221 |
+| file write syscall | 149 |
+| allocator free | 119 |
+| `memcmp` | 115 |
+| FOR typed decode | 109 |
+| sort validation | 107 |
+| `BuildStatistics` | 83 |
+| `ArrayIntegralBits` | 71 |
+| CRC32C | 71 |
+| `EncodeValidity` | 69 |
+
+FOR decode 已明显下降，writer 的 `EncodeNonPlain` 与逐行 `ArrayIntegralBits` 仍可局部消除。将 FOR
+delta 的 type switch 移到循环外后，encode microbenchmark P50 从 670 us 降至 575 us（-14.2%）；
+固定场景 writer encoding 从 1.7211 ms 降至 1.5797 ms，端到端从 6.8913 ms 降至 6.7926 ms。
+Bloom 双哈希仍是首位，但当前样本主要对应实际哈希工作，后续若继续优化必须保留完全相同的哈希字节
+与双种子结果。

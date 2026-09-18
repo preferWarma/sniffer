@@ -912,6 +912,16 @@ TEST(SnifferCoreTest, TypedForMatchesScalarReference) {
                          static_cast<uint16_t>(sniffer::EncodingKind::kForBitpack), field, array),
                      "typed FOR encode");
     EXPECT_TRUE(actual == expected) << "typed FOR bytes match scalar reference";
+
+    const auto sliced = array.Slice(1, array.length() - 2);
+    const auto sliced_expected =
+        ValueOrThrow(ReferenceEncodeFor(field, *sliced), "reference sliced FOR encode");
+    const auto sliced_actual =
+        ValueOrThrow(sniffer::internal::EncodeNonPlain(
+                         static_cast<uint16_t>(sniffer::EncodingKind::kForBitpack), field, *sliced),
+                     "typed sliced FOR encode");
+    EXPECT_TRUE(sliced_actual == sliced_expected)
+        << "typed sliced FOR bytes match scalar reference";
   }
 }
 
