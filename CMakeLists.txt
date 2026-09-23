@@ -269,6 +269,15 @@ if(SNIFFER_BUILD_BENCHMARK)
         -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/validate_google_benchmark_json.cmake"
     )
     add_test(
+      NAME sniffer_core_sample_skew_compression_benchmark_json_smoke
+      COMMAND
+        "${CMAKE_COMMAND}"
+        "-DBENCHMARK_EXECUTABLE=$<TARGET_FILE:sniffer_core_compression_benchmark>"
+        "-DBENCHMARK_FILTER=^Compression/sample_skew_int64_Sniffer/manual_time$"
+        -DEXPECTED_PREFIX=Compression/sample_skew_int64_Sniffer/
+        -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/validate_google_benchmark_json.cmake"
+    )
+    add_test(
       NAME sniffer_core_codec_benchmark_json_smoke
       COMMAND
         "${CMAKE_COMMAND}"
@@ -288,6 +297,7 @@ if(SNIFFER_BUILD_BENCHMARK)
       sniffer_core_wide_parquet_benchmark_json_smoke
       sniffer_core_compression_benchmark_json_smoke
       sniffer_core_parquet_compression_benchmark_json_smoke
+      sniffer_core_sample_skew_compression_benchmark_json_smoke
       sniffer_core_codec_benchmark_json_smoke
       PROPERTIES RESOURCE_LOCK sniffer_benchmark
     )

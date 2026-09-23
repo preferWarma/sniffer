@@ -178,7 +178,7 @@ Parquet 口径见 [`bench/BENCHMARK_V2.md`](bench/BENCHMARK_V2.md)；
 [`bench/BENCHMARK_V1.md`](bench/BENCHMARK_V1.md) 保留当时的 Arrow IPC 历史结果。
 
 压缩能力 benchmark 分别测试递增整数、窄值域整数、长 RLE、含 null 偏斜整数、低基数
-字符串和高基数字符串，并同时衡量空间效率、压缩写入效率和解压读取效率：
+字符串、高基数字符串和采样分布偏斜整数，并同时衡量空间效率、压缩写入效率和解压读取效率：
 
 ```bash
 ./build/sniffer_core_compression_benchmark \

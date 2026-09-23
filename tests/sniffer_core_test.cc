@@ -2831,4 +2831,65 @@ TEST(SnifferCoreTest, DeterministicEncodingSelector) {
       << "selector retains Plain for high-cardinality strings";
 }
 
+TEST(SnifferCoreTest, AdaptiveEncodingFallsBackWhenSampleMisleads) {
+  constexpr int64_t kRows = 4096;
+  sniffer::TableSchema schema{1, {{1, "value", arrow::int64(), false, nullptr}}};
+  const auto arrow_schema = ValueOrThrow(schema.ToArrowSchema(), "sample-skew schema");
+  arrow::Int64Builder builder;
+  for (int64_t row = 0; row < kRows; ++row) {
+    RequireOk(builder.Append(row < 1024 ? 0 : row), "append sample-skew value");
+  }
+  std::shared_ptr<arrow::Array> array;
+  RequireOk(builder.Finish(&array), "finish sample-skew values");
+  auto batch = arrow::RecordBatch::Make(arrow_schema, kRows, {array});
+  sniffer::LayoutPolicy layout;
+  layout.target_row_group_rows = static_cast<uint32_t>(kRows);
+  layout.encoding_sample_rows = 1024;
+  EXPECT_NE(ValueOrThrow(sniffer::internal::SelectEncoding(schema.fields.front(), *array, layout),
+                         "select sample-skew encoding"),
+            sniffer::internal::kPlainEncodingId);
+
+  TempFile adaptive_file("sample_skew_adaptive.seg");
+  WriteSegmentWithPolicy(adaptive_file.path(), schema, {batch}, layout);
+  const auto adaptive_bytes = ReadFile(adaptive_file.path());
+  const size_t trailer_offset = adaptive_bytes.size() - 40;
+  const size_t footer_offset = static_cast<size_t>(ReadU64(adaptive_bytes, trailer_offset + 8));
+  const size_t footer_length = static_cast<size_t>(ReadU64(adaptive_bytes, trailer_offset + 16));
+  const auto footer = ValueOrThrow(sniffer::internal::ParseFooter(std::span<const uint8_t>(
+                                       adaptive_bytes.data() + footer_offset, footer_length)),
+                                   "parse adaptive footer");
+  ASSERT_EQ(footer.row_groups.size(), 1U);
+  ASSERT_EQ(footer.row_groups.front().chunks.size(), 1U);
+  EXPECT_EQ(footer.row_groups.front().chunks.front().encoding_id,
+            sniffer::internal::kPlainEncodingId);
+  const auto plain = ValueOrThrow(sniffer::internal::EncodePlain(schema.fields.front(), *array),
+                                  "encode Plain reference");
+  EXPECT_EQ(footer.row_groups.front().chunks.front().length, plain.size());
+  auto reader = ValueOrThrow(sniffer::SegmentReader::Open(adaptive_file.path().string()),
+                             "open sample-skew adaptive file");
+  const auto round_trip = ValueOrThrow(reader->ReadAll(), "read sample-skew adaptive file");
+  ASSERT_EQ(round_trip.size(), 1U);
+  EXPECT_TRUE(round_trip.front()->Equals(*batch));
+
+  TempFile repeated_file("sample_skew_repeated.seg");
+  WriteSegmentWithPolicy(repeated_file.path(), schema, {batch}, layout);
+  EXPECT_EQ(ReadFile(repeated_file.path()), adaptive_bytes);
+
+  layout.field_encodings = {{1, sniffer::EncodingKind::kRle}};
+  TempFile forced_file("sample_skew_forced.seg");
+  WriteSegmentWithPolicy(forced_file.path(), schema, {batch}, layout);
+  const auto forced_bytes = ReadFile(forced_file.path());
+  const size_t forced_trailer_offset = forced_bytes.size() - 40;
+  const size_t forced_footer_offset =
+      static_cast<size_t>(ReadU64(forced_bytes, forced_trailer_offset + 8));
+  const size_t forced_footer_length =
+      static_cast<size_t>(ReadU64(forced_bytes, forced_trailer_offset + 16));
+  const auto forced_footer =
+      ValueOrThrow(sniffer::internal::ParseFooter(std::span<const uint8_t>(
+                       forced_bytes.data() + forced_footer_offset, forced_footer_length)),
+                   "parse forced footer");
+  EXPECT_EQ(forced_footer.row_groups.front().chunks.front().encoding_id,
+            sniffer::internal::kRleEncodingId);
+}
+
 }  // namespace

@@ -2,7 +2,7 @@
 
 本记录从 2026-09-23 起使用 Parquet 作为文件格式对照。v1 的 Arrow IPC 数字保留在
 [`BENCHMARK_V1.md`](BENCHMARK_V1.md)，两版的 Row Group、代码和测量口径不同，不能直接以表中
-绝对值推导版本间提速。本报告尚未覆盖宽表、超过页缓存的数据集和 cold-cache，因此不是 v0.2
+绝对值推导版本间提速。本报告已补 16 列宽表，但尚未覆盖超过页缓存的数据集和 cold-cache，因此不是 v0.2
 最终验收报告。
 
 ## 环境与口径
@@ -28,7 +28,7 @@
   --benchmark_report_aggregates_only=true --benchmark_format=json
 ```
 
-复现六种压缩分布：
+复现当前七种压缩分布（下方初版表格保留当时的六种）：
 
 ```sh
 ./build-release/sniffer_core_compression_benchmark \
@@ -86,7 +86,7 @@ Plain 回退与 offset 开销。
 
 ## 待补齐
 
-- 宽表、多列相关性、超页缓存数据、cold-cache 对照与完整矩阵汇总。
+- 宽表的多列相关性与宽投影、超页缓存数据、cold-cache 对照与完整矩阵汇总。
 - 各格式更细的读取量和峰值内存定义；当前 RSS 是进程高水位，不是每个 case 的独立峰值。
 - 使用相同源码状态与明确 v0.1 构建的回归复测，给出可信的相对 v1 数字。
 
@@ -129,3 +129,22 @@ Parquet 未报告可比的物理读取字节。进程 RSS 为高水位而非 cas
   --benchmark_repetitions=11 --benchmark_min_time=0.05s \
   --benchmark_report_aggregates_only=true --benchmark_format=json
 ```
+
+## 采样偏斜整数：实际编码大小保护
+
+2026-09-23，源码 `8895187-dirty`，Apple M4 / Release / 单线程；100,000 行、Row Group
+4,096，每组前 1,024 行为 0、后续行互异。默认 1,024 行样本将 Sniffer 引向 RLE，
+但完整 RLE payload 大于等价 Plain。新增实际 payload 大小检查后，仅在未强制指定编码且
+编码结果不小于 Plain 时回退；文件格式和已有编码 ID 均不变。
+
+| 格式/状态 | 写入 P50 ms | 读取 P50 ms | 文件字节 | 压缩比 |
+|---|---:|---:|---:|---:|
+| Sniffer，改动前 | 3.846 | 2.499 | 1,789,694 | 0.447x |
+| Sniffer，改动后 | 3.550 | 0.833 | 803,694 | 0.995x |
+| Parquet | 2.048 | 0.383 | 713,005 | 1.122x |
+| Parquet + ZSTD | 2.980 | 0.754 | 194,328 | 4.117x |
+
+改动前 Sniffer 和 Parquet 对照为 7 次重复，改动后 Sniffer 为 11 次重复，均使用
+`--benchmark_min_time=0.03s`；改动后写入/读取 CV 为 0.77%/0.65%。原有六种
+Sniffer 压缩场景的文件字节数全部保持不变。回退发生在非 Plain 编码已完成之后，
+这不是最终的 CPU/解码成本模型；采样分布变化仍需更早识别以避免无效编码开销。

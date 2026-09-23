@@ -2,6 +2,7 @@
 
 #include <arrow/util/bitmap_ops.h>
 
+#include <algorithm>
 #include <bit>
 #include <cstddef>
 #include <cstdint>
@@ -361,6 +362,16 @@ class SegmentWriter::Impl {
           }
           ARROW_ASSIGN_OR_RAISE(payload,
                                 internal::EncodeNonPlain(encoding_id, field, *array, statistics));
+          const bool forced_encoding = std::any_of(layout_policy_.field_encodings.begin(),
+                                                   layout_policy_.field_encodings.end(),
+                                                   [&field](const FieldEncoding& candidate) {
+                                                     return candidate.field_id == field.field_id;
+                                                   });
+          if (!forced_encoding && static_cast<uint64_t>(payload.size()) >= uncompressed_length) {
+            ARROW_ASSIGN_OR_RAISE(payload, internal::EncodePlain(field, *array));
+            encoding_id = internal::kPlainEncodingId;
+            uncompressed_length = static_cast<uint64_t>(payload.size());
+          }
         }
       }
       ARROW_ASSIGN_OR_RAISE(const auto physical_type, internal::PhysicalTypeFor(*field.type));

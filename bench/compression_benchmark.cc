@@ -109,7 +109,7 @@ std::string HighCardinalityString(int64_t row) {
 
 arrow::Result<std::vector<Scenario>> MakeScenarios(int64_t rows) {
   std::vector<Scenario> scenarios;
-  scenarios.reserve(6);
+  scenarios.reserve(7);
   ARROW_ASSIGN_OR_RAISE(auto ascending,
                         MakeInt64Scenario("ascending_int64", rows, false,
                                           [](int64_t row) { return std::optional<int64_t>(row); }));
@@ -140,6 +140,12 @@ arrow::Result<std::vector<Scenario>> MakeScenarios(int64_t rows) {
                           return std::optional<std::string>(HighCardinalityString(row));
                         }));
   scenarios.push_back(std::move(high_cardinality));
+  ARROW_ASSIGN_OR_RAISE(auto sample_skew,
+                        MakeInt64Scenario("sample_skew_int64", rows, false, [](int64_t row) {
+                          return row % kDefaultRowGroupRows < 1024 ? std::optional<int64_t>(0)
+                                                                   : std::optional<int64_t>(row);
+                        }));
+  scenarios.push_back(std::move(sample_skew));
   return scenarios;
 }
 
@@ -356,6 +362,15 @@ BENCHMARK_CAPTURE(Compression, high_cardinality_string_Parquet, 5U, Format::kPar
     ->UseManualTime()
     ->Unit(benchmark::kMillisecond);
 BENCHMARK_CAPTURE(Compression, high_cardinality_string_Parquet_ZSTD, 5U, Format::kParquetZstd)
+    ->UseManualTime()
+    ->Unit(benchmark::kMillisecond);
+BENCHMARK_CAPTURE(Compression, sample_skew_int64_Sniffer, 6U, Format::kSniffer)
+    ->UseManualTime()
+    ->Unit(benchmark::kMillisecond);
+BENCHMARK_CAPTURE(Compression, sample_skew_int64_Parquet, 6U, Format::kParquet)
+    ->UseManualTime()
+    ->Unit(benchmark::kMillisecond);
+BENCHMARK_CAPTURE(Compression, sample_skew_int64_Parquet_ZSTD, 6U, Format::kParquetZstd)
     ->UseManualTime()
     ->Unit(benchmark::kMillisecond);
 

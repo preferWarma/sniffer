@@ -140,7 +140,9 @@ SIMD、多级编码链和新压缩算法只有在标量路径完成剖析和优�
 
 - [ ] 让选择器同时估算最终 payload 大小、编码 CPU 成本和预期解码成本，而不是仅按样本大小阈值
       决策；模型必须确定、可解释、可测试。
-- [ ] 对所有候选编码加入“收益不足则 Plain”的保护，并记录选择原因供 benchmark 观测。
+- [x] 对所有自适应非 Plain 编码加入实际 payload 不小于 Plain 则回退的保护；显式强制编码
+      不受影响，复现采样偏斜时 RLE 膨胀并验证确定性、round-trip 和格式 ID。
+- [ ] 记录编码选择/回退原因供 benchmark 观测，并评估超过“恰好不比 Plain 大”的收益阈值。
 - [ ] 单独分析高基数 string/binary 的 64-bit offset 开销。如果引入 32-bit compact offset 或
       CompactPlain，必须分配新 encoding ID，旧 Reader 对未知 ID 明确失败，v0.2 Reader 保持读取
       v0.1 Plain 的能力。
@@ -970,3 +972,17 @@ CV 为 0.46%。Dictionary payload 仍为 113,058 字节，完整 Segment 仍为 
   3,104,713 字节；Parquet 为 40.439/1.852 ms，14,374,323 字节；Parquet + ZSTD 为
   59.152/2.405 ms，3,869,950 字节。Sniffer 写入 CV 为 1.00%，Parquet + ZSTD 扫描
   CV 为 6.69%。超页缓存及 cold-cache 项仍未完成，不能以此判断生产环境表现。
+
+### 2026-09-23：自适应编码实际大小保护
+
+- 新增采样偏斜整数分布：每个 4,096 行 Row Group 的前 1,024 行为 0，其余值互异。
+  旧选择器只看前 1,024 行，选 RLE 后完整编码的 payload 会比 Plain 大；先补该场景
+  的失败测试，再在自适应路径中用已计算的 `PlainEncodedSize()` 与实际编码大小比较。
+  若非 Plain payload 不小于 Plain，则回退 Plain；用户显式指定的 encoding 不改写。
+- Apple M4、Release、100,000 行、Row Group 4,096，改动前 7 次 P50：Sniffer
+  写入/读取 3.846/2.499 ms，文件 1,789,694 字节；改动后 11 次 P50：
+  3.550/0.833 ms，文件 803,694 字节。压缩比由 0.447x 升至 0.995x。
+  原有六种压缩场景的 Sniffer 文件字节数完全不变；Parquet 对照及限制见
+  [`bench/BENCHMARK_V2.md`](../bench/BENCHMARK_V2.md)。
+- 回退前已经完成一次非 Plain 编码，故这一步保障空间上界但未解决无效编码的 CPU
+  成本；更完整的编码成本模型仍在 TODO。文件格式版本、编码 ID 和读取兼容性不变。
