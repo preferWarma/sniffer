@@ -1,10 +1,10 @@
 #include <arrow/api.h>
 #include <arrow/io/api.h>
-#include <arrow/ipc/api.h>
 #include <arrow/util/byte_size.h>
-#include <arrow/util/compression.h>
 #include <arrow/util/config.h>
 #include <benchmark/benchmark.h>
+#include <parquet/arrow/reader.h>
+#include <parquet/properties.h>
 
 #include <algorithm>
 #include <chrono>
@@ -19,6 +19,7 @@
 #include <vector>
 
 #include "benchmark_build_config.h"
+#include "parquet_benchmark_util.h"
 #include "sniffer/segment_reader.h"
 #include "sniffer/segment_writer.h"
 
@@ -27,7 +28,7 @@ namespace {
 constexpr int64_t kDefaultRows = 100000;
 constexpr uint32_t kDefaultRowGroupRows = 4096;
 
-enum class Format { kSniffer, kArrowIpc, kArrowIpcZstd };
+enum class Format { kSniffer, kParquet, kParquetZstd };
 
 struct Scenario {
   std::string name;
@@ -194,41 +195,28 @@ arrow::Result<CompressionMeasurement> MeasureSnifferOnce(const std::filesystem::
       std::chrono::duration<double, std::milli>(decode_end - decode_start).count(), file_bytes};
 }
 
-arrow::Result<CompressionMeasurement> MeasureArrowIpcOnce(const std::filesystem::path& path,
-                                                          const Scenario& scenario,
-                                                          uint32_t row_group_rows,
-                                                          arrow::Compression::type compression) {
+arrow::Result<CompressionMeasurement> MeasureParquetOnce(const std::filesystem::path& path,
+                                                         const Scenario& scenario,
+                                                         uint32_t row_group_rows,
+                                                         parquet::Compression::type compression) {
   const auto encode_start = std::chrono::steady_clock::now();
-  ARROW_ASSIGN_OR_RAISE(auto output, arrow::io::FileOutputStream::Open(path.string()));
-  auto write_options = arrow::ipc::IpcWriteOptions::Defaults();
-  write_options.use_threads = false;
-  if (compression != arrow::Compression::UNCOMPRESSED) {
-    ARROW_ASSIGN_OR_RAISE(auto codec, arrow::util::Codec::Create(compression));
-    write_options.codec = std::move(codec);
-  }
-  ARROW_ASSIGN_OR_RAISE(
-      auto writer, arrow::ipc::MakeFileWriter(output, scenario.batch->schema(), write_options));
-  for (int64_t offset = 0; offset < scenario.batch->num_rows(); offset += row_group_rows) {
-    const int64_t length = std::min<int64_t>(row_group_rows, scenario.batch->num_rows() - offset);
-    ARROW_RETURN_NOT_OK(writer->WriteRecordBatch(*scenario.batch->Slice(offset, length)));
-  }
-  ARROW_RETURN_NOT_OK(writer->Close());
-  ARROW_RETURN_NOT_OK(output->Close());
+  ARROW_RETURN_NOT_OK(
+      sniffer_bench::WriteParquet(path, *scenario.batch, row_group_rows, compression));
   const auto encode_end = std::chrono::steady_clock::now();
   ARROW_ASSIGN_OR_RAISE(const uint64_t file_bytes, FileSize(path));
 
   const auto decode_start = std::chrono::steady_clock::now();
-  ARROW_ASSIGN_OR_RAISE(auto input, arrow::io::ReadableFile::Open(path.string()));
-  auto read_options = arrow::ipc::IpcReadOptions::Defaults();
-  read_options.use_threads = false;
-  ARROW_ASSIGN_OR_RAISE(auto reader, arrow::ipc::RecordBatchFileReader::Open(input, read_options));
+  ARROW_ASSIGN_OR_RAISE(auto reader, sniffer_bench::OpenParquet(path, row_group_rows));
+  ARROW_ASSIGN_OR_RAISE(auto stream, reader->GetRecordBatchReader());
   std::vector<std::shared_ptr<arrow::RecordBatch>> batches;
-  batches.reserve(static_cast<size_t>(reader->num_record_batches()));
-  for (int index = 0; index < reader->num_record_batches(); ++index) {
-    ARROW_ASSIGN_OR_RAISE(auto batch, reader->ReadRecordBatch(index));
+  batches.reserve(static_cast<size_t>(reader->num_row_groups()));
+  while (true) {
+    ARROW_ASSIGN_OR_RAISE(auto batch, stream->Next());
+    if (!batch) {
+      break;
+    }
     batches.push_back(std::move(batch));
   }
-  ARROW_RETURN_NOT_OK(input->Close());
   const auto decode_end = std::chrono::steady_clock::now();
   ARROW_RETURN_NOT_OK(ValidateBatches(*scenario.batch, batches));
   return CompressionMeasurement{
@@ -240,10 +228,10 @@ std::string_view FormatName(Format format) {
   switch (format) {
     case Format::kSniffer:
       return "Sniffer";
-    case Format::kArrowIpc:
-      return "ArrowIPC";
-    case Format::kArrowIpcZstd:
-      return "ArrowIPC_ZSTD";
+    case Format::kParquet:
+      return "Parquet";
+    case Format::kParquetZstd:
+      return "Parquet_ZSTD";
   }
   return "Unknown";
 }
@@ -267,9 +255,9 @@ void RunCompressionBenchmark(benchmark::State& state, const Scenario& scenario, 
     if (format == Format::kSniffer) {
       result = MeasureSnifferOnce(path, scenario, row_group_rows);
     } else {
-      result = MeasureArrowIpcOnce(path, scenario, row_group_rows,
-                                   format == Format::kArrowIpc ? arrow::Compression::UNCOMPRESSED
-                                                               : arrow::Compression::ZSTD);
+      result = MeasureParquetOnce(path, scenario, row_group_rows,
+                                  format == Format::kParquet ? parquet::Compression::UNCOMPRESSED
+                                                             : parquet::Compression::ZSTD);
     }
     if (!result.ok()) {
       state.SkipWithError(result.status().ToString());
@@ -319,55 +307,55 @@ void Compression(benchmark::State& state, size_t scenario_index, Format format) 
 BENCHMARK_CAPTURE(Compression, ascending_int64_Sniffer, 0U, Format::kSniffer)
     ->UseManualTime()
     ->Unit(benchmark::kMillisecond);
-BENCHMARK_CAPTURE(Compression, ascending_int64_ArrowIPC, 0U, Format::kArrowIpc)
+BENCHMARK_CAPTURE(Compression, ascending_int64_Parquet, 0U, Format::kParquet)
     ->UseManualTime()
     ->Unit(benchmark::kMillisecond);
-BENCHMARK_CAPTURE(Compression, ascending_int64_ArrowIPC_ZSTD, 0U, Format::kArrowIpcZstd)
+BENCHMARK_CAPTURE(Compression, ascending_int64_Parquet_ZSTD, 0U, Format::kParquetZstd)
     ->UseManualTime()
     ->Unit(benchmark::kMillisecond);
 BENCHMARK_CAPTURE(Compression, narrow_int64_Sniffer, 1U, Format::kSniffer)
     ->UseManualTime()
     ->Unit(benchmark::kMillisecond);
-BENCHMARK_CAPTURE(Compression, narrow_int64_ArrowIPC, 1U, Format::kArrowIpc)
+BENCHMARK_CAPTURE(Compression, narrow_int64_Parquet, 1U, Format::kParquet)
     ->UseManualTime()
     ->Unit(benchmark::kMillisecond);
-BENCHMARK_CAPTURE(Compression, narrow_int64_ArrowIPC_ZSTD, 1U, Format::kArrowIpcZstd)
+BENCHMARK_CAPTURE(Compression, narrow_int64_Parquet_ZSTD, 1U, Format::kParquetZstd)
     ->UseManualTime()
     ->Unit(benchmark::kMillisecond);
 BENCHMARK_CAPTURE(Compression, long_rle_int64_Sniffer, 2U, Format::kSniffer)
     ->UseManualTime()
     ->Unit(benchmark::kMillisecond);
-BENCHMARK_CAPTURE(Compression, long_rle_int64_ArrowIPC, 2U, Format::kArrowIpc)
+BENCHMARK_CAPTURE(Compression, long_rle_int64_Parquet, 2U, Format::kParquet)
     ->UseManualTime()
     ->Unit(benchmark::kMillisecond);
-BENCHMARK_CAPTURE(Compression, long_rle_int64_ArrowIPC_ZSTD, 2U, Format::kArrowIpcZstd)
+BENCHMARK_CAPTURE(Compression, long_rle_int64_Parquet_ZSTD, 2U, Format::kParquetZstd)
     ->UseManualTime()
     ->Unit(benchmark::kMillisecond);
 BENCHMARK_CAPTURE(Compression, nullable_skewed_int64_Sniffer, 3U, Format::kSniffer)
     ->UseManualTime()
     ->Unit(benchmark::kMillisecond);
-BENCHMARK_CAPTURE(Compression, nullable_skewed_int64_ArrowIPC, 3U, Format::kArrowIpc)
+BENCHMARK_CAPTURE(Compression, nullable_skewed_int64_Parquet, 3U, Format::kParquet)
     ->UseManualTime()
     ->Unit(benchmark::kMillisecond);
-BENCHMARK_CAPTURE(Compression, nullable_skewed_int64_ArrowIPC_ZSTD, 3U, Format::kArrowIpcZstd)
+BENCHMARK_CAPTURE(Compression, nullable_skewed_int64_Parquet_ZSTD, 3U, Format::kParquetZstd)
     ->UseManualTime()
     ->Unit(benchmark::kMillisecond);
 BENCHMARK_CAPTURE(Compression, low_cardinality_string_Sniffer, 4U, Format::kSniffer)
     ->UseManualTime()
     ->Unit(benchmark::kMillisecond);
-BENCHMARK_CAPTURE(Compression, low_cardinality_string_ArrowIPC, 4U, Format::kArrowIpc)
+BENCHMARK_CAPTURE(Compression, low_cardinality_string_Parquet, 4U, Format::kParquet)
     ->UseManualTime()
     ->Unit(benchmark::kMillisecond);
-BENCHMARK_CAPTURE(Compression, low_cardinality_string_ArrowIPC_ZSTD, 4U, Format::kArrowIpcZstd)
+BENCHMARK_CAPTURE(Compression, low_cardinality_string_Parquet_ZSTD, 4U, Format::kParquetZstd)
     ->UseManualTime()
     ->Unit(benchmark::kMillisecond);
 BENCHMARK_CAPTURE(Compression, high_cardinality_string_Sniffer, 5U, Format::kSniffer)
     ->UseManualTime()
     ->Unit(benchmark::kMillisecond);
-BENCHMARK_CAPTURE(Compression, high_cardinality_string_ArrowIPC, 5U, Format::kArrowIpc)
+BENCHMARK_CAPTURE(Compression, high_cardinality_string_Parquet, 5U, Format::kParquet)
     ->UseManualTime()
     ->Unit(benchmark::kMillisecond);
-BENCHMARK_CAPTURE(Compression, high_cardinality_string_ArrowIPC_ZSTD, 5U, Format::kArrowIpcZstd)
+BENCHMARK_CAPTURE(Compression, high_cardinality_string_Parquet_ZSTD, 5U, Format::kParquetZstd)
     ->UseManualTime()
     ->Unit(benchmark::kMillisecond);
 
@@ -380,9 +368,12 @@ void AddBenchmarkContext() {
   benchmark::AddCustomContext("source_revision", SNIFFER_BENCHMARK_SOURCE_REVISION);
   benchmark::AddCustomContext("compiler", SNIFFER_BENCHMARK_COMPILER);
   benchmark::AddCustomContext("arrow_version", ARROW_VERSION_STRING);
+  benchmark::AddCustomContext("parquet_version", ARROW_VERSION_STRING);
   benchmark::AddCustomContext("rows", std::to_string(kDefaultRows));
   benchmark::AddCustomContext("row_group_rows", std::to_string(kDefaultRowGroupRows));
   benchmark::AddCustomContext("logical_size", "Arrow TotalBufferSize of input RecordBatch");
+  benchmark::AddCustomContext("parquet_config",
+                              "dictionary=default,codec=uncompressed_or_zstd,threads=off");
 }
 
 }  // namespace

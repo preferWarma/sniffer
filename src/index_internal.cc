@@ -37,20 +37,6 @@ arrow::Result<int> CompareKeys(const std::vector<std::shared_ptr<arrow::Scalar>>
   return 0;
 }
 
-template <typename ArrayType>
-int ComparePrimitiveRows(const arrow::Array& untyped, int64_t left_index, int64_t right_index) {
-  const auto& array = static_cast<const ArrayType&>(untyped);
-  const auto left = array.Value(left_index);
-  const auto right = array.Value(right_index);
-  if (left < right) {
-    return -1;
-  }
-  if (left > right) {
-    return 1;
-  }
-  return 0;
-}
-
 int CompareByteViews(std::string_view left, std::string_view right) {
   const size_t common_size = std::min(left.size(), right.size());
   for (size_t index = 0; index < common_size; ++index) {
@@ -72,41 +58,81 @@ int CompareByteViews(std::string_view left, std::string_view right) {
   return 0;
 }
 
-arrow::Result<int> CompareArrayRows(const arrow::Array& array, int64_t left_index,
-                                    int64_t right_index) {
+template <typename ArrayType>
+arrow::Result<bool> ValidatePrimitiveSortValues(const arrow::Array& untyped, uint32_t field_id) {
+  const auto& array = static_cast<const ArrayType&>(untyped);
+  bool sorted = true;
+  using Value = std::remove_cv_t<decltype(array.Value(0))>;
+  Value previous{};
+  for (int64_t row = 0; row < array.length(); ++row) {
+    if (array.IsNull(row)) {
+      return arrow::Status::Invalid("[sniffer.layout.sort_key] field ", field_id,
+                                    " contains null or NaN");
+    }
+    const Value value = array.Value(row);
+    if constexpr (std::is_floating_point_v<Value>) {
+      if (std::isnan(value)) {
+        return arrow::Status::Invalid("[sniffer.layout.sort_key] field ", field_id,
+                                      " contains null or NaN");
+      }
+    }
+    if (row != 0 && value < previous) {
+      sorted = false;
+    }
+    previous = value;
+  }
+  return sorted;
+}
+
+template <typename ArrayType>
+arrow::Result<bool> ValidateVariableSortValues(const arrow::Array& untyped, uint32_t field_id) {
+  const auto& array = static_cast<const ArrayType&>(untyped);
+  bool sorted = true;
+  std::string_view previous;
+  for (int64_t row = 0; row < array.length(); ++row) {
+    if (array.IsNull(row)) {
+      return arrow::Status::Invalid("[sniffer.layout.sort_key] field ", field_id,
+                                    " contains null or NaN");
+    }
+    const std::string_view value = array.GetView(row);
+    if (row != 0 && CompareByteViews(previous, value) > 0) {
+      sorted = false;
+    }
+    previous = value;
+  }
+  return sorted;
+}
+
+arrow::Result<bool> ValidateSortValues(const arrow::Array& array, uint32_t field_id) {
   switch (array.type_id()) {
     case arrow::Type::BOOL:
-      return ComparePrimitiveRows<arrow::BooleanArray>(array, left_index, right_index);
+      return ValidatePrimitiveSortValues<arrow::BooleanArray>(array, field_id);
     case arrow::Type::INT8:
-      return ComparePrimitiveRows<arrow::Int8Array>(array, left_index, right_index);
+      return ValidatePrimitiveSortValues<arrow::Int8Array>(array, field_id);
     case arrow::Type::INT16:
-      return ComparePrimitiveRows<arrow::Int16Array>(array, left_index, right_index);
+      return ValidatePrimitiveSortValues<arrow::Int16Array>(array, field_id);
     case arrow::Type::INT32:
-      return ComparePrimitiveRows<arrow::Int32Array>(array, left_index, right_index);
+      return ValidatePrimitiveSortValues<arrow::Int32Array>(array, field_id);
     case arrow::Type::INT64:
-      return ComparePrimitiveRows<arrow::Int64Array>(array, left_index, right_index);
+      return ValidatePrimitiveSortValues<arrow::Int64Array>(array, field_id);
     case arrow::Type::UINT8:
-      return ComparePrimitiveRows<arrow::UInt8Array>(array, left_index, right_index);
+      return ValidatePrimitiveSortValues<arrow::UInt8Array>(array, field_id);
     case arrow::Type::UINT16:
-      return ComparePrimitiveRows<arrow::UInt16Array>(array, left_index, right_index);
+      return ValidatePrimitiveSortValues<arrow::UInt16Array>(array, field_id);
     case arrow::Type::UINT32:
-      return ComparePrimitiveRows<arrow::UInt32Array>(array, left_index, right_index);
+      return ValidatePrimitiveSortValues<arrow::UInt32Array>(array, field_id);
     case arrow::Type::UINT64:
-      return ComparePrimitiveRows<arrow::UInt64Array>(array, left_index, right_index);
+      return ValidatePrimitiveSortValues<arrow::UInt64Array>(array, field_id);
     case arrow::Type::FLOAT:
-      return ComparePrimitiveRows<arrow::FloatArray>(array, left_index, right_index);
+      return ValidatePrimitiveSortValues<arrow::FloatArray>(array, field_id);
     case arrow::Type::DOUBLE:
-      return ComparePrimitiveRows<arrow::DoubleArray>(array, left_index, right_index);
+      return ValidatePrimitiveSortValues<arrow::DoubleArray>(array, field_id);
     case arrow::Type::TIMESTAMP:
-      return ComparePrimitiveRows<arrow::TimestampArray>(array, left_index, right_index);
-    case arrow::Type::STRING: {
-      const auto& strings = static_cast<const arrow::StringArray&>(array);
-      return CompareByteViews(strings.GetView(left_index), strings.GetView(right_index));
-    }
-    case arrow::Type::BINARY: {
-      const auto& binary = static_cast<const arrow::BinaryArray&>(array);
-      return CompareByteViews(binary.GetView(left_index), binary.GetView(right_index));
-    }
+      return ValidatePrimitiveSortValues<arrow::TimestampArray>(array, field_id);
+    case arrow::Type::STRING:
+      return ValidateVariableSortValues<arrow::StringArray>(array, field_id);
+    case arrow::Type::BINARY:
+      return ValidateVariableSortValues<arrow::BinaryArray>(array, field_id);
     default:
       return arrow::Status::NotImplemented("[sniffer.layout.sort_key] unsupported type ",
                                            array.type()->ToString());
@@ -135,12 +161,7 @@ arrow::Status ValidateSingleSortKey(const TableSchema& schema, uint32_t field_id
                                     std::vector<std::shared_ptr<arrow::Scalar>>* previous_key) {
   ARROW_ASSIGN_OR_RAISE(const size_t field_index, FieldIndex(schema, field_id));
   const auto& array = *batch.column(static_cast<int>(field_index));
-  for (int64_t row = 0; row < array.length(); ++row) {
-    if (array.IsNull(row) || ArrayValueHasNaN(array, row)) {
-      return arrow::Status::Invalid("[sniffer.layout.sort_key] field ", field_id,
-                                    " contains null or NaN");
-    }
-  }
+  ARROW_ASSIGN_OR_RAISE(const bool locally_sorted, ValidateSortValues(array, field_id));
 
   ARROW_ASSIGN_OR_RAISE(auto first, array.GetScalar(0));
   if (!previous_key->empty()) {
@@ -153,12 +174,8 @@ arrow::Status ValidateSingleSortKey(const TableSchema& schema, uint32_t field_id
           "[sniffer.layout.sort_key] input is not globally non-decreasing");
     }
   }
-  for (int64_t row = 1; row < array.length(); ++row) {
-    ARROW_ASSIGN_OR_RAISE(const int order, CompareArrayRows(array, row - 1, row));
-    if (order > 0) {
-      return arrow::Status::Invalid(
-          "[sniffer.layout.sort_key] input is not globally non-decreasing");
-    }
+  if (!locally_sorted) {
+    return arrow::Status::Invalid("[sniffer.layout.sort_key] input is not globally non-decreasing");
   }
 
   if (array.length() == 1) {

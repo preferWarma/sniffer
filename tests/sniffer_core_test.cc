@@ -515,6 +515,88 @@ TEST(SnifferCoreTest, TypedArrayHashMatchesScalarReference) {
                    .ok());
 }
 
+TEST(SnifferCoreTest, TypedSingleSortValidationCoversAllFlatTypes) {
+  const auto timestamp_type = std::static_pointer_cast<arrow::TimestampType>(
+      arrow::timestamp(arrow::TimeUnit::MICRO, "UTC"));
+  struct SortCase {
+    std::shared_ptr<arrow::DataType> type;
+    std::shared_ptr<arrow::Array> sorted;
+    std::shared_ptr<arrow::Array> unsorted;
+  };
+  const std::vector<SortCase> cases = {
+      {arrow::boolean(), BuildArray<arrow::BooleanBuilder, bool>({false, false, true}),
+       BuildArray<arrow::BooleanBuilder, bool>({false, true, false})},
+      {arrow::int8(), BuildArray<arrow::Int8Builder, int8_t>({-1, 0, 1}),
+       BuildArray<arrow::Int8Builder, int8_t>({0, 1, -1})},
+      {arrow::int16(), BuildArray<arrow::Int16Builder, int16_t>({-1, 0, 1}),
+       BuildArray<arrow::Int16Builder, int16_t>({0, 1, -1})},
+      {arrow::int32(), BuildArray<arrow::Int32Builder, int32_t>({-1, 0, 1}),
+       BuildArray<arrow::Int32Builder, int32_t>({0, 1, -1})},
+      {arrow::int64(), BuildArray<arrow::Int64Builder, int64_t>({-1, 0, 1}),
+       BuildArray<arrow::Int64Builder, int64_t>({0, 1, -1})},
+      {arrow::uint8(), BuildArray<arrow::UInt8Builder, uint8_t>({0, 1, 2}),
+       BuildArray<arrow::UInt8Builder, uint8_t>({1, 2, 0})},
+      {arrow::uint16(), BuildArray<arrow::UInt16Builder, uint16_t>({0, 1, 2}),
+       BuildArray<arrow::UInt16Builder, uint16_t>({1, 2, 0})},
+      {arrow::uint32(), BuildArray<arrow::UInt32Builder, uint32_t>({0, 1, 2}),
+       BuildArray<arrow::UInt32Builder, uint32_t>({1, 2, 0})},
+      {arrow::uint64(), BuildArray<arrow::UInt64Builder, uint64_t>({0, 1, 2}),
+       BuildArray<arrow::UInt64Builder, uint64_t>({1, 2, 0})},
+      {arrow::float32(), BuildArray<arrow::FloatBuilder, float>({-1.0F, -0.0F, 1.0F}),
+       BuildArray<arrow::FloatBuilder, float>({0.0F, 1.0F, -1.0F})},
+      {arrow::float64(), BuildArray<arrow::DoubleBuilder, double>({-1.0, -0.0, 1.0}),
+       BuildArray<arrow::DoubleBuilder, double>({0.0, 1.0, -1.0})},
+      {timestamp_type, BuildTimestampArray(timestamp_type, {-1, 0, 1}),
+       BuildTimestampArray(timestamp_type, {0, 1, -1})},
+      {arrow::utf8(), BuildStringArray({"", "alpha", "beta"}),
+       BuildStringArray({"alpha", "beta", ""})},
+      {arrow::binary(),
+       BuildBinaryArray(
+           {std::vector<uint8_t>{}, std::vector<uint8_t>{0}, std::vector<uint8_t>{0, 1}}),
+       BuildBinaryArray(
+           {std::vector<uint8_t>{0}, std::vector<uint8_t>{0, 1}, std::vector<uint8_t>{}})},
+  };
+
+  uint32_t field_id = 1;
+  for (const auto& test : cases) {
+    const sniffer::TableSchema schema{1, {{field_id, "key", test.type, false, nullptr}}};
+    const auto arrow_schema = ValueOrThrow(schema.ToArrowSchema(), "create typed sort schema");
+    sniffer::LayoutPolicy layout;
+    layout.sort_key_field_ids = {field_id};
+    std::vector<std::shared_ptr<arrow::Scalar>> previous_key;
+    const auto sorted_batch =
+        arrow::RecordBatch::Make(arrow_schema, test.sorted->length(), {test.sorted});
+    EXPECT_TRUE(
+        sniffer::internal::ValidateAndUpdateSortOrder(schema, layout, *sorted_batch, &previous_key)
+            .ok())
+        << "sorted values accepted for " << test.type->ToString();
+    EXPECT_EQ(previous_key.size(), 1U);
+
+    previous_key.clear();
+    const auto unsorted_batch =
+        arrow::RecordBatch::Make(arrow_schema, test.unsorted->length(), {test.unsorted});
+    EXPECT_FALSE(sniffer::internal::ValidateAndUpdateSortOrder(schema, layout, *unsorted_batch,
+                                                               &previous_key)
+                     .ok())
+        << "unsorted values rejected for " << test.type->ToString();
+    ++field_id;
+  }
+
+  const sniffer::TableSchema nan_schema{1, {{100, "key", arrow::float64(), false, nullptr}}};
+  const auto nan_arrow_schema = ValueOrThrow(nan_schema.ToArrowSchema(), "create NaN sort schema");
+  const auto nan_values = BuildArray<arrow::DoubleBuilder, double>(
+      {0.0, std::numeric_limits<double>::quiet_NaN(), 1.0});
+  const auto nan_batch =
+      arrow::RecordBatch::Make(nan_arrow_schema, nan_values->length(), {nan_values});
+  sniffer::LayoutPolicy nan_layout;
+  nan_layout.sort_key_field_ids = {100};
+  std::vector<std::shared_ptr<arrow::Scalar>> previous_key;
+  EXPECT_FALSE(sniffer::internal::ValidateAndUpdateSortOrder(nan_schema, nan_layout, *nan_batch,
+                                                             &previous_key)
+                   .ok())
+      << "NaN sort key is rejected";
+}
+
 TEST(SnifferCoreTest, SortedPrimaryStatisticsFastPathMatchesGenericIndex) {
   const sniffer::TableSchema schema{
       1, {{1, "id", arrow::int64(), false, nullptr}, {2, "value", arrow::int32(), true, nullptr}}};

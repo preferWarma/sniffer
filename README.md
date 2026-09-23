@@ -169,11 +169,13 @@ ARROW_ASSIGN_OR_RAISE(auto batches, reader->Scan(std::move(plan), metrics));
 `context` 包含源码 revision、编译器、Arrow 版本与构建模式；`benchmarks` 包含标准时间、重复聚合
 和 Sniffer 自定义 counters。
 
-性能对照使用相同输入、相同 Row Group/RecordBatch 切分和相同过滤投影，同时运行 Sniffer、
-未压缩 Arrow IPC 和 Arrow IPC + ZSTD。输出包括 Google Benchmark 的时间与吞吐，以及写入、
-扫描、文件大小、剪枝、读取字节数和 Sniffer 内部分阶段 counters。输入 batch 构造不计时，编码、
-压缩和解压均设置为单线程。
-固定的测试口径、环境和参考结果见 [`bench/BENCHMARK_V1.md`](bench/BENCHMARK_V1.md)。
+性能对照使用相同输入和 Row Group 大小，同时运行 Sniffer、未压缩 Parquet 和 Parquet + ZSTD。
+Parquet 对照读取 Footer 中的 Row Group statistics 剪枝，仅读取谓词和输出所需列，再执行相同
+过滤与投影。输出包括时间、吞吐、文件大小、Row Group 剪枝和候选列块数；Sniffer 另报告实际
+读取字节数和内部分阶段 counters。Parquet 的列块数按选中 Row Group 与所需列计算，并非物理
+I/O 观测值。输入 batch 构造不计时，Parquet 读写关闭多线程。当前
+Parquet 口径见 [`bench/BENCHMARK_V2.md`](bench/BENCHMARK_V2.md)；
+[`bench/BENCHMARK_V1.md`](bench/BENCHMARK_V1.md) 保留当时的 Arrow IPC 历史结果。
 
 压缩能力 benchmark 分别测试递增整数、窄值域整数、长 RLE、含 null 偏斜整数、低基数
 字符串和高基数字符串，并同时衡量空间效率、压缩写入效率和解压读取效率：
@@ -207,9 +209,9 @@ round-trip 比较在计时区间外执行。
 与文件写入，以及 reader 的元数据、chunk I/O/checksum、解码、谓词、投影和 batch materialization。
 这些计时只在 benchmark 显式传入 metrics 对象时启用。
 
-Arrow IPC 对照使用类型化循环完成过滤和 projection materialization，但不提供 Sniffer 的编码
-选择、Row Group 索引、剪枝和各层 checksum，因此它是序列化/通用压缩基线，不是功能完全
-等价的存储格式。结果应分别用于观察端到端成本和文件大小，不能直接解释为纯解码器速度对比。
+Parquet 对照使用类型化循环完成过滤和 projection materialization，并以 Row Group statistics
+剪枝；它没有 Sniffer 当前的分离式谓词列/投影列解码和相同的 checksum 语义。文件格式和索引
+能力有差异，扫描数字应结合读取列块数与配置解释。
 
 `tests/sniffer_core_fuzz.cc` 同时提供 `LLVMFuzzerTestOneInput` 入口和 CTest 使用的确定性
 standalone smoke corpus，用于检查任意 Segment 输入的解析、checksum、完整读取和扫描路径。

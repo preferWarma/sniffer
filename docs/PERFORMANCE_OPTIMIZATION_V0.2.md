@@ -6,6 +6,9 @@
 
 **基线：** [`bench/BENCHMARK_V1.md`](../bench/BENCHMARK_V1.md)
 
+当前文件格式对照改为 Parquet；v1 Arrow IPC 数据保留作历史性能回归参考，新的对照口径见
+[`bench/BENCHMARK_V2.md`](../bench/BENCHMARK_V2.md)。
+
 ## 1. 目标与边界
 
 v0.2 聚焦现有 Segment writer、reader、codec、scan 和文件 I/O 路径的性能，不扩大
@@ -73,6 +76,8 @@ v0.2 聚焦现有 Segment writer、reader、codec、scan 和文件 I/O 路径的
         保留原回退路径，所有整数宽度、timestamp 和 all-null 均有逐字节等价测试。
   - [x] 第二小步：非排序整数、bool 和 timestamp statistics 在原 typed min/max 遍历中同时生成
         selector sample 摘要；排序键 endpoint 快速路径和无 statistics 字段不额外扫描。
+  - [x] 第三小步：单列 sort-key 校验按 Arrow type 绑定循环，将 null/NaN 检查与局部有序检查融合
+        为一次遍历；跨 batch 边界检查和结构化错误保持不变。
 - [x] Bloom 构建按列绑定数组类型和 physical type，逐行双哈希不再重复做类型一致性检查与
       `PhysicalTypeFor()`；安全入口和绑定入口的哈希结果逐值一致。
 - [x] 为整数、timestamp、bool、string/binary 增加 typed encoder 路径，避免逐值构造
@@ -841,3 +846,37 @@ P50）：
 确认运行的 wall/CPU CV 为 1.56%/1.64%，其中 writer encoding CPU CV 为 0.77%；microbenchmark CPU
 CV 为 0.46%。Dictionary payload 仍为 113,058 字节，完整 Segment 仍为 663,679 字节；Arrow 分配、
 12/25 Row Group 剪枝、26 个 ColumnChunk 和 172,228 个读取字节均保持不变。
+
+### 2026-09-21：融合单列 sort-key 校验
+
+- `dea1076` 后重新 profile，排除 benchmark 启动期符号后，项目内 top-of-stack 包括
+  `BuildRowGroupIndex` 369、`EncodeNonPlain` 233、Bloom known-valid hash 205、FOR decode 143、
+  `BuildStatistics` 118、Dictionary string map 107、`ValidateAndUpdateSortOrder` 104 和 CRC32C 100。
+- 单列 sort-key 原先先遍历全部值检查 null/NaN，再次遍历相邻值并在每行进入 type switch。现在先
+  按 Arrow type 绑定 typed loop，在一次遍历中完成两项检查；仍先报告 null/NaN，再执行跨 batch
+  边界检查，最后报告局部逆序，因此错误类别和优先级不变。
+- 新增全部首期平铺类型的有序/逆序测试，并显式覆盖重复值、浮点 signed zero、NaN、string、binary
+  和 timestamp；既有测试继续覆盖跨 `Append()` 边界逆序。
+
+同机 Release、100,000 行、Row Group 4,096、50% 选择率、11 次 P50：
+
+| 指标 | Before | After | 变化 |
+|---|---:|---:|---:|
+| writer validation | 0.4059 ms | 0.3127 ms | -23.0% |
+| writer 总耗时 | 4.7115 ms | 4.6200 ms | -1.9% |
+| 端到端耗时 / 吞吐 | 5.6907 ms / 17.573 M rows/s | 5.5972 ms / 17.866 M rows/s | 吞吐 +1.7% |
+
+确认运行 wall/CPU CV 为 0.62%/0.79%，validation CV 为 1.44%。Segment 仍为 663,679 字节，Arrow
+分配、12/25 Row Group 剪枝、26 个 ColumnChunk 和 172,228 个读取字节均保持不变。
+
+### 2026-09-23：文件格式对照切换为 Parquet
+
+- 性能与压缩 benchmark 的当前对照改为未压缩 Parquet 和 Parquet + ZSTD；两个 Parquet case 均
+  使用默认 dictionary 设置、单线程和与 Sniffer 相同的 Row Group 大小。
+- 性能路径按 Footer 中 `id` 的 Row Group statistics 剪枝，并仅读取谓词与投影所需列；单谓词、
+  三谓词、sort-key range 和 1%/10%/50%/100% 选择率矩阵均有对应 case。压缩路径逐轮全量
+  回读并在计时外验证 Arrow batch 一致性。
+- 已建立 [`bench/BENCHMARK_V2.md`](../bench/BENCHMARK_V2.md) 初版。固定 warm-cache 场景下三者
+  剪枝均为 12/25 Row Group，Sniffer、Parquet、Parquet + ZSTD 端到端 P50 分别为 5.431、
+  8.528、11.459 ms，文件分别为 663,679、1,955,982、514,667 字节。完整矩阵、宽表、cold-cache
+  和相对 v1 的同口径回归仍待补齐，故本专项完成定义暂不勾选。

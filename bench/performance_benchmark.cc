@@ -1,10 +1,11 @@
 #include <arrow/api.h>
 #include <arrow/io/api.h>
-#include <arrow/ipc/api.h>
 #include <arrow/memory_pool.h>
-#include <arrow/util/compression.h>
 #include <arrow/util/config.h>
 #include <benchmark/benchmark.h>
+#include <parquet/arrow/reader.h>
+#include <parquet/metadata.h>
+#include <parquet/statistics.h>
 
 #if defined(__APPLE__) || defined(__linux__)
 #include <sys/resource.h>
@@ -22,6 +23,7 @@
 #include <vector>
 
 #include "benchmark_build_config.h"
+#include "parquet_benchmark_util.h"
 #include "sniffer/io_plan.h"
 #include "sniffer/segment_reader.h"
 #include "sniffer/segment_writer.h"
@@ -31,7 +33,7 @@ namespace {
 constexpr int64_t kDefaultRows = 100000;
 constexpr int64_t kDefaultRowGroupRows = 4096;
 
-enum class Format { kSniffer, kArrowIpc, kArrowIpcZstd };
+enum class Format { kSniffer, kParquet, kParquetZstd };
 enum class Query { kSinglePredicate, kThreePredicates, kSortKeyRange };
 
 struct BenchmarkConfig {
@@ -223,64 +225,127 @@ arrow::Result<Measurement> RunSnifferOnce(const std::filesystem::path& path,
   return measurement;
 }
 
-arrow::Result<Measurement> RunArrowIpcOnce(const std::filesystem::path& path,
-                                           const std::shared_ptr<arrow::RecordBatch>& batch,
-                                           const BenchmarkConfig& config,
-                                           arrow::Compression::type compression) {
+arrow::Result<Measurement> RunParquetOnce(const std::filesystem::path& path,
+                                          const std::shared_ptr<arrow::RecordBatch>& batch,
+                                          const BenchmarkConfig& config, Query query,
+                                          parquet::Compression::type compression) {
   const MemorySnapshot memory_before = CaptureMemorySnapshot();
   const auto start = std::chrono::steady_clock::now();
-  ARROW_ASSIGN_OR_RAISE(auto output, arrow::io::FileOutputStream::Open(path.string()));
-  auto write_options = arrow::ipc::IpcWriteOptions::Defaults();
-  write_options.use_threads = false;
-  if (compression != arrow::Compression::UNCOMPRESSED) {
-    ARROW_ASSIGN_OR_RAISE(auto codec, arrow::util::Codec::Create(compression));
-    write_options.codec = std::move(codec);
-  }
-  ARROW_ASSIGN_OR_RAISE(auto writer,
-                        arrow::ipc::MakeFileWriter(output, batch->schema(), write_options));
-  for (int64_t offset = 0; offset < batch->num_rows(); offset += config.row_group_rows) {
-    const int64_t length = std::min<int64_t>(config.row_group_rows, batch->num_rows() - offset);
-    ARROW_RETURN_NOT_OK(writer->WriteRecordBatch(*batch->Slice(offset, length)));
-  }
-  ARROW_RETURN_NOT_OK(writer->Close());
-  ARROW_RETURN_NOT_OK(output->Close());
+  ARROW_RETURN_NOT_OK(
+      sniffer_bench::WriteParquet(path, *batch, config.row_group_rows, compression));
   const auto write_end = std::chrono::steady_clock::now();
 
-  ARROW_ASSIGN_OR_RAISE(auto input, arrow::io::ReadableFile::Open(path.string()));
-  auto read_options = arrow::ipc::IpcReadOptions::Defaults();
-  read_options.use_threads = false;
-  ARROW_ASSIGN_OR_RAISE(auto reader, arrow::ipc::RecordBatchFileReader::Open(input, read_options));
-  const int64_t threshold = batch->num_rows() / 2;
-  uint64_t output_rows = 0;
-  for (int index = 0; index < reader->num_record_batches(); ++index) {
-    ARROW_ASSIGN_OR_RAISE(auto current, reader->ReadRecordBatch(index));
-    const auto& ids = static_cast<const arrow::Int64Array&>(*current->column(0));
-    const auto& values = static_cast<const arrow::Int64Array&>(*current->column(2));
-    arrow::Int64Builder filtered_id_builder;
-    arrow::Int64Builder filtered_value_builder;
-    ARROW_RETURN_NOT_OK(filtered_id_builder.Reserve(current->num_rows()));
-    ARROW_RETURN_NOT_OK(filtered_value_builder.Reserve(current->num_rows()));
-    for (int64_t row = 0; row < current->num_rows(); ++row) {
-      if (ids.Value(row) < threshold) {
+  ARROW_ASSIGN_OR_RAISE(auto reader,
+                        sniffer_bench::OpenParquet(path, config.row_group_rows / 2 + 1));
+  const auto metadata = reader->parquet_reader()->metadata();
+  const int64_t threshold = PredicateThreshold(config);
+  const int64_t range_lower = batch->num_rows() / 4;
+  const int64_t range_upper = batch->num_rows() * 3 / 4;
+  std::vector<int> selected_row_groups;
+  selected_row_groups.reserve(static_cast<size_t>(reader->num_row_groups()));
+  for (int index = 0; index < reader->num_row_groups(); ++index) {
+    const auto row_group = metadata->RowGroup(index);
+    const auto statistics = row_group->ColumnChunk(0)->statistics();
+    if (statistics && statistics->HasMinMax() &&
+        statistics->physical_type() == parquet::Type::INT64) {
+      const auto& ids = static_cast<const parquet::Int64Statistics&>(*statistics);
+      if (query == Query::kSortKeyRange) {
+        if (ids.max() < range_lower || ids.min() >= range_upper) {
+          continue;
+        }
+      } else if (ids.max() < threshold) {
         continue;
       }
-      ARROW_RETURN_NOT_OK(filtered_id_builder.Append(ids.Value(row)));
-      if (values.IsNull(row)) {
-        ARROW_RETURN_NOT_OK(filtered_value_builder.AppendNull());
-      } else {
-        ARROW_RETURN_NOT_OK(filtered_value_builder.Append(values.Value(row)));
+    }
+    selected_row_groups.push_back(index);
+  }
+  std::vector<int> columns{0};
+  if (query == Query::kThreePredicates || config.projection_columns == 3) {
+    columns.push_back(1);
+  }
+  if (query == Query::kThreePredicates || config.projection_columns >= 2) {
+    columns.push_back(2);
+  }
+  ARROW_ASSIGN_OR_RAISE(auto stream, reader->GetRecordBatchReader(selected_row_groups, columns));
+  std::vector<std::shared_ptr<arrow::Field>> output_fields{batch->schema()->field(0)};
+  if (config.projection_columns == 3) {
+    output_fields.push_back(batch->schema()->field(1));
+  }
+  if (config.projection_columns >= 2) {
+    output_fields.push_back(batch->schema()->field(2));
+  }
+  const auto output_schema = arrow::schema(std::move(output_fields));
+  uint64_t output_rows = 0;
+  while (true) {
+    ARROW_ASSIGN_OR_RAISE(auto current, stream->Next());
+    if (!current) {
+      break;
+    }
+    const auto& ids = static_cast<const arrow::Int64Array&>(*current->GetColumnByName("id"));
+    const auto groups = current->GetColumnByName("group");
+    const auto values = current->GetColumnByName("value");
+    arrow::Int64Builder filtered_id_builder;
+    arrow::Int64Builder filtered_value_builder;
+    arrow::StringBuilder filtered_group_builder;
+    ARROW_RETURN_NOT_OK(filtered_id_builder.Reserve(current->num_rows()));
+    if (config.projection_columns >= 2) {
+      ARROW_RETURN_NOT_OK(filtered_value_builder.Reserve(current->num_rows()));
+    }
+    if (config.projection_columns == 3) {
+      ARROW_RETURN_NOT_OK(filtered_group_builder.Reserve(current->num_rows()));
+    }
+    for (int64_t row = 0; row < current->num_rows(); ++row) {
+      const int64_t id = ids.Value(row);
+      if (query == Query::kSortKeyRange ? (id < range_lower || id >= range_upper)
+                                        : id < threshold) {
+        continue;
+      }
+      if (query == Query::kThreePredicates) {
+        const auto& group = static_cast<const arrow::StringArray&>(*groups);
+        if (group.GetView(row) != "group-0" || values->IsNull(row)) {
+          continue;
+        }
+      }
+      ARROW_RETURN_NOT_OK(filtered_id_builder.Append(id));
+      if (config.projection_columns >= 2) {
+        const auto& value = static_cast<const arrow::Int64Array&>(*values);
+        if (value.IsNull(row)) {
+          ARROW_RETURN_NOT_OK(filtered_value_builder.AppendNull());
+        } else {
+          ARROW_RETURN_NOT_OK(filtered_value_builder.Append(value.Value(row)));
+        }
+      }
+      if (config.projection_columns == 3) {
+        ARROW_RETURN_NOT_OK(filtered_group_builder.Append(
+            static_cast<const arrow::StringArray&>(*groups).GetView(row)));
       }
     }
     std::shared_ptr<arrow::Array> filtered_id;
-    std::shared_ptr<arrow::Array> filtered_value;
     ARROW_RETURN_NOT_OK(filtered_id_builder.Finish(&filtered_id));
-    ARROW_RETURN_NOT_OK(filtered_value_builder.Finish(&filtered_value));
-    if (filtered_id->length() != filtered_value->length()) {
-      return arrow::Status::Invalid("Arrow IPC projected columns have different lengths");
+    std::shared_ptr<arrow::Array> filtered_value;
+    if (config.projection_columns >= 2) {
+      ARROW_RETURN_NOT_OK(filtered_value_builder.Finish(&filtered_value));
+      if (filtered_id->length() != filtered_value->length()) {
+        return arrow::Status::Invalid("Parquet projected columns have different lengths");
+      }
     }
-    output_rows += static_cast<uint64_t>(filtered_id->length());
+    std::vector<std::shared_ptr<arrow::Array>> output_columns{filtered_id};
+    if (config.projection_columns == 3) {
+      std::shared_ptr<arrow::Array> filtered_group;
+      ARROW_RETURN_NOT_OK(filtered_group_builder.Finish(&filtered_group));
+      if (filtered_id->length() != filtered_group->length()) {
+        return arrow::Status::Invalid("Parquet projected columns have different lengths");
+      }
+      output_columns.push_back(std::move(filtered_group));
+    }
+    if (config.projection_columns >= 2) {
+      output_columns.push_back(std::move(filtered_value));
+    }
+    const auto result_batch =
+        arrow::RecordBatch::Make(output_schema, filtered_id->length(), std::move(output_columns));
+    output_rows += static_cast<uint64_t>(result_batch->num_rows());
+    benchmark::DoNotOptimize(result_batch.get());
   }
-  ARROW_RETURN_NOT_OK(input->Close());
   const auto end = std::chrono::steady_clock::now();
 
   Measurement measurement;
@@ -291,7 +356,12 @@ arrow::Result<Measurement> RunArrowIpcOnce(const std::filesystem::path& path,
   measurement.total_milliseconds = std::chrono::duration<double, std::milli>(end - start).count();
   ARROW_ASSIGN_OR_RAISE(measurement.file_bytes, FileSize(path));
   measurement.output_rows = output_rows;
-  measurement.record_groups = static_cast<uint64_t>(reader->num_record_batches());
+  measurement.record_groups = static_cast<uint64_t>(reader->num_row_groups());
+  measurement.scan_metrics.row_groups_considered = measurement.record_groups;
+  measurement.scan_metrics.row_groups_pruned =
+      measurement.record_groups - static_cast<uint64_t>(selected_row_groups.size());
+  measurement.scan_metrics.column_chunks_read =
+      static_cast<uint64_t>(selected_row_groups.size() * columns.size());
   RecordMemory(memory_before, CaptureMemorySnapshot(), &measurement);
   return measurement;
 }
@@ -319,7 +389,7 @@ void RunPerformance(benchmark::State& state, Format format, Query query,
   policy.bloom_field_ids = {2};
   const std::string suffix = format == Format::kSniffer
                                  ? "sniffer"
-                                 : (format == Format::kArrowIpc ? "arrow" : "arrow_zstd");
+                                 : (format == Format::kParquet ? "parquet" : "parquet_zstd");
   const auto path =
       std::filesystem::temp_directory_path() / ("sniffer_performance_" + suffix + ".tmp");
   Measurement totals;
@@ -329,9 +399,9 @@ void RunPerformance(benchmark::State& state, Format format, Query query,
     if (format == Format::kSniffer) {
       result = RunSnifferOnce(path, schema, policy, batch, config, query);
     } else {
-      result = RunArrowIpcOnce(path, batch, config,
-                               format == Format::kArrowIpc ? arrow::Compression::UNCOMPRESSED
-                                                           : arrow::Compression::ZSTD);
+      result = RunParquetOnce(path, batch, config, query,
+                              format == Format::kParquet ? parquet::Compression::UNCOMPRESSED
+                                                         : parquet::Compression::ZSTD);
     }
     if (!result.ok()) {
       state.SkipWithError(result.status().ToString());
@@ -455,6 +525,13 @@ void RunPerformance(benchmark::State& state, Format format, Query query,
                static_cast<double>(totals.scan_metrics.column_chunks_read));
     SetAverage(state, "chunk_bytes_read",
                static_cast<double>(totals.scan_metrics.chunk_bytes_read));
+  } else {
+    SetAverage(state, "row_groups_considered",
+               static_cast<double>(totals.scan_metrics.row_groups_considered));
+    SetAverage(state, "row_groups_pruned",
+               static_cast<double>(totals.scan_metrics.row_groups_pruned));
+    SetAverage(state, "column_chunks_read",
+               static_cast<double>(totals.scan_metrics.column_chunks_read));
   }
   state.SetItemsProcessed(state.iterations() * config.rows);
 }
@@ -502,15 +579,43 @@ BENCHMARK_CAPTURE(Performance, SnifferSortKeyRange, Format::kSniffer, Query::kSo
     ->Args({kDefaultRows, kDefaultRowGroupRows})
     ->UseManualTime()
     ->Unit(benchmark::kMillisecond);
-BENCHMARK_CAPTURE(Performance, ArrowIPC, Format::kArrowIpc, Query::kSinglePredicate)
+BENCHMARK_CAPTURE(Performance, Parquet, Format::kParquet, Query::kSinglePredicate)
     ->Args({kDefaultRows, kDefaultRowGroupRows})
     ->UseManualTime()
     ->Unit(benchmark::kMillisecond);
-BENCHMARK_CAPTURE(Performance, ArrowIPC_ZSTD, Format::kArrowIpcZstd, Query::kSinglePredicate)
+BENCHMARK_CAPTURE(Performance, ParquetThreePredicates, Format::kParquet, Query::kThreePredicates)
+    ->Args({kDefaultRows, kDefaultRowGroupRows})
+    ->UseManualTime()
+    ->Unit(benchmark::kMillisecond);
+BENCHMARK_CAPTURE(Performance, ParquetSortKeyRange, Format::kParquet, Query::kSortKeyRange)
+    ->Args({kDefaultRows, kDefaultRowGroupRows})
+    ->UseManualTime()
+    ->Unit(benchmark::kMillisecond);
+BENCHMARK_CAPTURE(Performance, Parquet_ZSTD, Format::kParquetZstd, Query::kSinglePredicate)
+    ->Args({kDefaultRows, kDefaultRowGroupRows})
+    ->UseManualTime()
+    ->Unit(benchmark::kMillisecond);
+BENCHMARK_CAPTURE(Performance, Parquet_ZSTD_ThreePredicates, Format::kParquetZstd,
+                  Query::kThreePredicates)
+    ->Args({kDefaultRows, kDefaultRowGroupRows})
+    ->UseManualTime()
+    ->Unit(benchmark::kMillisecond);
+BENCHMARK_CAPTURE(Performance, Parquet_ZSTD_SortKeyRange, Format::kParquetZstd,
+                  Query::kSortKeyRange)
     ->Args({kDefaultRows, kDefaultRowGroupRows})
     ->UseManualTime()
     ->Unit(benchmark::kMillisecond);
 BENCHMARK_CAPTURE(PerformanceMatrix, Sniffer, Format::kSniffer, Query::kSinglePredicate)
+    ->Apply(ApplyPerformanceMatrix)
+    ->ArgNames({"rows", "row_group_rows", "selectivity_percent", "projection_columns"})
+    ->UseManualTime()
+    ->Unit(benchmark::kMillisecond);
+BENCHMARK_CAPTURE(PerformanceMatrix, Parquet, Format::kParquet, Query::kSinglePredicate)
+    ->Apply(ApplyPerformanceMatrix)
+    ->ArgNames({"rows", "row_group_rows", "selectivity_percent", "projection_columns"})
+    ->UseManualTime()
+    ->Unit(benchmark::kMillisecond);
+BENCHMARK_CAPTURE(PerformanceMatrix, Parquet_ZSTD, Format::kParquetZstd, Query::kSinglePredicate)
     ->Apply(ApplyPerformanceMatrix)
     ->ArgNames({"rows", "row_group_rows", "selectivity_percent", "projection_columns"})
     ->UseManualTime()
@@ -525,6 +630,10 @@ void AddBenchmarkContext() {
   benchmark::AddCustomContext("source_revision", SNIFFER_BENCHMARK_SOURCE_REVISION);
   benchmark::AddCustomContext("compiler", SNIFFER_BENCHMARK_COMPILER);
   benchmark::AddCustomContext("arrow_version", ARROW_VERSION_STRING);
+  benchmark::AddCustomContext("parquet_version", ARROW_VERSION_STRING);
+  benchmark::AddCustomContext("parquet_config",
+                              "dictionary=default,codec=uncompressed_or_zstd,threads=off,"
+                              "row_group_statistics_pruning=true");
   benchmark::AddCustomContext("distribution", "grouped_id_linear_value_nullable");
   benchmark::AddCustomContext("predicate", "id_ge_half");
   benchmark::AddCustomContext("query_variants", "single_predicate,three_predicates,sort_key_range");

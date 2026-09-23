@@ -2,11 +2,13 @@ if(NOT DEFINED BENCHMARK_EXECUTABLE OR NOT DEFINED EXPECTED_PREFIX)
   message(FATAL_ERROR "benchmark JSON validation requires executable and expected prefix")
 endif()
 
+set(benchmark_arguments --benchmark_dry_run --benchmark_format=json)
+if(DEFINED BENCHMARK_FILTER)
+  list(APPEND benchmark_arguments "--benchmark_filter=${BENCHMARK_FILTER}")
+endif()
+
 execute_process(
-  COMMAND
-    "${BENCHMARK_EXECUTABLE}"
-    --benchmark_dry_run
-    --benchmark_format=json
+  COMMAND "${BENCHMARK_EXECUTABLE}" ${benchmark_arguments}
   RESULT_VARIABLE benchmark_result
   OUTPUT_VARIABLE benchmark_output
   ERROR_VARIABLE benchmark_error
@@ -31,6 +33,11 @@ foreach(index RANGE 0 ${benchmark_last})
   string(JSON benchmark_name GET "${benchmark_output}" benchmarks ${index} name)
   string(FIND "${benchmark_name}" "${EXPECTED_PREFIX}" prefix_position)
   if(prefix_position EQUAL 0)
+    string(JSON benchmark_error_value ERROR_VARIABLE benchmark_error_status
+      GET "${benchmark_output}" benchmarks ${index} error_occurred)
+    if(benchmark_error_status STREQUAL "NOTFOUND" AND benchmark_error_value)
+      message(FATAL_ERROR "Google Benchmark case failed: ${benchmark_name}")
+    endif()
     string(JSON real_time GET "${benchmark_output}" benchmarks ${index} real_time)
     string(JSON time_unit GET "${benchmark_output}" benchmarks ${index} time_unit)
     if(real_time LESS 0 OR time_unit STREQUAL "")

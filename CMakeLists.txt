@@ -103,6 +103,25 @@ endif()
 
 if(SNIFFER_BUILD_BENCHMARK)
   find_package(benchmark CONFIG REQUIRED)
+  pkg_check_modules(Parquet REQUIRED parquet)
+  find_file(SNIFFER_PARQUET_STATIC_ARCHIVE
+    NAMES libparquet.a
+    HINTS ${Parquet_LIBRARY_DIRS}
+    NO_DEFAULT_PATH
+  )
+  if(SNIFFER_PARQUET_STATIC_ARCHIVE AND SNIFFER_ARROW_STATIC_ARCHIVE)
+    pkg_check_modules(Thrift REQUIRED IMPORTED_TARGET thrift)
+    add_library(sniffer_parquet STATIC IMPORTED GLOBAL)
+    set_target_properties(sniffer_parquet PROPERTIES
+      IMPORTED_LOCATION "${SNIFFER_PARQUET_STATIC_ARCHIVE}"
+      INTERFACE_INCLUDE_DIRECTORIES "${Parquet_INCLUDE_DIRS}"
+      INTERFACE_COMPILE_DEFINITIONS PARQUET_STATIC
+    )
+    target_link_libraries(sniffer_parquet INTERFACE sniffer_arrow PkgConfig::Thrift)
+  else()
+    pkg_check_modules(ParquetImported REQUIRED IMPORTED_TARGET parquet)
+    add_library(sniffer_parquet ALIAS PkgConfig::ParquetImported)
+  endif()
   set(SNIFFER_BENCHMARK_SOURCE_REVISION "unknown")
   find_package(Git QUIET)
   if(GIT_FOUND)
@@ -141,7 +160,7 @@ if(SNIFFER_BUILD_BENCHMARK)
     sniffer_core_performance_benchmark PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/generated"
   )
   target_link_libraries(
-    sniffer_core_performance_benchmark PRIVATE sniffer_core benchmark::benchmark
+    sniffer_core_performance_benchmark PRIVATE sniffer_core sniffer_parquet benchmark::benchmark
   )
 
   add_executable(sniffer_core_compression_benchmark bench/compression_benchmark.cc)
@@ -150,7 +169,7 @@ if(SNIFFER_BUILD_BENCHMARK)
     sniffer_core_compression_benchmark PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/generated"
   )
   target_link_libraries(
-    sniffer_core_compression_benchmark PRIVATE sniffer_core benchmark::benchmark
+    sniffer_core_compression_benchmark PRIVATE sniffer_core sniffer_parquet benchmark::benchmark
   )
 
   add_executable(sniffer_core_codec_benchmark bench/codec_benchmark.cc)
@@ -201,11 +220,30 @@ if(SNIFFER_BUILD_BENCHMARK)
         -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/validate_google_benchmark_json.cmake"
     )
     add_test(
+      NAME sniffer_core_parquet_performance_benchmark_json_smoke
+      COMMAND
+        "${CMAKE_COMMAND}"
+        "-DBENCHMARK_EXECUTABLE=$<TARGET_FILE:sniffer_core_performance_benchmark>"
+        "-DBENCHMARK_FILTER=^Performance/Parquet/100000/4096/manual_time$"
+        -DEXPECTED_PREFIX=Performance/Parquet/
+        -DEXPECT_MEMORY_COUNTERS=ON
+        -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/validate_google_benchmark_json.cmake"
+    )
+    add_test(
       NAME sniffer_core_compression_benchmark_json_smoke
       COMMAND
         "${CMAKE_COMMAND}"
         "-DBENCHMARK_EXECUTABLE=$<TARGET_FILE:sniffer_core_compression_benchmark>"
         -DEXPECTED_PREFIX=Compression/
+        -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/validate_google_benchmark_json.cmake"
+    )
+    add_test(
+      NAME sniffer_core_parquet_compression_benchmark_json_smoke
+      COMMAND
+        "${CMAKE_COMMAND}"
+        "-DBENCHMARK_EXECUTABLE=$<TARGET_FILE:sniffer_core_compression_benchmark>"
+        "-DBENCHMARK_FILTER=^Compression/high_cardinality_string_Parquet_ZSTD/manual_time$"
+        -DEXPECTED_PREFIX=Compression/high_cardinality_string_Parquet_ZSTD/
         -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/validate_google_benchmark_json.cmake"
     )
     add_test(

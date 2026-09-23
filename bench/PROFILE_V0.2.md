@@ -255,3 +255,26 @@ P50 从 783 us 降至 639 us（-18.4%），吞吐从 1.354 GiB/s 升至 1.656 Gi
 4.7825 ms，端到端从 5.9501 ms 降至 5.7627 ms，吞吐从 16.807 M rows/s 升至 17.353 M rows/s。
 完整场景 wall/CPU CV 为 1.56%/1.64%，writer encoding CPU CV 为 0.77%。Dictionary payload、Segment
 文件、Arrow 分配、剪枝和读取量均不变。
+
+## 13. `dea1076` 后的 sort-key 校验
+
+Dictionary index 批量写入合入后重新采样。排除 benchmark 启动期符号后，项目内主要
+top-of-stack 为：
+
+| 符号 | top-of-stack 样本 |
+|---|---:|
+| `BuildRowGroupIndex` | 369 |
+| `EncodeNonPlain` | 233 |
+| `ArrayValuePairHasher::HashKnownValid` | 205 |
+| `memcmp` | 164 |
+| FOR typed decode | 143 |
+| `BuildStatistics` | 118 |
+| Dictionary string map insertion/lookup | 107 |
+| `ValidateAndUpdateSortOrder` | 104 |
+| CRC32C | 100 |
+
+单列 sort-key 校验此前先扫描 null/NaN，再扫描相邻值，并在第二遍的每一行重新做类型分派。将两项
+检查融合为一次 typed loop 后，固定场景 writer validation P50 从 0.4059 ms 降至 0.3127 ms
+（-23.0%），writer 从 4.7115 ms 降至 4.6200 ms，端到端从 5.6907 ms 降至 5.5972 ms，吞吐从
+17.573 M rows/s 升至 17.866 M rows/s。wall/CPU CV 为 0.62%/0.79%；持久化字节、索引、Arrow
+分配、剪枝和读取量不变。
