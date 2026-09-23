@@ -143,6 +143,9 @@ SIMD、多级编码链和新压缩算法只有在标量路径完成剖析和优�
 - [x] 对所有自适应非 Plain 编码加入实际 payload 不小于 Plain 则回退的保护；显式强制编码
       不受影响，复现采样偏斜时 RLE 膨胀并验证确定性、round-trip 和格式 ID。
 - [ ] 记录编码选择/回退原因供 benchmark 观测，并评估超过“恰好不比 Plain 大”的收益阈值。
+  - [x] 第一小步：writer 可选 metrics 按 chunk 记录直接 Plain、保留非 Plain、实际大小回退、
+        显式强制编码，以及回退时被弃 payload 与 Plain payload 的字节数；压缩 benchmark 输出
+        对应计数。不改变编码策略，CPU/解码成本与更高收益阈值仍待评估。
 - [ ] 单独分析高基数 string/binary 的 64-bit offset 开销。如果引入 32-bit compact offset 或
       CompactPlain，必须分配新 encoding ID，旧 Reader 对未知 ID 明确失败，v0.2 Reader 保持读取
       v0.1 Plain 的能力。
@@ -986,3 +989,14 @@ CV 为 0.46%。Dictionary payload 仍为 113,058 字节，完整 Segment 仍为 
   [`bench/BENCHMARK_V2.md`](../bench/BENCHMARK_V2.md)。
 - 回退前已经完成一次非 Plain 编码，故这一步保障空间上界但未解决无效编码的 CPU
   成本；更完整的编码成本模型仍在 TODO。文件格式版本、编码 ID 和读取兼容性不变。
+
+### 2026-09-23：编码选择与大小回退的诊断计数
+
+- `WriterMetrics` 增加按已写入 ColumnChunk 计数的四类互斥结果：自适应直接 Plain、
+  自适应保留非 Plain、自适应实际大小回退、显式强制编码。大小回退额外累计被弃编码
+  payload 和最终 Plain payload 的字节数。指标只在显式传入 metrics 时记录，不落盘。
+- 压缩 benchmark 为 Sniffer case 输出这些计数。采样偏斜 100,000 行 case 共 25 个
+  Row Group，25 个均因大小回退；被弃 payload 共 1,786,600 字节，替换成 Plain
+  payload 共 800,600 字节。长 RLE case 的 25 个 Row Group 均保留非 Plain，回退为零。
+  两个 case 的文件大小分别仍为 803,694 和 7,166 字节。基准细节见
+  [`bench/BENCHMARK_V2.md`](../bench/BENCHMARK_V2.md)。

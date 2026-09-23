@@ -19,6 +19,14 @@ struct WriterMetrics {
   uint64_t checksum_nanoseconds = 0;
   uint64_t file_write_nanoseconds = 0;
   uint64_t footer_nanoseconds = 0;
+  // Completed ColumnChunks, classified by how their final encoding was chosen.
+  uint64_t adaptive_plain_chunks = 0;
+  uint64_t adaptive_nonplain_chunks = 0;
+  uint64_t adaptive_size_fallback_chunks = 0;
+  uint64_t forced_encoding_chunks = 0;
+  // Payload bytes from the rejected encoding and its Plain replacement.
+  uint64_t adaptive_size_fallback_rejected_bytes = 0;
+  uint64_t adaptive_size_fallback_plain_bytes = 0;
 };
 
 class SegmentWriter {

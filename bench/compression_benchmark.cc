@@ -40,6 +40,7 @@ struct CompressionMeasurement {
   double encode_write_milliseconds = 0;
   double decode_read_milliseconds = 0;
   uint64_t file_bytes = 0;
+  sniffer::WriterMetrics writer_metrics;
 };
 
 template <typename Generator>
@@ -184,8 +185,9 @@ arrow::Result<CompressionMeasurement> MeasureSnifferOnce(const std::filesystem::
   const auto encode_start = std::chrono::steady_clock::now();
   sniffer::LayoutPolicy policy;
   policy.target_row_group_rows = row_group_rows;
-  ARROW_ASSIGN_OR_RAISE(auto writer,
-                        sniffer::SegmentWriter::Open(path.string(), scenario.schema, policy));
+  auto writer_metrics = std::make_shared<sniffer::WriterMetrics>();
+  ARROW_ASSIGN_OR_RAISE(auto writer, sniffer::SegmentWriter::Open(path.string(), scenario.schema,
+                                                                  policy, writer_metrics));
   ARROW_RETURN_NOT_OK(writer->Append(scenario.batch));
   ARROW_RETURN_NOT_OK(writer->Finish());
   const auto encode_end = std::chrono::steady_clock::now();
@@ -198,7 +200,8 @@ arrow::Result<CompressionMeasurement> MeasureSnifferOnce(const std::filesystem::
   ARROW_RETURN_NOT_OK(ValidateBatches(*scenario.batch, batches));
   return CompressionMeasurement{
       std::chrono::duration<double, std::milli>(encode_end - encode_start).count(),
-      std::chrono::duration<double, std::milli>(decode_end - decode_start).count(), file_bytes};
+      std::chrono::duration<double, std::milli>(decode_end - decode_start).count(), file_bytes,
+      *writer_metrics};
 }
 
 arrow::Result<CompressionMeasurement> MeasureParquetOnce(const std::filesystem::path& path,
@@ -227,7 +230,9 @@ arrow::Result<CompressionMeasurement> MeasureParquetOnce(const std::filesystem::
   ARROW_RETURN_NOT_OK(ValidateBatches(*scenario.batch, batches));
   return CompressionMeasurement{
       std::chrono::duration<double, std::milli>(encode_end - encode_start).count(),
-      std::chrono::duration<double, std::milli>(decode_end - decode_start).count(), file_bytes};
+      std::chrono::duration<double, std::milli>(decode_end - decode_start).count(),
+      file_bytes,
+      {}};
 }
 
 std::string_view FormatName(Format format) {
@@ -255,6 +260,7 @@ void RunCompressionBenchmark(benchmark::State& state, const Scenario& scenario, 
   double encode_total = 0;
   double decode_total = 0;
   uint64_t file_bytes = 0;
+  sniffer::WriterMetrics encoding_totals;
   for (auto _ : state) {
     (void)_;
     arrow::Result<CompressionMeasurement> result = arrow::Status::Invalid("unknown format");
@@ -276,6 +282,15 @@ void RunCompressionBenchmark(benchmark::State& state, const Scenario& scenario, 
     file_bytes = result->file_bytes;
     encode_total += result->encode_write_milliseconds;
     decode_total += result->decode_read_milliseconds;
+    encoding_totals.adaptive_plain_chunks += result->writer_metrics.adaptive_plain_chunks;
+    encoding_totals.adaptive_nonplain_chunks += result->writer_metrics.adaptive_nonplain_chunks;
+    encoding_totals.adaptive_size_fallback_chunks +=
+        result->writer_metrics.adaptive_size_fallback_chunks;
+    encoding_totals.forced_encoding_chunks += result->writer_metrics.forced_encoding_chunks;
+    encoding_totals.adaptive_size_fallback_rejected_bytes +=
+        result->writer_metrics.adaptive_size_fallback_rejected_bytes;
+    encoding_totals.adaptive_size_fallback_plain_bytes +=
+        result->writer_metrics.adaptive_size_fallback_plain_bytes;
     state.SetIterationTime((result->encode_write_milliseconds + result->decode_read_milliseconds) /
                            1000.0);
     benchmark::DoNotOptimize(result->file_bytes);
@@ -297,6 +312,20 @@ void RunCompressionBenchmark(benchmark::State& state, const Scenario& scenario, 
       static_cast<double>(file_bytes) / static_cast<double>(logical_size);
   state.counters["bytes_per_value"] =
       static_cast<double>(file_bytes) / static_cast<double>(scenario.batch->num_rows());
+  if (format == Format::kSniffer) {
+    state.counters["adaptive_plain_chunks"] =
+        static_cast<double>(encoding_totals.adaptive_plain_chunks) / iterations;
+    state.counters["adaptive_nonplain_chunks"] =
+        static_cast<double>(encoding_totals.adaptive_nonplain_chunks) / iterations;
+    state.counters["adaptive_size_fallback_chunks"] =
+        static_cast<double>(encoding_totals.adaptive_size_fallback_chunks) / iterations;
+    state.counters["forced_encoding_chunks"] =
+        static_cast<double>(encoding_totals.forced_encoding_chunks) / iterations;
+    state.counters["adaptive_size_fallback_rejected_bytes"] =
+        static_cast<double>(encoding_totals.adaptive_size_fallback_rejected_bytes) / iterations;
+    state.counters["adaptive_size_fallback_plain_bytes"] =
+        static_cast<double>(encoding_totals.adaptive_size_fallback_plain_bytes) / iterations;
+  }
   state.SetBytesProcessed(state.iterations() * logical_size);
   state.SetItemsProcessed(state.iterations() * scenario.batch->num_rows());
 }

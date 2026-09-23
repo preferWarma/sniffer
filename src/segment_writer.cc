@@ -346,6 +346,14 @@ class SegmentWriter::Impl {
       }
       std::vector<uint8_t> payload;
       uint64_t uncompressed_length = 0;
+      uint64_t rejected_payload_bytes = 0;
+      bool size_fallback = false;
+      const bool forced_encoding =
+          (encoding_id != internal::kPlainEncodingId || metrics_ != nullptr) &&
+          std::any_of(layout_policy_.field_encodings.begin(), layout_policy_.field_encodings.end(),
+                      [&field](const FieldEncoding& candidate) {
+                        return candidate.field_id == field.field_id;
+                      });
       {
         internal::NanosecondTimer timer(metrics_ ? &metrics_->encoding_nanoseconds : nullptr);
         if (encoding_id == internal::kPlainEncodingId) {
@@ -362,12 +370,9 @@ class SegmentWriter::Impl {
           }
           ARROW_ASSIGN_OR_RAISE(payload,
                                 internal::EncodeNonPlain(encoding_id, field, *array, statistics));
-          const bool forced_encoding = std::any_of(layout_policy_.field_encodings.begin(),
-                                                   layout_policy_.field_encodings.end(),
-                                                   [&field](const FieldEncoding& candidate) {
-                                                     return candidate.field_id == field.field_id;
-                                                   });
           if (!forced_encoding && static_cast<uint64_t>(payload.size()) >= uncompressed_length) {
+            size_fallback = true;
+            rejected_payload_bytes = static_cast<uint64_t>(payload.size());
             ARROW_ASSIGN_OR_RAISE(payload, internal::EncodePlain(field, *array));
             encoding_id = internal::kPlainEncodingId;
             uncompressed_length = static_cast<uint64_t>(payload.size());
@@ -391,6 +396,19 @@ class SegmentWriter::Impl {
       }
       ARROW_RETURN_NOT_OK(WriteTracked(payload));
       row_group.chunks.push_back(chunk);
+      if (metrics_) {
+        if (forced_encoding) {
+          ++metrics_->forced_encoding_chunks;
+        } else if (size_fallback) {
+          ++metrics_->adaptive_size_fallback_chunks;
+          metrics_->adaptive_size_fallback_rejected_bytes += rejected_payload_bytes;
+          metrics_->adaptive_size_fallback_plain_bytes += chunk.length;
+        } else if (encoding_id == internal::kPlainEncodingId) {
+          ++metrics_->adaptive_plain_chunks;
+        } else {
+          ++metrics_->adaptive_nonplain_chunks;
+        }
+      }
     }
     ARROW_ASSIGN_OR_RAISE(auto index_bytes, internal::SerializeIndexBlock(schema_, indexes));
     row_group.index_block.offset = position_;

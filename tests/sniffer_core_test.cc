@@ -1273,9 +1273,11 @@ void WriteSegment(const std::filesystem::path& path, const sniffer::TableSchema&
 
 void WriteSegmentWithPolicy(const std::filesystem::path& path, const sniffer::TableSchema& schema,
                             const std::vector<std::shared_ptr<arrow::RecordBatch>>& batches,
-                            const sniffer::LayoutPolicy& policy) {
+                            const sniffer::LayoutPolicy& policy,
+                            std::shared_ptr<sniffer::WriterMetrics> metrics = nullptr) {
   auto writer =
-      ValueOrThrow(sniffer::SegmentWriter::Open(path.string(), schema, policy), "open writer");
+      ValueOrThrow(sniffer::SegmentWriter::Open(path.string(), schema, policy, std::move(metrics)),
+                   "open writer");
   for (const auto& batch : batches) {
     RequireOk(writer->Append(batch), "append batch");
   }
@@ -2787,8 +2789,12 @@ TEST(SnifferCoreTest, DeterministicEncodingSelector) {
   auto repeated =
       BuildArray<arrow::Int64Builder, int64_t>(std::vector<std::optional<int64_t>>(100, 7));
   TempFile rle_file("selector_rle.seg");
+  auto rle_metrics = std::make_shared<sniffer::WriterMetrics>();
   WriteSegmentWithPolicy(rle_file.path(), integer_schema,
-                         {arrow::RecordBatch::Make(integer_arrow_schema, 100, {repeated})}, {});
+                         {arrow::RecordBatch::Make(integer_arrow_schema, 100, {repeated})}, {},
+                         rle_metrics);
+  EXPECT_EQ(rle_metrics->adaptive_nonplain_chunks, 1U);
+  EXPECT_EQ(rle_metrics->adaptive_size_fallback_chunks, 0U);
   EXPECT_TRUE(FirstChunkEncoding(rle_file.path(), 17) ==
               static_cast<uint16_t>(sniffer::EncodingKind::kRle))
       << "selector chooses RLE for a long run";
@@ -2823,9 +2829,13 @@ TEST(SnifferCoreTest, DeterministicEncodingSelector) {
       << "selector chooses Dictionary for low-cardinality strings";
 
   TempFile plain_file("selector_plain.seg");
+  auto plain_metrics = std::make_shared<sniffer::WriterMetrics>();
   WriteSegmentWithPolicy(
       plain_file.path(), string_schema,
-      {arrow::RecordBatch::Make(string_arrow_schema, 100, {BuildStringArray(unique_strings)})}, {});
+      {arrow::RecordBatch::Make(string_arrow_schema, 100, {BuildStringArray(unique_strings)})}, {},
+      plain_metrics);
+  EXPECT_EQ(plain_metrics->adaptive_plain_chunks, 1U);
+  EXPECT_EQ(plain_metrics->adaptive_nonplain_chunks, 0U);
   EXPECT_TRUE(FirstChunkEncoding(plain_file.path(), 17) ==
               static_cast<uint16_t>(sniffer::EncodingKind::kPlain))
       << "selector retains Plain for high-cardinality strings";
@@ -2850,7 +2860,14 @@ TEST(SnifferCoreTest, AdaptiveEncodingFallsBackWhenSampleMisleads) {
             sniffer::internal::kPlainEncodingId);
 
   TempFile adaptive_file("sample_skew_adaptive.seg");
-  WriteSegmentWithPolicy(adaptive_file.path(), schema, {batch}, layout);
+  auto adaptive_metrics = std::make_shared<sniffer::WriterMetrics>();
+  WriteSegmentWithPolicy(adaptive_file.path(), schema, {batch}, layout, adaptive_metrics);
+  EXPECT_EQ(adaptive_metrics->adaptive_size_fallback_chunks, 1U);
+  EXPECT_EQ(adaptive_metrics->adaptive_plain_chunks, 0U);
+  EXPECT_EQ(adaptive_metrics->adaptive_nonplain_chunks, 0U);
+  EXPECT_EQ(adaptive_metrics->forced_encoding_chunks, 0U);
+  EXPECT_GT(adaptive_metrics->adaptive_size_fallback_rejected_bytes,
+            adaptive_metrics->adaptive_size_fallback_plain_bytes);
   const auto adaptive_bytes = ReadFile(adaptive_file.path());
   const size_t trailer_offset = adaptive_bytes.size() - 40;
   const size_t footer_offset = static_cast<size_t>(ReadU64(adaptive_bytes, trailer_offset + 8));
@@ -2865,6 +2882,7 @@ TEST(SnifferCoreTest, AdaptiveEncodingFallsBackWhenSampleMisleads) {
   const auto plain = ValueOrThrow(sniffer::internal::EncodePlain(schema.fields.front(), *array),
                                   "encode Plain reference");
   EXPECT_EQ(footer.row_groups.front().chunks.front().length, plain.size());
+  EXPECT_EQ(adaptive_metrics->adaptive_size_fallback_plain_bytes, plain.size());
   auto reader = ValueOrThrow(sniffer::SegmentReader::Open(adaptive_file.path().string()),
                              "open sample-skew adaptive file");
   const auto round_trip = ValueOrThrow(reader->ReadAll(), "read sample-skew adaptive file");
@@ -2877,7 +2895,11 @@ TEST(SnifferCoreTest, AdaptiveEncodingFallsBackWhenSampleMisleads) {
 
   layout.field_encodings = {{1, sniffer::EncodingKind::kRle}};
   TempFile forced_file("sample_skew_forced.seg");
-  WriteSegmentWithPolicy(forced_file.path(), schema, {batch}, layout);
+  auto forced_metrics = std::make_shared<sniffer::WriterMetrics>();
+  forced_metrics->adaptive_size_fallback_chunks = 100;
+  WriteSegmentWithPolicy(forced_file.path(), schema, {batch}, layout, forced_metrics);
+  EXPECT_EQ(forced_metrics->forced_encoding_chunks, 1U);
+  EXPECT_EQ(forced_metrics->adaptive_size_fallback_chunks, 0U);
   const auto forced_bytes = ReadFile(forced_file.path());
   const size_t forced_trailer_offset = forced_bytes.size() - 40;
   const size_t forced_footer_offset =
@@ -2890,6 +2912,14 @@ TEST(SnifferCoreTest, AdaptiveEncodingFallsBackWhenSampleMisleads) {
                    "parse forced footer");
   EXPECT_EQ(forced_footer.row_groups.front().chunks.front().encoding_id,
             sniffer::internal::kRleEncodingId);
+
+  layout.field_encodings = {{1, sniffer::EncodingKind::kPlain}};
+  TempFile forced_plain_file("sample_skew_forced_plain.seg");
+  auto forced_plain_metrics = std::make_shared<sniffer::WriterMetrics>();
+  WriteSegmentWithPolicy(forced_plain_file.path(), schema, {batch}, layout, forced_plain_metrics);
+  EXPECT_EQ(forced_plain_metrics->forced_encoding_chunks, 1U);
+  EXPECT_EQ(forced_plain_metrics->adaptive_plain_chunks, 0U);
+  EXPECT_EQ(forced_plain_metrics->adaptive_size_fallback_chunks, 0U);
 }
 
 }  // namespace
