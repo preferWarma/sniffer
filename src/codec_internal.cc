@@ -1048,13 +1048,12 @@ arrow::Result<std::shared_ptr<arrow::Array>> DecodeForBitpack(
 }
 
 arrow::Result<uint64_t> PlainSampleSize(const FieldSpec& field, const arrow::Array& array,
-                                        int64_t sample_rows) {
+                                        int64_t sample_rows, bool has_nulls) {
   if (sample_rows < 0 || sample_rows > array.length()) {
     return InvalidCodec("Plain size sample exceeds array bounds");
   }
   const uint64_t rows = static_cast<uint64_t>(sample_rows);
   uint64_t size = 24;
-  const bool has_nulls = array.Slice(0, sample_rows)->null_count() != 0;
   if (has_nulls) {
     ARROW_ASSIGN_OR_RAISE(size, CheckedAdd(size, rows / 8U + (rows % 8U != 0)));
   }
@@ -1110,7 +1109,7 @@ bool EncodingSupports(uint16_t encoding_id, const arrow::DataType& type) {
 }
 
 arrow::Result<uint64_t> PlainEncodedSize(const FieldSpec& field, const arrow::Array& array) {
-  return PlainSampleSize(field, array, array.length());
+  return PlainSampleSize(field, array, array.length(), array.null_count() != 0);
 }
 
 arrow::Result<uint16_t> SelectEncoding(const FieldSpec& field, const arrow::Array& array,
@@ -1126,7 +1125,16 @@ arrow::Result<uint16_t> SelectEncoding(const FieldSpec& field, const arrow::Arra
   if (sample_rows == 0) {
     return kPlainEncodingId;
   }
-  ARROW_ASSIGN_OR_RAISE(const uint64_t plain_size, PlainSampleSize(field, array, sample_rows));
+  // Share the sample's null decision with Plain sizing and candidate estimates.
+  // Count bitmap bits at the array offset without materializing an Arrow slice.
+  const bool sample_has_nulls =
+      array.null_bitmap_data() != nullptr &&
+      (sample_rows == array.length()
+           ? array.null_count() != 0
+           : arrow::internal::CountSetBits(array.null_bitmap_data(), array.offset(), sample_rows) !=
+                 sample_rows);
+  ARROW_ASSIGN_OR_RAISE(const uint64_t plain_size,
+                        PlainSampleSize(field, array, sample_rows, sample_has_nulls));
   const uint64_t threshold = plain_size - plain_size / 10U;
   uint16_t best_id = kPlainEncodingId;
   uint64_t best_size = plain_size;
@@ -1223,10 +1231,10 @@ arrow::Result<uint16_t> SelectEncoding(const FieldSpec& field, const arrow::Arra
     }
     dictionary_count = static_cast<uint64_t>(distinct.size());
   }
-  const uint64_t validity_size = array.Slice(0, sample_rows)->null_count() == 0
-                                     ? 0
-                                     : static_cast<uint64_t>(sample_rows) / 8U +
-                                           (static_cast<uint64_t>(sample_rows) % 8U != 0);
+  const uint64_t validity_size =
+      sample_has_nulls
+          ? static_cast<uint64_t>(sample_rows) / 8U + (static_cast<uint64_t>(sample_rows) % 8U != 0)
+          : 0;
   if (supports_dictionary) {
     uint64_t dictionary_size = 48U + validity_size + dictionary_values_size +
                                static_cast<uint64_t>(sample_rows) * IndexWidth(dictionary_count);

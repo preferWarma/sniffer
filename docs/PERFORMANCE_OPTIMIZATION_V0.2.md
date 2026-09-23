@@ -81,6 +81,9 @@ SIMD、多级编码链和新压缩算法只有在标量路径完成剖析和优�
         为一次遍历；跨 batch 边界检查和结构化错误保持不变。
   - [x] 第四小步：全非空 string/binary 的 Plain 大小估算直接使用 Arrow 首尾 offset，移除逐行
         `value_length()` 求和；含 null 列保留逐行安全路径。
+  - [x] 第五小步：选择器对采样区间仅计算一次 null bitmap 状态，Plain 样本大小与候选编码
+        复用；有 bitmap 时直接按 Arrow bit offset 计数，不再创建临时 slice。覆盖切片、样本
+        内外 null 的等价测试，文件字节不变。
 - [x] Bloom 构建按列绑定数组类型和 physical type，逐行双哈希不再重复做类型一致性检查与
       `PhysicalTypeFor()`；安全入口和绑定入口的哈希结果逐值一致。
 - [x] Bloom 构建按列确定是否可能含 NaN；非浮点列跳过逐行类型检查，float/double 仍按原规则
@@ -1000,3 +1003,15 @@ CV 为 0.46%。Dictionary payload 仍为 113,058 字节，完整 Segment 仍为 
   payload 共 800,600 字节。长 RLE case 的 25 个 Row Group 均保留非 Plain，回退为零。
   两个 case 的文件大小分别仍为 803,694 和 7,166 字节。基准细节见
   [`bench/BENCHMARK_V2.md`](../bench/BENCHMARK_V2.md)。
+
+### 2026-09-23：选择器采样 null 统计去重
+
+- `SelectEncoding()` 原先为 Plain 样本大小与候选估算分别创建 Arrow slice 并统计 null；
+  改为一次按 bitmap offset 计数，或在全长样本复用 `array.null_count()`。空 bitmap
+  直接判定无 null，含 null 的切片与独立构造的同值数组作选择器等价测试。
+- Apple M4 / Release / 单线程、100,000 行、Row Group 4,096，11 次重复、
+  `--benchmark_min_time=0.03s`：标准性能场景 writer 编码选择 P50 由 1.028 ms
+  到 0.998 ms，写入 P50 由 4.283 ms 到 4.233 ms；两组 CV 分别为 1.62%/1.46%
+  与 1.31%/1.25%。低基数字符串压缩写入 P50 由 1.402 ms 到 1.377 ms；
+  高基数字符串写入波动较大，不能据此断言提速。三个场景的文件字节完全不变。
+  性能增益很小，仍需在固定硬件负载下交错重测后才可宣称稳定提速。

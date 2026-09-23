@@ -989,6 +989,36 @@ TEST(SnifferCoreTest, PlainVariableBulkCopyMatchesReference) {
   }
 }
 
+TEST(SnifferCoreTest, EncodingSampleNullsMatchDetachedSlices) {
+  const std::vector<std::optional<int64_t>> values = {999,          7, 7, 7, 7, std::nullopt, 8, 8,
+                                                      std::nullopt, 9};
+  const auto array = BuildArray<arrow::Int64Builder, int64_t>(values);
+  const sniffer::FieldSpec field{1, "value", arrow::int64(), true, nullptr};
+  sniffer::LayoutPolicy layout;
+  layout.encoding_sample_rows = 4;
+  for (int64_t start = 0; start < array->length(); ++start) {
+    for (int64_t length = 1; length <= array->length() - start; ++length) {
+      const auto slice = array->Slice(start, length);
+      const std::vector<std::optional<int64_t>> detached_values(values.begin() + start,
+                                                                values.begin() + start + length);
+      const auto detached = BuildArray<arrow::Int64Builder, int64_t>(detached_values);
+      const auto size = ValueOrThrow(sniffer::internal::PlainEncodedSize(field, *slice),
+                                     "size nullable integer slice");
+      const auto payload =
+          ValueOrThrow(sniffer::internal::EncodePlain(field, *slice), "encode nullable slice");
+      EXPECT_EQ(size, payload.size()) << "Plain size matches encoded slice";
+      EXPECT_EQ(ValueOrThrow(sniffer::internal::SelectEncoding(field, *slice, layout),
+                             "select encoding for nullable slice"),
+                ValueOrThrow(sniffer::internal::SelectEncoding(field, *detached, layout),
+                             "select encoding for detached values"))
+          << "sample statistics ignore nulls outside the logical slice";
+    }
+  }
+  EXPECT_EQ(ValueOrThrow(sniffer::internal::SelectEncoding(field, *array->Slice(1, 8), layout),
+                         "select encoding for all-valid sample with later null"),
+            sniffer::internal::kRleEncodingId);
+}
+
 TEST(SnifferCoreTest, PlainSelectedTypedDecodeMatchesReference) {
   const auto data = MakeAllTypesBatch();
   const std::vector<uint64_t> selection = {0, 2, 4};
