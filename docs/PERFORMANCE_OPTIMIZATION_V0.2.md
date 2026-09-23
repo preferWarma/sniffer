@@ -15,8 +15,8 @@ v0.2 聚焦现有 Segment writer、reader、codec、scan 和文件 I/O 路径的
 `sniffer-core` 的业务边界。优化必须保持 Arrow 语义、确定性输出、边界检查、checksum、结构化
 错误以及 v0.1 文件的可读性。
 
-本专项不默认引入 RocksDB、对象存储、SQL、RPC、事务、后台线程池或完整 nested type。SIMD、
-多级编码链和新压缩算法只有在标量路径完成剖析和优化后才进入实现；任何新 encoding 都必须有
+本专项不默认引入 RocksDB、对象存储、SQL、RPC、事务、默认启用的后台线程池或完整 nested type。
+SIMD、多级编码链和新压缩算法只有在标量路径完成剖析和优化后才进入实现；任何新 encoding 都必须有
 显式 ID、兼容策略、decision record 和未知编码失败测试。
 
 ## 2. v0.1 基线与 v0.2 目标
@@ -78,6 +78,8 @@ v0.2 聚焦现有 Segment writer、reader、codec、scan 和文件 I/O 路径的
         selector sample 摘要；排序键 endpoint 快速路径和无 statistics 字段不额外扫描。
   - [x] 第三小步：单列 sort-key 校验按 Arrow type 绑定循环，将 null/NaN 检查与局部有序检查融合
         为一次遍历；跨 batch 边界检查和结构化错误保持不变。
+  - [x] 第四小步：全非空 string/binary 的 Plain 大小估算直接使用 Arrow 首尾 offset，移除逐行
+        `value_length()` 求和；含 null 列保留逐行安全路径。
 - [x] Bloom 构建按列绑定数组类型和 physical type，逐行双哈希不再重复做类型一致性检查与
       `PhysicalTypeFor()`；安全入口和绑定入口的哈希结果逐值一致。
 - [x] 为整数、timestamp、bool、string/binary 增加 typed encoder 路径，避免逐值构造
@@ -141,14 +143,42 @@ v0.2 聚焦现有 Segment writer、reader、codec、scan 和文件 I/O 路径的
 - [ ] 新 encoding 必须补齐随机、极值、null、截断、错误 offset、checksum 和 selection decode
       测试，并更新 format decision record。
 
-## 8. P3：可选向量化与并行
+## 8. P2：并发能力；P3：可选向量化
+
+**执行顺序：** 先完成单线程优化及其基准，再启动本节的并发工作；列入 v0.2 TODO 不代表当前开始实现。
+
+当前公开 API 未定义线程安全契约，benchmark 也仅覆盖单线程。Reader 内部文件句柄的互斥锁
+只保护 seek/read 操作，不能单独作为“支持并发”的验收依据。并发读与内部并行执行是不同能力，
+均列入 v0.2 工作范围；默认单线程行为和无后台线程的嵌入方式必须保留。
+
+### 8.1 并发访问契约与并发读取（P2）
+
+- [ ] 明确并测试对象级线程安全边界：多个 Reader 读同一不可变 Segment、同一 Reader 创建的多个
+      独立 Scan iterator 并发读取应正确；同一 iterator 的并发 `Next()`、同一 Writer 的并发
+      `Append()`/`Finish()` 若不支持，应在 API 文档中明确禁止，不能含糊承诺。
+- [ ] 审核共享文件句柄、footer/index、Arrow 内存池及可选 metrics 的所有权和同步。避免把所有
+      并发 scan 串行化在一个 seek/read 互斥锁上；评估每 scan 独立句柄或有界 `pread` 路径，
+      同时保留 offset 检查、checksum、索引剪枝与“只读候选列块”契约。
+- [ ] 补多线程正确性与压力测试：不同 IOPlan、projection、limit、空结果和损坏文件同时扫描；
+      与单线程结果逐字段比较，并在可用平台运行 ThreadSanitizer。明确 Reader/iterator 销毁、
+      错误传播与取消时的生命周期语义。
+
+### 8.2 受控的内部并行（P2）
+
+- [ ] 评估跨 ColumnChunk/Row Group 的可选并行编码：并行任务只生成独立结果，最终按原始列和
+      Row Group 顺序写入；同一输入及配置的 Segment 字节、checksum 和索引必须与单线程一致。
+- [ ] 评估候选 Row Group 的可选并行读取、解码与过滤；输出行序、`limit` 早停、谓词列/投影列
+      分离解码和剪枝结果必须与单线程一致，不得为未命中列块发起额外读取。
+- [ ] 线程数、任务粒度、在途 Row Group 数和内存预算由显式配置限制；提供单线程 fallback、
+      错误/取消传播，不创建无上限异步任务。若需要新公共配置，先确定向后兼容的 API 语义。
+- [ ] 增加 1/2/4/8 线程吞吐、单请求延迟、峰值 RSS 和分配量 benchmark；并发多查询与单查询
+      内部并行分别报告，在相同硬件、数据、Row Group、选择率与线程预算下对照 Parquet。
+
+### 8.3 可选向量化（P3）
 
 - [ ] 在标量 typed kernel 稳定后，为 bit unpack、predicate 和 bitmap 操作评估 NEON/AVX2；提供
       编译期/运行时能力检测和完全等价的标量 fallback。
 - [ ] SIMD 实现不得使用不安全 reinterpret-cast 解析外部输入；先验证 buffer 边界和规范性。
-- [ ] 评估跨 ColumnChunk/Row Group 的可选并行编码与解码。公共 API 默认语义、输出顺序和文件
-      确定性必须保持不变，单线程仍是基准和 fallback。
-- [ ] 线程数、任务粒度和内存预算必须由显式配置控制，不使用无上限异步任务。
 
 ## 9. 推荐实施顺序
 
@@ -158,7 +188,9 @@ v0.2 聚焦现有 Segment writer、reader、codec、scan 和文件 I/O 路径的
 4. 复用 reader 文件句柄并优化 chunk 读取，再测 warm/cold cache。
 5. 优化 typed predicate、selection 和 batch 拼接，再跑完整 IOPlan 矩阵。
 6. 修正编码 cost model 和高基数字符串空间开销。
-7. 只有标量路径仍是 CPU 热点时才实现 SIMD；只有单线程吞吐达标后才评估并行。
+7. 只有标量路径仍是 CPU 热点时才评估 SIMD。
+8. 最后建立并发访问契约和多查询并发读基线；内部并行编码/扫描按 CPU profile 与内存预算逐步
+   实现，不提前打断单线程专项。
 
 每个性能提交必须只处理一个可归因热点，并附同机 before/after 原始指标。若性能提升伴随空间、
 内存或复杂度回退，提交说明和 v0.2 benchmark 报告必须显式列出取舍。
@@ -168,6 +200,8 @@ v0.2 聚焦现有 Segment writer、reader、codec、scan 和文件 I/O 路径的
 - [ ] 第 2 节正确性和非回归门槛全部满足；
 - [x] 至少达到第 2 节中的 writer、scan、encode、decode 四个吞吐目标；
 - [ ] benchmark 矩阵覆盖第 3 节规定的 Row Group、选择率、投影和缓存维度；
+- [ ] 第 8 节的并发读取契约、多线程正确性/竞态测试和 1/2/4/8 线程基准完成；内部并行路径
+      如因实测收益不足而未启用，需记录数据、取舍和单线程 fallback；
 - [ ] 所有性能结论都有 profiler 证据和至少 7 次重复测量；
 - [ ] 生成 `bench/BENCHMARK_V2.md`，同时记录绝对值、相对 v1 的变化、压缩比、峰值内存和原始
       运行参数；
@@ -880,3 +914,18 @@ CV 为 0.46%。Dictionary payload 仍为 113,058 字节，完整 Segment 仍为 
   剪枝均为 12/25 Row Group，Sniffer、Parquet、Parquet + ZSTD 端到端 P50 分别为 5.431、
   8.528、11.459 ms，文件分别为 663,679、1,955,982、514,667 字节。完整矩阵、宽表、cold-cache
   和相对 v1 的同口径回归仍待补齐，故本专项完成定义暂不勾选。
+
+### 2026-09-23：全非空变长列的 Plain 大小估算
+
+- Dictionary 等非 Plain 编码需要记录等价 Plain 长度。全非空 string/binary 的长度可由已校验的
+  Arrow offset 直接算出；新路径对 slice 和截短 sample 仍适用。含 null 列继续逐行累计有效值长度，
+  保持 null 槽中潜在数据不计入文件大小的语义。未更改编码 ID、payload 或 checksum。
+- 对所有起点和长度的 sliced string、nullable binary 比较 `PlainEncodedSize()` 与实际 Plain
+  payload 大小；完整 round-trip、fuzz smoke 以及 Release/Debug/ASan+UBSan 各 55 项测试通过。
+- 同机 Release、100,000 行、Row Group 4,096、低基数字符串压缩专项：改动前 7 次 P50
+  写入 1.533 ms、端到端 2.930 ms（写入 CV 1.92%）；改动后 11 次 P50 写入 1.379 ms、
+  端到端 2.847 ms（写入 CV 1.37%）。这是该场景的一轮短时测量，不能外推到其他分布。
+  文件保持 117,044 字节。固定性能场景复测仍为 663,679 字节、12/25 Row Group 剪枝、
+  26 个 ColumnChunk 和 172,228 个读取字节。
+- CTest 中 benchmark smoke 使用同名临时文件；为避免并行运行相互覆盖，将这些 smoke case
+  加入同一资源锁，不改变库或正式 benchmark 的行为。

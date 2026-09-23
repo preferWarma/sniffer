@@ -254,6 +254,19 @@ if(SNIFFER_BUILD_BENCHMARK)
         -DEXPECTED_PREFIX=Codec/
         -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/validate_google_benchmark_json.cmake"
     )
+    # Benchmark smoke cases share fixed temporary paths and measure process CPU.
+    # Serialize them so parallel CTest runs neither race nor perturb measurements.
+    set_tests_properties(
+      sniffer_core_performance_benchmark_smoke
+      sniffer_core_compression_benchmark_smoke
+      sniffer_core_codec_benchmark_smoke
+      sniffer_core_performance_benchmark_json_smoke
+      sniffer_core_parquet_performance_benchmark_json_smoke
+      sniffer_core_compression_benchmark_json_smoke
+      sniffer_core_parquet_compression_benchmark_json_smoke
+      sniffer_core_codec_benchmark_json_smoke
+      PROPERTIES RESOURCE_LOCK sniffer_benchmark
+    )
   endif()
 endif()
 

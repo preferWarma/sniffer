@@ -900,6 +900,16 @@ TEST(SnifferCoreTest, PlainVariableBulkCopyMatchesReference) {
   const auto actual = ValueOrThrow(sniffer::internal::EncodePlain(string_field, *sliced),
                                    "bulk sliced Plain string");
   EXPECT_TRUE(actual == expected) << "bulk Plain string bytes match row-wise reference";
+  for (int64_t start = 0; start <= strings->length(); ++start) {
+    for (int64_t length = 0; length <= strings->length() - start; ++length) {
+      const auto slice = strings->Slice(start, length);
+      const auto payload = ValueOrThrow(sniffer::internal::EncodePlain(string_field, *slice),
+                                        "encode sliced Plain string");
+      EXPECT_EQ(ValueOrThrow(sniffer::internal::PlainEncodedSize(string_field, *slice),
+                             "measure sliced Plain string"),
+                payload.size());
+    }
+  }
 
   const auto binary = BuildBinaryArray(
       {std::vector<uint8_t>{0, 1}, std::nullopt,
@@ -913,6 +923,16 @@ TEST(SnifferCoreTest, PlainVariableBulkCopyMatchesReference) {
       sniffer::internal::EncodePlain(binary_field, *binary_slice), "nullable sliced Plain binary");
   EXPECT_TRUE(nullable_actual == nullable_expected)
       << "nullable sliced Plain binary bytes match row-wise reference";
+  for (int64_t start = 0; start <= binary->length(); ++start) {
+    for (int64_t length = 0; length <= binary->length() - start; ++length) {
+      const auto slice = binary->Slice(start, length);
+      const auto payload = ValueOrThrow(sniffer::internal::EncodePlain(binary_field, *slice),
+                                        "encode sliced Plain binary");
+      EXPECT_EQ(ValueOrThrow(sniffer::internal::PlainEncodedSize(binary_field, *slice),
+                             "measure sliced Plain binary"),
+                payload.size());
+    }
+  }
 }
 
 TEST(SnifferCoreTest, PlainSelectedTypedDecodeMatchesReference) {

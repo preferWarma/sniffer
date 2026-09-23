@@ -1054,7 +1054,8 @@ arrow::Result<uint64_t> PlainSampleSize(const FieldSpec& field, const arrow::Arr
   }
   const uint64_t rows = static_cast<uint64_t>(sample_rows);
   uint64_t size = 24;
-  if (array.Slice(0, sample_rows)->null_count() != 0) {
+  const bool has_nulls = array.Slice(0, sample_rows)->null_count() != 0;
+  if (has_nulls) {
     ARROW_ASSIGN_OR_RAISE(size, CheckedAdd(size, rows / 8U + (rows % 8U != 0)));
   }
   if (IsVariable(field.type->id())) {
@@ -1062,10 +1063,22 @@ arrow::Result<uint64_t> PlainSampleSize(const FieldSpec& field, const arrow::Arr
     ARROW_ASSIGN_OR_RAISE(const uint64_t offset_bytes, CheckedMultiply(offset_count, uint64_t{8}));
     ARROW_ASSIGN_OR_RAISE(size, CheckedAdd(size, offset_bytes));
     const auto& binary = static_cast<const arrow::BinaryArray&>(array);
-    for (int64_t row = 0; row < sample_rows; ++row) {
-      if (binary.IsValid(row)) {
-        ARROW_ASSIGN_OR_RAISE(size,
-                              CheckedAdd(size, static_cast<uint64_t>(binary.value_length(row))));
+    if (!has_nulls) {
+      // Validated Arrow offsets are cumulative, so the value span is enough
+      // even when the array or the sample is a slice.
+      const int64_t first_offset = binary.value_offset(0);
+      const int64_t last_offset = binary.value_offset(sample_rows);
+      if (first_offset < 0 || last_offset < first_offset) {
+        return InvalidCodec("invalid Arrow binary offsets");
+      }
+      ARROW_ASSIGN_OR_RAISE(size,
+                            CheckedAdd(size, static_cast<uint64_t>(last_offset - first_offset)));
+    } else {
+      for (int64_t row = 0; row < sample_rows; ++row) {
+        if (binary.IsValid(row)) {
+          ARROW_ASSIGN_OR_RAISE(size,
+                                CheckedAdd(size, static_cast<uint64_t>(binary.value_length(row))));
+        }
       }
     }
   } else {
