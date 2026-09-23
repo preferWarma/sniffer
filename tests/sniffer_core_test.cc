@@ -1860,6 +1860,55 @@ TEST(SnifferCoreTest, NoPredicateFullScanRespectsLimitAndChunkReads) {
   }
 }
 
+TEST(SnifferCoreTest, WideTableProjectionSkipsUnneededColumnChunks) {
+  std::vector<sniffer::FieldSpec> fields;
+  std::vector<std::shared_ptr<arrow::Array>> columns;
+  fields.reserve(16);
+  columns.reserve(16);
+  for (uint32_t column = 0; column < 16; ++column) {
+    fields.push_back(
+        {column + 1U, "field_" + std::to_string(column), arrow::int64(), false, nullptr});
+    arrow::Int64Builder builder;
+    for (int64_t row = 0; row < 40; ++row) {
+      RequireOk(builder.Append(row * 16 + column), "append wide table value");
+    }
+    std::shared_ptr<arrow::Array> array;
+    RequireOk(builder.Finish(&array), "finish wide table column");
+    columns.push_back(std::move(array));
+  }
+  const sniffer::TableSchema schema{1, std::move(fields)};
+  const auto arrow_schema = ValueOrThrow(schema.ToArrowSchema(), "wide table schema");
+  const auto batch = arrow::RecordBatch::Make(arrow_schema, 40, std::move(columns));
+  sniffer::LayoutPolicy layout;
+  layout.target_row_group_rows = 7;
+  layout.statistics_field_ids = {1};
+  layout.sort_key_field_ids = {1};
+  TempFile file("wide_projection.seg");
+  WriteSegmentWithPolicy(file.path(), schema, {batch}, layout);
+  auto reader = ValueOrThrow(sniffer::SegmentReader::Open(file.path().string()), "open wide table");
+
+  sniffer::IOPlan plan;
+  plan.projection_field_ids = {16, 1};
+  plan.conjunctive_predicates = {
+      {1, sniffer::Predicate::Op::kGe, std::make_shared<arrow::Int64Scalar>(20 * 16)}};
+  plan.output_batch_rows = 5;
+  auto metrics = std::make_shared<sniffer::ScanMetrics>();
+  const auto batches = CollectScan(ValueOrThrow(reader->Scan(plan, metrics), "scan wide table"));
+  const auto first = CollectInt64Column(batches, 0);
+  const auto second = CollectInt64Column(batches, 1);
+  ASSERT_EQ(first.size(), 20U);
+  ASSERT_EQ(second.size(), 20U);
+  for (int64_t row = 20; row < 40; ++row) {
+    const size_t index = static_cast<size_t>(row - 20);
+    EXPECT_EQ(first[index], row * 16 + 15);
+    EXPECT_EQ(second[index], row * 16);
+  }
+  EXPECT_EQ(metrics->row_groups_pruned, 2U);
+  EXPECT_EQ(metrics->predicate_chunks_decoded, 4U);
+  EXPECT_EQ(metrics->projection_chunks_decoded, 4U);
+  EXPECT_EQ(metrics->column_chunks_read, 8U);
+}
+
 TEST(SnifferCoreTest, PredicateExecutionOrderIsDeterministic) {
   const auto data = MakeScanBatch();
   TempFile file("scan_resolved_plan.seg");

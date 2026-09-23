@@ -105,3 +105,27 @@ Parquet/Parquet + ZSTD full-scan scan P50 分别为 1.629/2.534 ms；改动后�
 同日 Bloom 构建外提非浮点列的 NaN 类型检查。固定 50% 选择率场景的 Sniffer writer index
 P50 从 1.210 ms 降至 1.156 ms（各 11 次）；完整端到端两轮结果方向不一致，暂不宣称
 全路径提速。持久化字节、剪枝和读取量保持不变。
+
+## 16 列宽表：首轮 warm-cache 对照
+
+源码 `984e9cb-dirty`，Apple M4 / Release / 单线程，100,000 行，Row Group 4,096。
+输入为 `id/group/value` 加 13 列按行号线性生成的非空 int64；谓词 `id >= 50000`，
+投影 `id,value`。此场景只覆盖窄投影，不代表宽投影或大于页缓存的读取。
+`--benchmark_repetitions=11 --benchmark_min_time=0.05s`，下表为 P50：
+
+| 格式 | 写入 ms | 扫描 ms | 端到端 ms | 文件字节 | 剪枝 Row Group | 候选列块 |
+|---|---:|---:|---:|---:|---:|---:|
+| Sniffer | 22.297 | 1.305 | 23.599 | 3,104,713 | 12/25 | 26 |
+| Parquet | 40.439 | 1.852 | 42.256 | 14,374,323 | 12/25 | 26 |
+| Parquet + ZSTD | 59.152 | 2.405 | 61.443 | 3,869,950 | 12/25 | 26 |
+
+三个端到端 wall-time CV 分别为 0.95%、0.96%、1.21%。Sniffer 实际读取 172,228 字节；
+Parquet 未报告可比的物理读取字节。进程 RSS 为高水位而非 case 独立峰值，Arrow 分配统计也
+受各格式内部实现影响，不能直接当作相同内存成本比较。复现：
+
+```sh
+./build-release/sniffer_core_performance_benchmark \
+  '--benchmark_filter=^PerformanceWide/(Sniffer|Parquet|Parquet_ZSTD)/manual_time$' \
+  --benchmark_repetitions=11 --benchmark_min_time=0.05s \
+  --benchmark_report_aggregates_only=true --benchmark_format=json
+```

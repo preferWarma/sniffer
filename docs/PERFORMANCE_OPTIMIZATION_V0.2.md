@@ -60,7 +60,8 @@ SIMD、多级编码链和新压缩算法只有在标量路径完成剖析和优�
       热点，再修改实现。
 - [x] 增加峰值 RSS、Arrow memory pool 峰值和每输入行分配次数指标。
 - [x] 扩展固定矩阵：Row Group 1K/8K/64K/256K，选择率 1%/10%/50%/100%，单列/多列/全列投影。
-- [ ] 增加至少一个宽表和一个超过页缓存容量的数据集；分别报告 warm-cache 与 cold-cache 结果。
+- [x] 增加 16 列宽表的 Sniffer/Parquet 对照，报告 warm-cache 写入、扫描、文件大小和内存指标。
+- [ ] 增加超过页缓存容量的数据集，并分别报告 warm-cache 与 cold-cache 结果。
 
 ## 4. P0：消除已知重复工作和逐值对象开销
 
@@ -957,3 +958,15 @@ CV 为 0.46%。Dictionary payload 仍为 113,058 字节，完整 Segment 仍为 
   完整端到端结果从 5.199 ms 到第一轮 5.239 ms、第二轮 5.171 ms，变化尚不足以断言
   全路径提速。文件仍为 663,679 字节，12/25 Row Group 剪枝、26 个 ColumnChunk 和
   172,228 个读取字节不变。
+
+### 2026-09-23：16 列宽表基准
+
+- 性能 benchmark 增加 16 列、100,000 行、Row Group 4,096 的宽表：原 `id/group/value`
+  加 13 列确定性非空 int64；每列按行号线性生成。查询仍为 `id >= 50000`，投影 `id,value`，
+  因而主要衡量宽表写入、文件体积和窄投影扫描，不代表宽投影或真实列间分布。
+- Sniffer、未压缩 Parquet、Parquet + ZSTD 统一使用 25 个 Row Group；均输出 50,000 行，
+  剪枝 12/25 个 Row Group，候选读取列块数为 26。新增 JSON smoke 校验 16 输入列。
+- Apple M4、Release、单线程、warm-cache，11 次 P50：Sniffer 写入/扫描 22.297/1.305 ms，
+  3,104,713 字节；Parquet 为 40.439/1.852 ms，14,374,323 字节；Parquet + ZSTD 为
+  59.152/2.405 ms，3,869,950 字节。Sniffer 写入 CV 为 1.00%，Parquet + ZSTD 扫描
+  CV 为 6.69%。超页缓存及 cold-cache 项仍未完成，不能以此判断生产环境表现。

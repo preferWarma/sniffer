@@ -43,6 +43,12 @@ foreach(index RANGE 0 ${benchmark_last})
     if(real_time LESS 0 OR time_unit STREQUAL "")
       message(FATAL_ERROR "Google Benchmark JSON contains an invalid timing result")
     endif()
+    if(DEFINED EXPECTED_INPUT_COLUMNS)
+      string(JSON input_columns GET "${benchmark_output}" benchmarks ${index} input_columns)
+      if(NOT input_columns EQUAL EXPECTED_INPUT_COLUMNS)
+        message(FATAL_ERROR "Google Benchmark JSON has unexpected input column count")
+      endif()
+    endif()
     if(EXPECT_MEMORY_COUNTERS)
       foreach(
         counter

@@ -41,6 +41,7 @@ struct BenchmarkConfig {
   uint32_t row_group_rows;
   uint32_t selectivity_percent = 50;
   uint32_t projection_columns = 2;
+  uint32_t extra_columns = 0;
 };
 
 struct Measurement {
@@ -103,10 +104,16 @@ void RecordMemory(const MemorySnapshot& before, const MemorySnapshot& after,
   measurement->process_peak_rss_bytes = after.process_peak_rss_bytes;
 }
 
-arrow::Result<std::shared_ptr<arrow::RecordBatch>> MakeBenchmarkBatch(int64_t rows) {
-  auto schema = arrow::schema({arrow::field("id", arrow::int64(), false),
-                               arrow::field("group", arrow::utf8(), false),
-                               arrow::field("value", arrow::int64(), true)});
+arrow::Result<std::shared_ptr<arrow::RecordBatch>> MakeBenchmarkBatch(int64_t rows,
+                                                                      uint32_t extra_columns) {
+  std::vector<std::shared_ptr<arrow::Field>> fields = {arrow::field("id", arrow::int64(), false),
+                                                       arrow::field("group", arrow::utf8(), false),
+                                                       arrow::field("value", arrow::int64(), true)};
+  fields.reserve(3U + extra_columns);
+  for (uint32_t column = 0; column < extra_columns; ++column) {
+    fields.push_back(arrow::field("extra_" + std::to_string(column), arrow::int64(), false));
+  }
+  auto schema = arrow::schema(std::move(fields));
   arrow::Int64Builder id_builder;
   arrow::StringBuilder group_builder;
   arrow::Int64Builder value_builder;
@@ -122,10 +129,18 @@ arrow::Result<std::shared_ptr<arrow::RecordBatch>> MakeBenchmarkBatch(int64_t ro
       ARROW_RETURN_NOT_OK(value_builder.Append(row * 3));
     }
   }
-  std::vector<std::shared_ptr<arrow::Array>> columns(3);
+  std::vector<std::shared_ptr<arrow::Array>> columns(3U + extra_columns);
   ARROW_RETURN_NOT_OK(id_builder.Finish(&columns[0]));
   ARROW_RETURN_NOT_OK(group_builder.Finish(&columns[1]));
   ARROW_RETURN_NOT_OK(value_builder.Finish(&columns[2]));
+  for (uint32_t column = 0; column < extra_columns; ++column) {
+    arrow::Int64Builder builder;
+    ARROW_RETURN_NOT_OK(builder.Reserve(rows));
+    for (int64_t row = 0; row < rows; ++row) {
+      ARROW_RETURN_NOT_OK(builder.Append(row * static_cast<int64_t>(column + 1U) + column));
+    }
+    ARROW_RETURN_NOT_OK(builder.Finish(&columns[3U + column]));
+  }
   auto batch = arrow::RecordBatch::Make(std::move(schema), rows, std::move(columns));
   ARROW_RETURN_NOT_OK(batch->ValidateFull());
   return batch;
@@ -372,16 +387,21 @@ void SetAverage(benchmark::State& state, std::string_view name, double total) {
 
 void RunPerformance(benchmark::State& state, Format format, Query query,
                     const BenchmarkConfig& config) {
-  auto batch_result = MakeBenchmarkBatch(config.rows);
+  auto batch_result = MakeBenchmarkBatch(config.rows, config.extra_columns);
   if (!batch_result.ok()) {
     state.SkipWithError(batch_result.status().ToString());
     return;
   }
   const auto batch = *batch_result;
-  const sniffer::TableSchema schema{1,
-                                    {{1, "id", arrow::int64(), false, nullptr},
-                                     {2, "group", arrow::utf8(), false, nullptr},
-                                     {3, "value", arrow::int64(), true, nullptr}}};
+  std::vector<sniffer::FieldSpec> fields = {{1, "id", arrow::int64(), false, nullptr},
+                                            {2, "group", arrow::utf8(), false, nullptr},
+                                            {3, "value", arrow::int64(), true, nullptr}};
+  fields.reserve(3U + config.extra_columns);
+  for (uint32_t column = 0; column < config.extra_columns; ++column) {
+    fields.push_back(
+        {4U + column, "extra_" + std::to_string(column), arrow::int64(), false, nullptr});
+  }
+  const sniffer::TableSchema schema{1, std::move(fields)};
   sniffer::LayoutPolicy policy;
   policy.target_row_group_rows = config.row_group_rows;
   policy.sort_key_field_ids = {1};
@@ -494,6 +514,7 @@ void RunPerformance(benchmark::State& state, Format format, Query query,
   state.counters["process_peak_rss_bytes"] = static_cast<double>(totals.process_peak_rss_bytes);
   state.counters["selectivity_percent"] = static_cast<double>(config.selectivity_percent);
   state.counters["projection_columns"] = static_cast<double>(config.projection_columns);
+  state.counters["input_columns"] = static_cast<double>(3U + config.extra_columns);
   if (format == Format::kSniffer) {
     constexpr double kNanosecondsPerMillisecond = 1'000'000.0;
     const auto phase = [&](std::string_view name, uint64_t nanoseconds) {
@@ -554,6 +575,12 @@ void PerformanceMatrix(benchmark::State& state, Format format, Query query) {
     return;
   }
   RunPerformance(state, format, query, config);
+}
+
+void PerformanceWide(benchmark::State& state, Format format) {
+  const BenchmarkConfig config{kDefaultRows, static_cast<uint32_t>(kDefaultRowGroupRows), 50U, 2U,
+                               13U};
+  RunPerformance(state, format, Query::kSinglePredicate, config);
 }
 
 void ApplyPerformanceMatrix(benchmark::internal::Benchmark* benchmark) {
@@ -632,6 +659,15 @@ BENCHMARK_CAPTURE(PerformanceMatrix, Parquet, Format::kParquet, Query::kSinglePr
 BENCHMARK_CAPTURE(PerformanceMatrix, Parquet_ZSTD, Format::kParquetZstd, Query::kSinglePredicate)
     ->Apply(ApplyPerformanceMatrix)
     ->ArgNames({"rows", "row_group_rows", "selectivity_percent", "projection_columns"})
+    ->UseManualTime()
+    ->Unit(benchmark::kMillisecond);
+BENCHMARK_CAPTURE(PerformanceWide, Sniffer, Format::kSniffer)
+    ->UseManualTime()
+    ->Unit(benchmark::kMillisecond);
+BENCHMARK_CAPTURE(PerformanceWide, Parquet, Format::kParquet)
+    ->UseManualTime()
+    ->Unit(benchmark::kMillisecond);
+BENCHMARK_CAPTURE(PerformanceWide, Parquet_ZSTD, Format::kParquetZstd)
     ->UseManualTime()
     ->Unit(benchmark::kMillisecond);
 
