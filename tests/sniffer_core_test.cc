@@ -515,6 +515,60 @@ TEST(SnifferCoreTest, TypedArrayHashMatchesScalarReference) {
                    .ok());
 }
 
+TEST(SnifferCoreTest, BloomIndexBitsMatchScalarReferenceAcrossTypesAndNaN) {
+  const auto check = [](const sniffer::TableSchema& schema,
+                        const std::shared_ptr<arrow::RecordBatch>& batch) {
+    sniffer::LayoutPolicy layout;
+    for (const auto& field : schema.fields) {
+      layout.bloom_field_ids.push_back(field.field_id);
+    }
+    const auto index = ValueOrThrow(sniffer::internal::BuildRowGroupIndex(schema, layout, *batch),
+                                    "build Bloom reference index");
+    ASSERT_EQ(index.blooms.size(), schema.fields.size());
+    for (size_t column = 0; column < schema.fields.size(); ++column) {
+      const auto& field = schema.fields[column];
+      const auto& array = batch->column(static_cast<int>(column));
+      const auto& bloom = index.blooms[column];
+      std::vector<uint8_t> expected(bloom.bits.size(), 0);
+      for (int64_t row = 0; row < array->length(); ++row) {
+        if (array->IsNull(row)) {
+          continue;
+        }
+        const auto value = ValueOrThrow(array->GetScalar(row), "get Bloom reference scalar");
+        if (sniffer::internal::ScalarHasNaN(*value)) {
+          continue;
+        }
+        const uint64_t first =
+            ValueOrThrow(sniffer::internal::HashScalar(field, *value, 0x243F6A8885A308D3ULL),
+                         "hash first Bloom seed");
+        const uint64_t second =
+            ValueOrThrow(sniffer::internal::HashScalar(field, *value, 0x13198A2E03707344ULL),
+                         "hash second Bloom seed") |
+            1U;
+        for (uint32_t probe = 0; probe < bloom.hash_count; ++probe) {
+          const uint64_t bit =
+              (first + static_cast<uint64_t>(probe) * second) & (bloom.bit_count - 1U);
+          expected[static_cast<size_t>(bit / 8U)] |=
+              static_cast<uint8_t>(1U << static_cast<uint32_t>(bit % 8U));
+        }
+      }
+      EXPECT_EQ(bloom.bits, expected) << "Bloom bit pattern for field " << field.field_id;
+    }
+  };
+
+  const auto all_types = MakeAllTypesBatch();
+  check(all_types.table_schema, all_types.batch);
+  const sniffer::TableSchema floating_schema{
+      1,
+      {{1, "f32", arrow::float32(), true, nullptr}, {2, "f64", arrow::float64(), true, nullptr}}};
+  const auto arrow_schema = ValueOrThrow(floating_schema.ToArrowSchema(), "Bloom NaN schema");
+  const auto f32 = BuildArray<arrow::FloatBuilder, float>(
+      {1.0F, std::numeric_limits<float>::quiet_NaN(), std::nullopt, -0.0F, 2.0F});
+  const auto f64 = BuildArray<arrow::DoubleBuilder, double>(
+      {1.0, std::numeric_limits<double>::quiet_NaN(), std::nullopt, -0.0, 2.0});
+  check(floating_schema, arrow::RecordBatch::Make(arrow_schema, 5, {f32, f64}));
+}
+
 TEST(SnifferCoreTest, TypedSingleSortValidationCoversAllFlatTypes) {
   const auto timestamp_type = std::static_pointer_cast<arrow::TimestampType>(
       arrow::timestamp(arrow::TimeUnit::MICRO, "UTC"));
@@ -1766,6 +1820,44 @@ TEST(SnifferCoreTest, IOPlanProjectionPredicatesLimitAndBatching) {
   EXPECT_TRUE(metrics->predicate_chunks_decoded == 6 && metrics->projection_chunks_decoded == 6 &&
               metrics->column_chunks_read == 12)
       << "predicate and projection chunks follow separate decode paths";
+}
+
+TEST(SnifferCoreTest, NoPredicateFullScanRespectsLimitAndChunkReads) {
+  const auto data = MakeScanBatch();
+  TempFile file("scan_no_predicate.seg");
+  WriteSegmentWithPolicy(file.path(), data.table_schema, {data.batch}, ScanLayout());
+  auto reader = ValueOrThrow(sniffer::SegmentReader::Open(file.path().string()), "open full scan");
+
+  for (const uint64_t limit : {uint64_t{0}, uint64_t{1}, uint64_t{7}, uint64_t{30}}) {
+    sniffer::IOPlan plan;
+    plan.projection_field_ids = {4, 1};
+    plan.output_batch_rows = 4;
+    plan.limit = limit;
+    auto metrics = std::make_shared<sniffer::ScanMetrics>();
+    const auto batches =
+        CollectScan(ValueOrThrow(reader->Scan(plan, metrics), "scan no predicate"));
+    std::vector<int64_t> keys;
+    std::vector<std::string> payloads;
+    for (const auto& batch : batches) {
+      const auto& payload = static_cast<const arrow::BinaryArray&>(*batch->column(0));
+      const auto& key = static_cast<const arrow::Int64Array&>(*batch->column(1));
+      for (int64_t row = 0; row < batch->num_rows(); ++row) {
+        keys.push_back(key.Value(row));
+        payloads.emplace_back(payload.GetView(row));
+      }
+    }
+    ASSERT_EQ(keys.size(), limit);
+    ASSERT_EQ(payloads.size(), limit);
+    for (uint64_t row = 0; row < limit; ++row) {
+      EXPECT_EQ(keys[static_cast<size_t>(row)], static_cast<int64_t>(row));
+      EXPECT_EQ(payloads[static_cast<size_t>(row)], "p" + std::to_string(row));
+    }
+    const uint64_t expected_groups = (limit + 4U) / 5U;
+    EXPECT_EQ(metrics->row_groups_considered, expected_groups);
+    EXPECT_EQ(metrics->predicate_chunks_decoded, 0U);
+    EXPECT_EQ(metrics->projection_chunks_decoded, expected_groups * 2U);
+    EXPECT_EQ(metrics->column_chunks_read, expected_groups * 2U);
+  }
 }
 
 TEST(SnifferCoreTest, PredicateExecutionOrderIsDeterministic) {

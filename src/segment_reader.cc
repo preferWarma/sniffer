@@ -11,6 +11,7 @@
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <numeric>
 #include <optional>
 #include <span>
 #include <string>
@@ -1324,21 +1325,27 @@ class ScanState {
       std::vector<uint64_t> selection;
       {
         internal::NanosecondTimer timer(&metrics_->predicate_nanoseconds);
-        selection.reserve(
-            static_cast<size_t>(std::min<uint64_t>(row_group.row_count, remaining_limit)));
-        const bool reorder_predicates = plan_.conjunctive_predicates.size() > 1;
-        for (uint64_t row = 0;
-             row < row_group.row_count && static_cast<uint64_t>(selection.size()) < remaining_limit;
-             ++row) {
-          bool matches = false;
-          if (reorder_predicates) {
-            ARROW_ASSIGN_OR_RAISE(matches,
-                                  RowMatchesReordered(row, predicate_columns, sort_key_columns));
-          } else {
-            ARROW_ASSIGN_OR_RAISE(matches, RowMatches(row, predicate_columns, sort_key_columns));
-          }
-          if (matches) {
-            selection.push_back(row);
+        const size_t capacity =
+            static_cast<size_t>(std::min<uint64_t>(row_group.row_count, remaining_limit));
+        if (plan_.conjunctive_predicates.empty() && !plan_.sort_key_range) {
+          selection.resize(capacity);
+          std::iota(selection.begin(), selection.end(), uint64_t{0});
+        } else {
+          selection.reserve(capacity);
+          const bool reorder_predicates = plan_.conjunctive_predicates.size() > 1;
+          for (uint64_t row = 0; row < row_group.row_count &&
+                                 static_cast<uint64_t>(selection.size()) < remaining_limit;
+               ++row) {
+            bool matches = false;
+            if (reorder_predicates) {
+              ARROW_ASSIGN_OR_RAISE(matches,
+                                    RowMatchesReordered(row, predicate_columns, sort_key_columns));
+            } else {
+              ARROW_ASSIGN_OR_RAISE(matches, RowMatches(row, predicate_columns, sort_key_columns));
+            }
+            if (matches) {
+              selection.push_back(row);
+            }
           }
         }
       }

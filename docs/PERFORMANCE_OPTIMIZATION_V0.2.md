@@ -82,6 +82,8 @@ SIMD、多级编码链和新压缩算法只有在标量路径完成剖析和优�
         `value_length()` 求和；含 null 列保留逐行安全路径。
 - [x] Bloom 构建按列绑定数组类型和 physical type，逐行双哈希不再重复做类型一致性检查与
       `PhysicalTypeFor()`；安全入口和绑定入口的哈希结果逐值一致。
+- [x] Bloom 构建按列确定是否可能含 NaN；非浮点列跳过逐行类型检查，float/double 仍按原规则
+      排除 NaN，Bloom bit pattern 与 Scalar reference 一致。
 - [x] 为整数、timestamp、bool、string/binary 增加 typed encoder 路径，避免逐值构造
       `arrow::Scalar` 和调用 `SerializeScalar()`。
 - [x] 为 `ByteWriter` 增加可计算的容量预留和批量 append，减少 vector 扩容及中间 payload 拷贝。
@@ -110,12 +112,15 @@ SIMD、多级编码链和新压缩算法只有在标量路径完成剖析和优�
 - [x] 将多个 AND predicate 融合到同一次 selection 构建，优先执行成本低、选择性高的谓词。
 - [x] 在计划校验时为 sort-key range 绑定 typed comparator，逐行范围判断不再调用 `GetScalar()`
       或构造临时 key vector。
+- [x] 无谓词且无 sort-key range 的全量扫描直接构造连续 selection，跳过逐行空匹配调用；
+      `limit` 仍只选择所需行数。
 - [ ] 比较 index vector、bitmap 和连续 range 表示在 1%/10%/50%/100% 选择率下的成本，使用
       确定性阈值选择表示。
 - [x] projection 与 predicate 是同一列时，直接从已解码列构造输出，提供 typed take/filter 路径。
 - [ ] 减少跨 Row Group 输出时的 `ConcatenateRecordBatches()` 拷贝；优先返回合法 slice，只有确实
       需要单个连续 batch 时才合并。
-- [ ] 针对 `limit` 做早停，确保不解码超过最后命中行所需的 projection 数据。
+- [x] 针对 `limit` 做早停：selection 达到剩余 limit 后停止逐行匹配，只为这些命中行解码
+      projection，并且不读取后续 Row Group；已有谓词测试和无谓词 `limit=0/1/7/30` 测试覆盖。
 - [ ] 增加指标验证：谓词列、投影列、selection、拼接各阶段的行数、字节数和耗时可观测。
 
 ## 6. P1：优化文件 I/O 与 checksum
@@ -929,3 +934,26 @@ CV 为 0.46%。Dictionary payload 仍为 113,058 字节，完整 Segment 仍为 
   26 个 ColumnChunk 和 172,228 个读取字节。
 - CTest 中 benchmark smoke 使用同名临时文件；为避免并行运行相互覆盖，将这些 smoke case
   加入同一资源锁，不改变库或正式 benchmark 的行为。
+
+### 2026-09-23：无谓词全量扫描的连续 selection
+
+- 无 predicate、无 sort-key range 时，原路径对每一行调用空的 `RowMatches()` 和
+  `SortKeyRowMatches()`。现在直接生成 `[0, min(row_group_rows, remaining_limit))`，其他
+  filter/range 路径保持原样；未更改文件格式、剪枝或解码策略。
+- 新增 full-scan 性能 case，Sniffer、Parquet 和 Parquet + ZSTD 使用相同输入、Row Group 和投影。
+  额外测试覆盖 `limit=0/1/7/30`，检查逐行结果、批次顺序及 predicate/projection chunk 指标。
+- Apple M4、Release、100,000 行、Row Group 4,096、无过滤、投影 `id,value`：改动前 7 次
+  P50 扫描 1.277 ms（wall CV 1.06%），改动后 11 次 P50 扫描 1.128 ms（wall CV 0.64%），
+  约下降 11.7%。完整 Segment 仍为 663,679 字节，输出 100,000 行，读取 50 个 ColumnChunk /
+  339,076 字节。短时 warm-cache 合成数据，不代表所有查询收益。
+
+### 2026-09-23：Bloom 非浮点列的 NaN 检查外提
+
+- 之前 Bloom 每行都调用 `ArrayValueHasNaN()`，即使列类型不可能包含 NaN。现在每列只判断一次
+  类型，float/double 仍逐值检查 NaN。全首期类型和含 NaN/null 的浮点列以 Scalar reference
+  验证 Bloom bit pattern，未改变哈希、索引或持久化格式。
+- Apple M4、Release、100,000 行、Row Group 4,096、50% 选择率、投影 `id,value`：同机
+  11 次 P50 的 writer index 阶段从 1.210 ms 降至 1.156 ms；第二轮复测为 1.152 ms。
+  完整端到端结果从 5.199 ms 到第一轮 5.239 ms、第二轮 5.171 ms，变化尚不足以断言
+  全路径提速。文件仍为 663,679 字节，12/25 Row Group 剪枝、26 个 ColumnChunk 和
+  172,228 个读取字节不变。

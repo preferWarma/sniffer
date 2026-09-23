@@ -503,11 +503,13 @@ arrow::Result<RowGroupIndex> BuildRowGroupIndex(const TableSchema& schema,
     }
     bloom.bits.assign(static_cast<size_t>(bloom.bit_count / 8U), 0);
     ARROW_ASSIGN_OR_RAISE(const auto bloom_hasher, ArrayValuePairHasher::Bind(field, *array));
+    const bool may_have_nan =
+        array->type_id() == arrow::Type::FLOAT || array->type_id() == arrow::Type::DOUBLE;
     for (int64_t row = 0; row < array->length(); ++row) {
       if (array->IsNull(row)) {
         continue;
       }
-      if (!ArrayValueHasNaN(*array, row)) {
+      if (!may_have_nan || !ArrayValueHasNaN(*array, row)) {
         BloomInsertArrayValue(bloom_hasher, row, &bloom);
       }
     }

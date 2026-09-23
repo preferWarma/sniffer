@@ -34,7 +34,7 @@ constexpr int64_t kDefaultRows = 100000;
 constexpr int64_t kDefaultRowGroupRows = 4096;
 
 enum class Format { kSniffer, kParquet, kParquetZstd };
-enum class Query { kSinglePredicate, kThreePredicates, kSortKeyRange };
+enum class Query { kSinglePredicate, kThreePredicates, kSortKeyRange, kFullScan };
 
 struct BenchmarkConfig {
   int64_t rows;
@@ -186,7 +186,7 @@ arrow::Result<Measurement> RunSnifferOnce(const std::filesystem::path& path,
     range.upper = std::vector<std::shared_ptr<arrow::Scalar>>{
         std::make_shared<arrow::Int64Scalar>(batch->num_rows() * 3 / 4)};
     plan.sort_key_range = std::move(range);
-  } else {
+  } else if (query != Query::kFullScan) {
     plan.conjunctive_predicates = {
         {1, sniffer::Predicate::Op::kGe,
          std::make_shared<arrow::Int64Scalar>(PredicateThreshold(config))}};
@@ -246,7 +246,7 @@ arrow::Result<Measurement> RunParquetOnce(const std::filesystem::path& path,
   for (int index = 0; index < reader->num_row_groups(); ++index) {
     const auto row_group = metadata->RowGroup(index);
     const auto statistics = row_group->ColumnChunk(0)->statistics();
-    if (statistics && statistics->HasMinMax() &&
+    if (query != Query::kFullScan && statistics && statistics->HasMinMax() &&
         statistics->physical_type() == parquet::Type::INT64) {
       const auto& ids = static_cast<const parquet::Int64Statistics&>(*statistics);
       if (query == Query::kSortKeyRange) {
@@ -297,7 +297,7 @@ arrow::Result<Measurement> RunParquetOnce(const std::filesystem::path& path,
     for (int64_t row = 0; row < current->num_rows(); ++row) {
       const int64_t id = ids.Value(row);
       if (query == Query::kSortKeyRange ? (id < range_lower || id >= range_upper)
-                                        : id < threshold) {
+                                        : (query != Query::kFullScan && id < threshold)) {
         continue;
       }
       if (query == Query::kThreePredicates) {
@@ -409,7 +409,9 @@ void RunPerformance(benchmark::State& state, Format format, Query query,
     }
     auto value = *result;
     uint64_t expected_rows = SelectedRows(config);
-    if (query == Query::kSortKeyRange) {
+    if (query == Query::kFullScan) {
+      expected_rows = static_cast<uint64_t>(config.rows);
+    } else if (query == Query::kSortKeyRange) {
       expected_rows = static_cast<uint64_t>(config.rows * 3 / 4 - config.rows / 4);
     }
     if (query == Query::kThreePredicates) {
@@ -579,6 +581,10 @@ BENCHMARK_CAPTURE(Performance, SnifferSortKeyRange, Format::kSniffer, Query::kSo
     ->Args({kDefaultRows, kDefaultRowGroupRows})
     ->UseManualTime()
     ->Unit(benchmark::kMillisecond);
+BENCHMARK_CAPTURE(Performance, SnifferFullScan, Format::kSniffer, Query::kFullScan)
+    ->Args({kDefaultRows, kDefaultRowGroupRows})
+    ->UseManualTime()
+    ->Unit(benchmark::kMillisecond);
 BENCHMARK_CAPTURE(Performance, Parquet, Format::kParquet, Query::kSinglePredicate)
     ->Args({kDefaultRows, kDefaultRowGroupRows})
     ->UseManualTime()
@@ -588,6 +594,10 @@ BENCHMARK_CAPTURE(Performance, ParquetThreePredicates, Format::kParquet, Query::
     ->UseManualTime()
     ->Unit(benchmark::kMillisecond);
 BENCHMARK_CAPTURE(Performance, ParquetSortKeyRange, Format::kParquet, Query::kSortKeyRange)
+    ->Args({kDefaultRows, kDefaultRowGroupRows})
+    ->UseManualTime()
+    ->Unit(benchmark::kMillisecond);
+BENCHMARK_CAPTURE(Performance, ParquetFullScan, Format::kParquet, Query::kFullScan)
     ->Args({kDefaultRows, kDefaultRowGroupRows})
     ->UseManualTime()
     ->Unit(benchmark::kMillisecond);
@@ -602,6 +612,10 @@ BENCHMARK_CAPTURE(Performance, Parquet_ZSTD_ThreePredicates, Format::kParquetZst
     ->Unit(benchmark::kMillisecond);
 BENCHMARK_CAPTURE(Performance, Parquet_ZSTD_SortKeyRange, Format::kParquetZstd,
                   Query::kSortKeyRange)
+    ->Args({kDefaultRows, kDefaultRowGroupRows})
+    ->UseManualTime()
+    ->Unit(benchmark::kMillisecond);
+BENCHMARK_CAPTURE(Performance, Parquet_ZSTD_FullScan, Format::kParquetZstd, Query::kFullScan)
     ->Args({kDefaultRows, kDefaultRowGroupRows})
     ->UseManualTime()
     ->Unit(benchmark::kMillisecond);

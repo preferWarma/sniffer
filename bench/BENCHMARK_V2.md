@@ -96,3 +96,12 @@ Plain 回退与 offset 开销。
 Sniffer case（100,000 行、Row Group 4,096）的写入 P50 从 1.533 ms（7 次）变为
 1.379 ms（11 次），文件均为 117,044 字节。该数字与本报告初版表格不是同一轮实验；
 改动范围、测试和限制见 [`PERFORMANCE_OPTIMIZATION_V0.2.md`](../docs/PERFORMANCE_OPTIMIZATION_V0.2.md)。
+
+同日新增无谓词 full-scan case。100,000 行、Row Group 4,096、投影 `id,value`，Sniffer
+scan P50 从 1.277 ms（7 次）降至 1.128 ms（11 次），文件大小及读取量不变。相同改动前
+Parquet/Parquet + ZSTD full-scan scan P50 分别为 1.629/2.534 ms；改动后重测分别为
+1.669/2.590 ms。两轮运行次数和温度条件不同，不能据此判断 Parquet 性能变化。
+
+同日 Bloom 构建外提非浮点列的 NaN 类型检查。固定 50% 选择率场景的 Sniffer writer index
+P50 从 1.210 ms 降至 1.156 ms（各 11 次）；完整端到端两轮结果方向不一致，暂不宣称
+全路径提速。持久化字节、剪枝和读取量保持不变。
