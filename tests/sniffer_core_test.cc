@@ -1892,6 +1892,103 @@ TEST(SnifferCoreTest, NoPredicateFullScanRespectsLimitAndChunkReads) {
   }
 }
 
+TEST(SnifferCoreTest, WholeRowGroupScanPreservesBatchingAndPartialLimit) {
+  const auto data = MakeScanBatch();
+  auto policy = ScanLayout();
+  policy.field_encodings = {{1, sniffer::EncodingKind::kForBitpack},
+                            {2, sniffer::EncodingKind::kDictionary},
+                            {3, sniffer::EncodingKind::kRle},
+                            {4, sniffer::EncodingKind::kPlain}};
+  TempFile file("whole_row_group_scan.seg");
+  WriteSegmentWithPolicy(file.path(), data.table_schema, {data.batch}, policy);
+  auto reader = ValueOrThrow(sniffer::SegmentReader::Open(file.path().string()),
+                             "open whole-row-group scan file");
+
+  const auto verify = [&](std::optional<uint64_t> limit, uint32_t batch_rows,
+                          const std::vector<int64_t>& expected_batch_rows,
+                          uint64_t expected_row_groups) {
+    sniffer::IOPlan plan;
+    plan.projection_field_ids = {4, 1, 2, 3};
+    plan.output_batch_rows = batch_rows;
+    plan.limit = limit;
+    auto metrics = std::make_shared<sniffer::ScanMetrics>();
+    const auto batches =
+        CollectScan(ValueOrThrow(reader->Scan(plan, metrics), "scan whole groups"));
+    ASSERT_EQ(batches.size(), expected_batch_rows.size());
+    int64_t offset = 0;
+    const std::array<int, 4> source_columns = {3, 0, 1, 2};
+    for (size_t batch_index = 0; batch_index < batches.size(); ++batch_index) {
+      const auto& batch = batches[batch_index];
+      EXPECT_EQ(batch->num_rows(), expected_batch_rows[batch_index]);
+      for (size_t column = 0; column < source_columns.size(); ++column) {
+        EXPECT_TRUE(
+            batch->column(static_cast<int>(column))
+                ->Equals(
+                    data.batch->column(source_columns[column])->Slice(offset, batch->num_rows())))
+            << "full and partial Row Groups preserve projected values and nulls";
+      }
+      offset += batch->num_rows();
+    }
+    EXPECT_EQ(offset, limit ? static_cast<int64_t>(*limit) : data.batch->num_rows());
+    EXPECT_EQ(metrics->row_groups_considered, expected_row_groups);
+    EXPECT_EQ(metrics->predicate_chunks_decoded, 0U);
+    EXPECT_EQ(metrics->projection_chunks_decoded, expected_row_groups * 4U);
+    EXPECT_EQ(metrics->column_chunks_read, expected_row_groups * 4U);
+  };
+  verify(std::nullopt, 7, {7, 7, 7, 7, 2}, 6);
+  verify(std::nullopt, 5, {5, 5, 5, 5, 5, 5}, 6);
+  verify(uint64_t{7}, 4, {4, 3}, 2);
+  verify(uint64_t{1}, 4, {1}, 1);
+  verify(uint64_t{0}, 4, {}, 0);
+
+  sniffer::IOPlan empty_projection;
+  empty_projection.output_batch_rows = 7;
+  auto empty_metrics = std::make_shared<sniffer::ScanMetrics>();
+  const auto empty_batches = CollectScan(ValueOrThrow(reader->Scan(empty_projection, empty_metrics),
+                                                      "scan whole groups without projection"));
+  ASSERT_EQ(empty_batches.size(), 5U);
+  int64_t empty_rows = 0;
+  for (const auto& batch : empty_batches) {
+    EXPECT_EQ(batch->num_columns(), 0);
+    empty_rows += batch->num_rows();
+  }
+  EXPECT_EQ(empty_rows, data.batch->num_rows());
+  EXPECT_EQ(empty_metrics->row_groups_considered, 6U);
+  EXPECT_EQ(empty_metrics->column_chunks_read, 0U);
+}
+
+TEST(SnifferCoreTest, WholeRowGroupScanRejectsOversizedRowCount) {
+  const auto data = MakeScanBatch();
+  TempFile file("oversized_whole_row_group.seg");
+  WriteSegmentWithPolicy(file.path(), data.table_schema, {data.batch}, ScanLayout());
+  auto bytes = ReadFile(file.path());
+  const size_t trailer_offset = bytes.size() - 40;
+  const size_t footer_offset = static_cast<size_t>(ReadU64(bytes, trailer_offset + 8));
+  const size_t footer_length = static_cast<size_t>(ReadU64(bytes, trailer_offset + 16));
+  auto footer = ValueOrThrow(sniffer::internal::ParseFooter(std::span<const uint8_t>(
+                                 bytes.data() + footer_offset, footer_length)),
+                             "parse footer for oversized row count");
+  constexpr uint64_t kOversizedRows = static_cast<uint64_t>(INT64_MAX) + 1U;
+  footer.row_groups.front().row_count = kOversizedRows;
+  for (auto& chunk : footer.row_groups.front().chunks) {
+    chunk.row_count = kOversizedRows;
+  }
+  const auto mutated =
+      ValueOrThrow(sniffer::internal::SerializeFooter(footer), "serialize oversized footer");
+  ASSERT_EQ(mutated.size(), footer_length);
+  std::copy(mutated.begin(), mutated.end(), bytes.begin() + static_cast<ptrdiff_t>(footer_offset));
+  RefreshFooterChecksums(&bytes);
+  WriteFile(file.path(), bytes);
+
+  auto reader = ValueOrThrow(sniffer::SegmentReader::Open(file.path().string()),
+                             "open oversized row-group file");
+  sniffer::IOPlan empty_projection;
+  auto iterator = ValueOrThrow(reader->Scan(empty_projection), "create oversized scan");
+  const auto next = iterator.Next();
+  EXPECT_FALSE(next.ok());
+  EXPECT_NE(next.status().ToString().find("[sniffer.format.limit]"), std::string::npos);
+}
+
 TEST(SnifferCoreTest, WideTableProjectionSkipsUnneededColumnChunks) {
   std::vector<sniffer::FieldSpec> fields;
   std::vector<std::shared_ptr<arrow::Array>> columns;

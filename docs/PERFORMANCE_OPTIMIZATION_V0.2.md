@@ -118,6 +118,8 @@ SIMD、多级编码链和新压缩算法只有在标量路径完成剖析和优�
       或构造临时 key vector。
 - [x] 无谓词且无 sort-key range 的全量扫描直接构造连续 selection，跳过逐行空匹配调用；
       `limit` 仍只选择所需行数。
+  - [x] 整个 Row Group 均命中且未被 `limit` 截断时，不再分配连续 selection，投影列走
+        已有全量解码路径；部分 Row Group 保留 selected-decode，batch 大小与早停语义不变。
 - [ ] 比较 index vector、bitmap 和连续 range 表示在 1%/10%/50%/100% 选择率下的成本，使用
       确定性阈值选择表示。
 - [x] projection 与 predicate 是同一列时，直接从已解码列构造输出，提供 typed take/filter 路径。
@@ -1015,3 +1017,32 @@ CV 为 0.46%。Dictionary payload 仍为 113,058 字节，完整 Segment 仍为 
   与 1.31%/1.25%。低基数字符串压缩写入 P50 由 1.402 ms 到 1.377 ms；
   高基数字符串写入波动较大，不能据此断言提速。三个场景的文件字节完全不变。
   性能增益很小，仍需在固定硬件负载下交错重测后才可宣称稳定提速。
+
+### 2026-09-24：无谓词整组扫描免建 selection
+
+- 对无谓词、无 sort-key range 且当前 Row Group 未被 `limit` 截断的扫描，直接使用
+  既有全量 Plain/Dictionary/RLE/FOR 解码路径，不分配 `[0..N)` selection。部分
+  Row Group 仍走原 selected-decode；列投影、输出 batch 大小、limit、checksum 与
+  剪枝语义均不变。新增强制编码混合、多 Row Group、空投影、部分 limit 及损坏的
+  超大 row count 测试。
+- Apple M4 / Release / 单线程，100,000 行、Row Group 4,096、投影两列、
+  warm-cache、11 次重复、`--benchmark_min_time=0.03s`：full-scan scan P50
+  改前 1.116 ms，改后两轮 1.068/1.091 ms；文件均为 663,679 字节，读取均为
+  50 个 ColumnChunk / 339,076 字节。改前/改后第一轮 CV 为 2.35%/1.22%，
+  第二轮为 1.30%。差异较小，暂不据此断言稳定提速；过滤扫描路径未改。
+
+### 2026-09-24：输出 batch 边界诊断与快路径否决
+
+- 增加 Sniffer-only `PerformanceAligned` 诊断 case：同为 100,000 行、Row Group 4,096、
+  无过滤及两列投影，但 `output_batch_rows=4096`；与原 full-scan case 的 2,049 行输出
+  并列观察。它不是 Parquet 格式对照，专门用于定位输出 batch 边界成本。
+- Apple M4 / Release / 单线程、warm-cache，独立运行 11 次、
+  `--benchmark_min_time=0.03s`：对齐 case 的 scan P50 为 1.011 ms，
+  batch materialization P50 为 0.0038 ms，Arrow allocation 为 100；跨组 case 分别
+  为 1.052 ms、0.0449 ms 和 172。两者文件均为 663,679 字节；scan CV 分别为
+  2.20%/2.12%。对齐输出降低了拼接和分配，但两种输出 batch 规格不同，不能把
+  差值当作同一 API 工作量下的纯实现提速。
+- 曾尝试在单组输出时直接复用完整 `RecordBatch`，跳过 `Slice()`；保持同样诊断
+  计数的 A/B 中，对齐 case 基线 P50 1.041 ms，快路径两轮 P50 1.039/1.075 ms，
+  没有稳定收益，因此撤回快路径及临时公共指标。当前单组输出仍走零拷贝 `Slice()`；
+  真正跨组且调用者要求固定 batch 大小时仍需拼接，相关 TODO 保持未完成。

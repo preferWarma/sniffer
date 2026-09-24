@@ -171,3 +171,38 @@ Sniffer 压缩场景的文件字节数全部保持不变。回退发生在非 Pl
 写入 P50 4.283 → 4.233 ms，文件始终 663,679 字节。低基数字符串写入 P50
 1.402 → 1.377 ms，文件始终 117,044 字节。高基数字符串结果波动较大，未形成
 可归因的速度结论；本轮主要确认重复 bitmap 计数已消除、编码结果及文件格式未变。
+
+### 无谓词整组扫描免建 selection
+
+2026-09-24，基于 `43dd99b`，Apple M4 / Release / 单线程、100,000 行、Row Group
+4,096、投影 `id,value`、无谓词、warm-cache、11 次重复、
+`--benchmark_min_time=0.03s`。full-scan scan P50 改前 1.116 ms，改后两轮
+1.068/1.091 ms；文件均为 663,679 字节，读取均为 50 个 ColumnChunk、
+339,076 字节。改前 CV 2.35%，改后两轮 CV 1.22%/1.30%。该优化只在整个
+Row Group 全命中且未被 limit 截断时绕过 selection；目前只视为方向性结果，
+不据此宣称稳定提速。相同代码状态的过滤扫描 P50 为 0.930 ms。
+
+### 输出 batch 对齐诊断（Sniffer-only）
+
+2026-09-24，Apple M4 / Release / 单线程、warm-cache、100,000 行、Row Group 4,096、
+无谓词、投影 `id,value`。两种 case 使用相同输入及文件，仅输出 batch 大小不同；
+各独立运行 11 次、`--benchmark_min_time=0.03s`，均报告 P50：
+
+| case | 输出 batch 行数 | scan ms | batch materialization ms | Arrow allocations | 文件字节 |
+|---|---:|---:|---:|---:|---:|
+| `Performance/SnifferFullScan/100000/4096` | 2,049 | 1.052 | 0.0449 | 172 | 663,679 |
+| `PerformanceAligned` | 4,096 | 1.011 | 0.0038 | 100 | 663,679 |
+
+scan CV 分别为 2.12%/2.20%。对齐 case 是 Sniffer 的 batch 边界诊断，**不是**
+与 Parquet 的格式对比，也不能把不同输出规格的耗时差当作代码优化收益。曾试验
+单组输出时跳过 `Slice()`，同计数条件下基线/快路径 P50 为 1.041/1.039 ms，
+快路径第二轮为 1.075 ms；未见稳定收益，故未保留。
+
+复现：
+
+```sh
+./build-release/sniffer_core_performance_benchmark \
+  '--benchmark_filter=^(PerformanceAligned|Performance/SnifferFullScan/100000/4096)/manual_time$' \
+  --benchmark_repetitions=11 --benchmark_min_time=0.03s \
+  --benchmark_report_aggregates_only=true --benchmark_format=json
+```

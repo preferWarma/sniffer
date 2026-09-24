@@ -1322,8 +1322,10 @@ class ScanState {
         sort_key_columns.push_back(filter_columns.at(field_index).get());
       }
 
+      const bool full_row_group = plan_.conjunctive_predicates.empty() && !plan_.sort_key_range &&
+                                  remaining_limit >= row_group.row_count;
       std::vector<uint64_t> selection;
-      {
+      if (!full_row_group) {
         internal::NanosecondTimer timer(&metrics_->predicate_nanoseconds);
         const size_t capacity =
             static_cast<size_t>(std::min<uint64_t>(row_group.row_count, remaining_limit));
@@ -1349,8 +1351,13 @@ class ScanState {
           }
         }
       }
-      if (selection.empty()) {
+      const uint64_t selected_rows =
+          full_row_group ? row_group.row_count : static_cast<uint64_t>(selection.size());
+      if (selected_rows == 0) {
         continue;
+      }
+      if (selected_rows > static_cast<uint64_t>(std::numeric_limits<int64_t>::max())) {
+        return arrow::Status::Invalid("[sniffer.format.limit] row group exceeds Arrow row limit");
       }
 
       std::vector<std::shared_ptr<arrow::Array>> projected_columns;
@@ -1365,15 +1372,16 @@ class ScanState {
           }
           projected_columns.push_back(std::move(selected));
         } else {
-          ARROW_ASSIGN_OR_RAISE(auto selected,
-                                DecodeProjectionChunk(row_group, field_index, selection));
+          ARROW_ASSIGN_OR_RAISE(
+              auto selected,
+              DecodeProjectionChunk(row_group, field_index, full_row_group ? nullptr : &selection));
           projected_columns.push_back(std::move(selected));
         }
       }
       std::shared_ptr<arrow::RecordBatch> batch;
       {
         internal::NanosecondTimer timer(&metrics_->batch_materialization_nanoseconds);
-        batch = arrow::RecordBatch::Make(output_schema_, static_cast<int64_t>(selection.size()),
+        batch = arrow::RecordBatch::Make(output_schema_, static_cast<int64_t>(selected_rows),
                                          std::move(projected_columns));
         ARROW_RETURN_NOT_OK(batch->ValidateFull());
       }
@@ -1420,19 +1428,24 @@ class ScanState {
 
   arrow::Result<std::shared_ptr<arrow::Array>> DecodeProjectionChunk(
       const internal::RowGroupMeta& row_group, size_t field_index,
-      const std::vector<uint64_t>& selection) {
+      const std::vector<uint64_t>* selection) {
     const auto& chunk = row_group.chunks[field_index];
     ARROW_ASSIGN_OR_RAISE(auto payload, ReadChunk(chunk));
     std::shared_ptr<arrow::Array> array;
     {
       internal::NanosecondTimer timer(&metrics_->decode_nanoseconds);
       if (chunk.encoding_id == internal::kPlainEncodingId) {
-        ARROW_ASSIGN_OR_RAISE(
-            array, internal::DecodePlainSelected(footer_.schema.fields[field_index], chunk, payload,
-                                                 selection));
+        if (selection) {
+          ARROW_ASSIGN_OR_RAISE(
+              array, internal::DecodePlainSelected(footer_.schema.fields[field_index], chunk,
+                                                   payload, *selection));
+        } else {
+          ARROW_ASSIGN_OR_RAISE(
+              array, internal::DecodePlain(footer_.schema.fields[field_index], chunk, payload));
+        }
       } else {
         ARROW_ASSIGN_OR_RAISE(array, internal::DecodeNonPlain(footer_.schema.fields[field_index],
-                                                              chunk, payload, &selection));
+                                                              chunk, payload, selection));
       }
     }
     ++metrics_->projection_chunks_decoded;

@@ -42,6 +42,7 @@ struct BenchmarkConfig {
   uint32_t selectivity_percent = 50;
   uint32_t projection_columns = 2;
   uint32_t extra_columns = 0;
+  uint32_t output_batch_rows = 0;  // 0 keeps the cross-Row-Group baseline.
 };
 
 struct Measurement {
@@ -211,7 +212,8 @@ arrow::Result<Measurement> RunSnifferOnce(const std::filesystem::path& path,
         {2, sniffer::Predicate::Op::kEq, std::make_shared<arrow::StringScalar>("group-0")});
     plan.conjunctive_predicates.push_back({3, sniffer::Predicate::Op::kIsNotNull, nullptr});
   }
-  plan.output_batch_rows = config.row_group_rows / 2 + 1;
+  plan.output_batch_rows =
+      config.output_batch_rows == 0 ? config.row_group_rows / 2 + 1 : config.output_batch_rows;
   auto scan_metrics = std::make_shared<sniffer::ScanMetrics>();
   ARROW_ASSIGN_OR_RAISE(auto iterator, reader->Scan(std::move(plan), scan_metrics));
   uint64_t output_rows = 0;
@@ -516,6 +518,10 @@ void RunPerformance(benchmark::State& state, Format format, Query query,
   state.counters["projection_columns"] = static_cast<double>(config.projection_columns);
   state.counters["input_columns"] = static_cast<double>(3U + config.extra_columns);
   if (format == Format::kSniffer) {
+    state.counters["output_batch_rows"] = static_cast<double>(
+        config.output_batch_rows == 0 ? config.row_group_rows / 2 + 1 : config.output_batch_rows);
+  }
+  if (format == Format::kSniffer) {
     constexpr double kNanosecondsPerMillisecond = 1'000'000.0;
     const auto phase = [&](std::string_view name, uint64_t nanoseconds) {
       SetAverage(state, name, static_cast<double>(nanoseconds) / kNanosecondsPerMillisecond);
@@ -583,6 +589,12 @@ void PerformanceWide(benchmark::State& state, Format format) {
   RunPerformance(state, format, Query::kSinglePredicate, config);
 }
 
+void PerformanceAligned(benchmark::State& state) {
+  BenchmarkConfig config{kDefaultRows, static_cast<uint32_t>(kDefaultRowGroupRows)};
+  config.output_batch_rows = config.row_group_rows;
+  RunPerformance(state, Format::kSniffer, Query::kFullScan, config);
+}
+
 void ApplyPerformanceMatrix(benchmark::internal::Benchmark* benchmark) {
   constexpr std::array<int64_t, 4> kRowGroupRows = {1024, 8192, 65536, 262144};
   constexpr std::array<int64_t, 4> kSelectivityPercent = {1, 10, 50, 100};
@@ -612,6 +624,7 @@ BENCHMARK_CAPTURE(Performance, SnifferFullScan, Format::kSniffer, Query::kFullSc
     ->Args({kDefaultRows, kDefaultRowGroupRows})
     ->UseManualTime()
     ->Unit(benchmark::kMillisecond);
+BENCHMARK(PerformanceAligned)->UseManualTime()->Unit(benchmark::kMillisecond);
 BENCHMARK_CAPTURE(Performance, Parquet, Format::kParquet, Query::kSinglePredicate)
     ->Args({kDefaultRows, kDefaultRowGroupRows})
     ->UseManualTime()

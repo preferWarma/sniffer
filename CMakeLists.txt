@@ -241,6 +241,16 @@ if(SNIFFER_BUILD_BENCHMARK)
         -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/validate_google_benchmark_json.cmake"
     )
     add_test(
+      NAME sniffer_core_aligned_performance_benchmark_json_smoke
+      COMMAND
+        "${CMAKE_COMMAND}"
+        "-DBENCHMARK_EXECUTABLE=$<TARGET_FILE:sniffer_core_performance_benchmark>"
+        "-DBENCHMARK_FILTER=^PerformanceAligned/manual_time$"
+        -DEXPECTED_PREFIX=PerformanceAligned/
+        -DEXPECT_MEMORY_COUNTERS=ON
+        -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/validate_google_benchmark_json.cmake"
+    )
+    add_test(
       NAME sniffer_core_wide_parquet_benchmark_json_smoke
       COMMAND
         "${CMAKE_COMMAND}"
@@ -294,6 +304,7 @@ if(SNIFFER_BUILD_BENCHMARK)
       sniffer_core_performance_benchmark_json_smoke
       sniffer_core_parquet_performance_benchmark_json_smoke
       sniffer_core_wide_performance_benchmark_json_smoke
+      sniffer_core_aligned_performance_benchmark_json_smoke
       sniffer_core_wide_parquet_benchmark_json_smoke
       sniffer_core_compression_benchmark_json_smoke
       sniffer_core_parquet_compression_benchmark_json_smoke
