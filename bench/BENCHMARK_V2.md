@@ -242,3 +242,71 @@ scan CV 分别为 2.12%/2.20%。对齐 case 是 Sniffer 的 batch 边界诊断�
 
 同一三列场景修改前的 chunk I/O P50 为 0.127 ms，decode 为 1.799 ms，
 scan 为 2.798 ms。相邻 chunk 合并读取的 warm-cache 上界较低，尚未测试 cold-cache。
+
+### selection 表示的独立微基准
+
+2026-09-25，Apple M4 / Release / 单线程，100,000 行。预先生成确定性 mask 和
+values；计时仅含表示的构建与按命中行求和，不含谓词、codec、文件 I/O、Arrow builder。
+`distribution:0` 是 hash 均匀散点，`:1` 是连续前缀；每 case 11 次重复、
+`--benchmark_min_time=0.03s`。P50 单位为 µs：
+
+| 分布 | 选择率 | 64-bit 行号 | bitmap | ranges |
+|---|---:|---:|---:|---:|
+| 均匀散点 | 1% | 31.2 | 28.6 | 33.7 |
+| 均匀散点 | 10% | 47.9 | 36.5 | 52.6 |
+| 均匀散点 | 50% | 178.1 | 104.9 | 221.6 |
+| 均匀散点 | 100% | 62.3 | 157.6 | 74.1 |
+| 连续前缀 | 1% | 24.0 | 24.8 | 24.7 |
+| 连续前缀 | 10% | 28.5 | 38.0 | 28.9 |
+| 连续前缀 | 50% | 42.9 | 92.0 | 48.7 |
+| 连续前缀 | 100% | 62.4 | 157.1 | 74.3 |
+
+这份诊断的行号 vector 按当前扫描逻辑预留整组容量：800,000 字节；bitmap 容量
+12,504 字节。连续前缀只有一个 range、容量 16 字节；均匀散点的 range 容量
+取决于连续命中的段数，例如 50% 为 524,288 字节。均匀 hash 的实际命中数与
+目标百分比略有差异，按 benchmark JSON 中的 `selected_rows` 计。
+
+bitmap 在均匀中高选择率下的时间和空间较好，但生产 scan 仍使用 index vector；
+`limit`、selected-decode 和 Arrow 输出成本尚未计入，暂不设生产切换阈值。
+当前全命中 Row Group 已用隐式连续表示，不应再构造上表的任一容器。复现：
+
+```sh
+./build-release/sniffer_core_selection_benchmark \
+  '--benchmark_filter=^Selection/' \
+  --benchmark_repetitions=11 --benchmark_min_time=0.03s \
+  --benchmark_report_aggregates_only=true --benchmark_format=json
+```
+
+### Plain selected-decode 的 bitmap A/B
+
+2026-09-25，Apple M4 / Apple Clang 21 / Arrow 23.0.1 / Release / 单线程 / warm-cache。
+100,000 个 nullable int64，17 行中约 1 行为 null，非 null 值为确定性 hash；单个
+Plain ColumnChunk，无 Row Group 边界。均匀散点与连续前缀各测 1%/10%/50%/100%；
+11 次重复、每次至少 0.05 秒，下表为 CPU 时间 P50，单位 µs。计时从预建的选择
+表示和已编码 payload 开始，包含完整 Plain selected-decode、Arrow builder 输出及
+`ValidateFull()`，不含谓词、选择表示构建、I/O、CRC 和 batch 拼接。每个 case 在
+计时前用两个解码器逐值核对。
+
+| 分布 | 选择率 | 行号 | bitmap | bitmap / 行号 |
+|---|---:|---:|---:|---:|
+| 均匀散点 | 1% | 22.51 | 23.86 | 1.06 |
+| 均匀散点 | 10% | 45.70 | 43.35 | 0.95 |
+| 均匀散点 | 50% | 143.67 | 134.92 | 0.94 |
+| 均匀散点 | 100% | 248.24 | 211.02 | 0.85 |
+| 连续前缀 | 1% | 22.29 | 22.82 | 1.02 |
+| 连续前缀 | 10% | 42.92 | 40.35 | 0.94 |
+| 连续前缀 | 50% | 134.45 | 115.15 | 0.86 |
+| 连续前缀 | 100% | 248.40 | 209.62 | 0.84 |
+
+bitmap 容量为 12,504 字节；本 case 的行号 vector 容量从约 8 KiB（1% 连续前缀）
+到 1 MiB（100%），是 benchmark 构建方式的实际容量，不等于生产 scan 的整组预留。
+1% 解码略慢；中高选择率 Plain 解码较快，但这里未测 bitmap 构建、谓词列复用和
+Dictionary/RLE/FOR 的 selected-decode，不能据此设生产阈值。生产全命中 Row Group
+原本就不分配 selection，100% 一行只用于比较两个 decoder。复现：
+
+```sh
+./build-release/sniffer_core_selection_benchmark \
+  '--benchmark_filter=^PlainSelectedDecode/' \
+  --benchmark_repetitions=11 --benchmark_min_time=0.05s \
+  --benchmark_report_aggregates_only=true --benchmark_format=json
+```

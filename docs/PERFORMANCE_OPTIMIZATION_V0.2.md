@@ -125,6 +125,13 @@ SIMD、多级编码链和新压缩算法只有在标量路径完成剖析和优�
   - [x] 对全命中的谓词 Row Group 使用隐式连续范围，跳过 identity selection；部分命中
         保持 index vector，`limit` 截断的前缀仍显式生成所需行号。bitmap 与通用连续 range
         表示尚未比较。
+  - [x] 独立 Google Benchmark 比较 index vector、bitmap、range 在 1%/10%/50%/100%
+        选择率、均匀散点和连续前缀数据上的构建＋消费成本与容器容量；结果见
+        [`bench/BENCHMARK_V2.md`](../bench/BENCHMARK_V2.md)。生产 scan 尚只传递
+        index vector，必须完成完整 codec/scan A/B 后才能选择阈值。
+  - [x] Plain selected-decode 增加内部 bitmap 候选和 1%/10%/50%/100% 的
+        nullable int64 A/B；各 Plain 类型、null、跨 word、非法 bitmap 逐值测试。
+        生产 scan 尚未切换；Dictionary/RLE/FOR、选择构建和完整 scan 待测。
 - [x] projection 与 predicate 是同一列时，直接从已解码列构造输出，提供 typed take/filter 路径。
 - [ ] 减少跨 Row Group 输出时的 `ConcatenateRecordBatches()` 拷贝；优先返回合法 slice，只有确实
       需要单个连续 batch 时才合并。
@@ -1084,3 +1091,27 @@ CV 为 0.46%。Dictionary payload 仍为 113,058 字节，完整 Segment 仍为 
 - 候选 chunk 合并读取的同场景诊断：三列扫描的 chunk I/O P50 约 0.127 ms，
   decode P50 约 1.799 ms、scan P50 约 2.798 ms。warm-cache 下减少少量相邻
   读取调用不是当前最大热点；冷缓存结论尚缺，I/O TODO 保持未完成。
+
+### 2026-09-25：selection 表示微基准
+
+- 新增 `sniffer_core_selection_benchmark`：100,000 行，均匀 hash 与连续前缀两类
+  确定性命中分布，比较 64-bit 行号、64-bit bitmap 和 `[begin,end)` ranges 的
+  构建＋遍历耗时及容器容量；运行前逐 case 与独立 mask reference 核对命中数和
+  求和。CTests 包含 Google Benchmark dry-run 与 JSON smoke。
+- Apple M4 / Release / 单线程，11 次 P50：均匀散点 10% 时行号/bitmap/range
+  约 47.9/36.5/52.6 µs；50% 时约 178.1/104.9/221.6 µs。当前扫描
+  row-group-sized reserve 下行号占 800 KB，bitmap 占 12.5 KB；连续前缀
+  range 仅 16 字节。该微基准不包含 ColumnChunk 解码、Arrow builder 和
+  `limit`，不能据此为生产 scan 设置选择阈值；顶层 TODO 保持未完成。
+
+### 2026-09-25：Plain bitmap selected-decode 候选
+
+- 增加只在内存使用的 `BitmapSelection`，校验 word 数量和末尾越界 bit，按递增行号
+  迭代；Plain selected-decode 共用原来的 payload、validity、offset 与 Arrow 输出
+  校验逻辑，支持所有 Plain 类型。没有修改 Segment 格式或公开 `IOPlan`。
+- Apple M4 / Release / 单线程、100,000 行 nullable int64、11 次 CPU P50：均匀
+  散点 1% 行号/bitmap 为 22.51/23.86 µs，10% 为 45.70/43.35 µs，50% 为
+  143.67/134.92 µs。完整矩阵及复现命令见
+  [`bench/BENCHMARK_V2.md`](../bench/BENCHMARK_V2.md)。这只测预建 selection 到
+  Arrow array，不含 bitmap 构建、谓词、非 Plain codec 和端到端扫描；生产路径
+  暂保留 index vector，尚无可信阈值。

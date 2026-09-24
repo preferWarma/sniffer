@@ -523,10 +523,19 @@ arrow::Status ValidateSelection(uint64_t row_count, const std::vector<uint64_t>&
   return arrow::Status::OK();
 }
 
-template <typename Builder, typename ReadValue>
-arrow::Result<std::shared_ptr<arrow::Array>> DecodeSelectedFixed(
-    const std::vector<uint64_t>& selection, std::span<const uint8_t> validity,
-    std::span<const uint8_t> values, uint32_t width, Builder* builder, ReadValue read_value) {
+arrow::Status ValidateSelection(uint64_t row_count, const internal::BitmapSelection& selection) {
+  if (selection.row_count() != row_count) {
+    return InvalidFormat("bitmap selection row count differs from chunk");
+  }
+  return arrow::Status::OK();
+}
+
+template <typename Rows, typename Builder, typename ReadValue>
+arrow::Result<std::shared_ptr<arrow::Array>> DecodeSelectedFixed(const Rows& selection,
+                                                                 std::span<const uint8_t> validity,
+                                                                 std::span<const uint8_t> values,
+                                                                 uint32_t width, Builder* builder,
+                                                                 ReadValue read_value) {
   ARROW_RETURN_NOT_OK(builder->Reserve(static_cast<int64_t>(selection.size())));
   for (const uint64_t row : selection) {
     if (!IsValid(validity, row)) {
@@ -542,9 +551,9 @@ arrow::Result<std::shared_ptr<arrow::Array>> DecodeSelectedFixed(
   return result;
 }
 
+template <typename Rows>
 arrow::Result<std::shared_ptr<arrow::Array>> DecodeSelectedBoolean(
-    const std::vector<uint64_t>& selection, std::span<const uint8_t> validity,
-    std::span<const uint8_t> values) {
+    const Rows& selection, std::span<const uint8_t> validity, std::span<const uint8_t> values) {
   arrow::BooleanBuilder builder;
   ARROW_RETURN_NOT_OK(builder.Reserve(static_cast<int64_t>(selection.size())));
   for (const uint64_t row : selection) {
@@ -564,10 +573,10 @@ arrow::Result<std::shared_ptr<arrow::Array>> DecodeSelectedBoolean(
   return result;
 }
 
-template <typename Builder>
+template <typename Rows, typename Builder>
 arrow::Result<std::shared_ptr<arrow::Array>> DecodeSelectedBinary(
-    const std::vector<uint64_t>& selection, std::span<const uint8_t> validity,
-    const std::vector<uint64_t>& offsets, std::span<const uint8_t> values, Builder* builder) {
+    const Rows& selection, std::span<const uint8_t> validity, const std::vector<uint64_t>& offsets,
+    std::span<const uint8_t> values, Builder* builder) {
   ARROW_RETURN_NOT_OK(builder->Reserve(static_cast<int64_t>(selection.size())));
   for (const uint64_t row : selection) {
     if (!IsValid(validity, row)) {
@@ -596,9 +605,10 @@ arrow::Result<std::shared_ptr<arrow::Array>> DecodeSelectedBinary(
   return result;
 }
 
+template <typename Rows>
 arrow::Result<std::shared_ptr<arrow::Array>> DecodePlainSelectedImpl(
     const FieldSpec& field, const internal::ColumnChunkMeta& chunk,
-    std::span<const uint8_t> payload, const std::vector<uint64_t>& selection) {
+    std::span<const uint8_t> payload, const Rows& selection) {
   internal::ByteReader payload_reader(payload);
   ARROW_ASSIGN_OR_RAISE(const uint64_t validity_length, payload_reader.ReadU64());
   ARROW_ASSIGN_OR_RAISE(const uint64_t offsets_length, payload_reader.ReadU64());
@@ -1214,6 +1224,12 @@ arrow::Result<std::shared_ptr<arrow::Array>> DecodePlain(const FieldSpec& field,
 arrow::Result<std::shared_ptr<arrow::Array>> DecodePlainSelected(
     const FieldSpec& field, const ColumnChunkMeta& chunk, std::span<const uint8_t> payload,
     const std::vector<uint64_t>& selection) {
+  return DecodePlainSelectedImpl(field, chunk, payload, selection);
+}
+
+arrow::Result<std::shared_ptr<arrow::Array>> DecodePlainSelectedBitmap(
+    const FieldSpec& field, const ColumnChunkMeta& chunk, std::span<const uint8_t> payload,
+    const BitmapSelection& selection) {
   return DecodePlainSelectedImpl(field, chunk, payload, selection);
 }
 

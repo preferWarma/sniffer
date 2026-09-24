@@ -1039,6 +1039,18 @@ TEST(SnifferCoreTest, PlainSelectedTypedDecodeMatchesReference) {
     const auto actual =
         ValueOrThrow(sniffer::internal::DecodePlainSelected(field, chunk, payload, selection),
                      "decode selected typed Plain values");
+    std::vector<uint64_t> words((chunk.row_count + 63U) / 64U, 0);
+    for (const uint64_t row : selection) {
+      words[static_cast<size_t>(row / 64U)] |= uint64_t{1} << (row % 64U);
+    }
+    const auto bitmap =
+        ValueOrThrow(sniffer::internal::BitmapSelection::Make(chunk.row_count, std::move(words)),
+                     "make selected Plain bitmap");
+    const auto bitmap_actual =
+        ValueOrThrow(sniffer::internal::DecodePlainSelectedBitmap(field, chunk, payload, bitmap),
+                     "decode selected Plain bitmap values");
+    EXPECT_TRUE(bitmap_actual->Equals(actual))
+        << "bitmap and index selection differ for " + field.name;
     auto expected_builder =
         ValueOrThrow(arrow::MakeBuilder(field.type), "make selected Plain reference builder");
     for (const uint64_t row : selection) {
@@ -1054,7 +1066,22 @@ TEST(SnifferCoreTest, PlainSelectedTypedDecodeMatchesReference) {
     const std::vector<uint64_t> duplicate = {1, 1};
     EXPECT_TRUE(!sniffer::internal::DecodePlainSelected(field, chunk, payload, duplicate).ok())
         << "selected Plain decode rejects duplicate rows";
+    chunk.row_count += 1;
+    EXPECT_TRUE(!sniffer::internal::DecodePlainSelectedBitmap(field, chunk, payload, bitmap).ok())
+        << "bitmap row count mismatch must fail";
   }
+
+  EXPECT_FALSE(sniffer::internal::BitmapSelection::Make(65, {uint64_t{1}}).ok());
+  EXPECT_FALSE(sniffer::internal::BitmapSelection::Make(65, {0, uint64_t{2}}).ok());
+  const auto sparse = ValueOrThrow(
+      sniffer::internal::BitmapSelection::Make(130, {uint64_t{1} << 63U, 0, uint64_t{1}}),
+      "make sparse bitmap spanning words");
+  EXPECT_EQ(std::vector<uint64_t>(sparse.begin(), sparse.end()), (std::vector<uint64_t>{63, 128}));
+  const auto adjacent = ValueOrThrow(
+      sniffer::internal::BitmapSelection::Make(130, {uint64_t{1} << 63U, uint64_t{1}, uint64_t{1}}),
+      "make bitmap spanning adjacent words");
+  EXPECT_EQ(std::vector<uint64_t>(adjacent.begin(), adjacent.end()),
+            (std::vector<uint64_t>{63, 64, 128}));
 
   const auto& bool_field = data.table_schema.fields.front();
   const auto& bool_source = data.batch->column(0);
@@ -1079,6 +1106,52 @@ TEST(SnifferCoreTest, PlainSelectedTypedDecodeMatchesReference) {
   EXPECT_TRUE(
       !sniffer::internal::DecodePlainSelected(bool_field, bool_chunk, corrupted, first_row).ok())
       << "selected Plain decode rejects non-canonical boolean values";
+}
+
+TEST(SnifferCoreTest, PlainBitmapSelectionMatchesIndexAcrossWordBoundaries) {
+  constexpr uint64_t kRows = 130;
+  std::vector<std::optional<std::string>> values;
+  values.reserve(kRows);
+  for (uint64_t row = 0; row < kRows; ++row) {
+    if (row % 11U == 0) {
+      values.emplace_back(std::nullopt);
+    } else {
+      values.emplace_back(std::to_string(row) + std::string(row % 7U, 'x'));
+    }
+  }
+  const auto source = BuildArray<arrow::StringBuilder, std::string>(values);
+  const sniffer::FieldSpec field{1, "value", arrow::utf8(), true, nullptr};
+  const auto payload = ValueOrThrow(sniffer::internal::EncodePlain(field, *source),
+                                    "encode variable-length bitmap test input");
+  sniffer::internal::ColumnChunkMeta chunk;
+  chunk.field_id = field.field_id;
+  chunk.physical_type = sniffer::internal::PhysicalTypeId::kString;
+  chunk.encoding_id = sniffer::internal::kPlainEncodingId;
+  chunk.row_count = kRows;
+  chunk.null_count = static_cast<uint64_t>(source->null_count());
+  chunk.length = payload.size();
+  for (const uint64_t percent :
+       {uint64_t{0}, uint64_t{1}, uint64_t{10}, uint64_t{50}, uint64_t{100}}) {
+    std::vector<uint64_t> indices;
+    std::vector<uint64_t> words((kRows + 63U) / 64U, 0);
+    for (uint64_t row = 0; row < kRows; ++row) {
+      if ((row * 37U + 19U) % 100U < percent) {
+        indices.push_back(row);
+        words[static_cast<size_t>(row / 64U)] |= uint64_t{1} << (row % 64U);
+      }
+    }
+    const auto bitmap =
+        ValueOrThrow(sniffer::internal::BitmapSelection::Make(kRows, std::move(words)),
+                     "make variable-length bitmap selection");
+    EXPECT_EQ(std::vector<uint64_t>(bitmap.begin(), bitmap.end()), indices);
+    const auto from_indices =
+        ValueOrThrow(sniffer::internal::DecodePlainSelected(field, chunk, payload, indices),
+                     "decode variable-length index selection");
+    const auto from_bitmap =
+        ValueOrThrow(sniffer::internal::DecodePlainSelectedBitmap(field, chunk, payload, bitmap),
+                     "decode variable-length bitmap selection");
+    EXPECT_TRUE(from_bitmap->Equals(from_indices)) << "selection percent " << percent;
+  }
 }
 
 TEST(SnifferCoreTest, TypedRleMatchesScalarReference) {

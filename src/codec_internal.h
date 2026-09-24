@@ -8,6 +8,7 @@
 
 #include "column_analysis_internal.h"
 #include "format_internal.h"
+#include "selection_internal.h"
 #include "sniffer/layout.h"
 #include "sniffer/schema.h"
 
@@ -26,6 +27,9 @@ namespace sniffer::internal {
 [[nodiscard]] arrow::Result<std::shared_ptr<arrow::Array>> DecodePlainSelected(
     const FieldSpec& field, const ColumnChunkMeta& chunk, std::span<const uint8_t> payload,
     const std::vector<uint64_t>& selection);
+[[nodiscard]] arrow::Result<std::shared_ptr<arrow::Array>> DecodePlainSelectedBitmap(
+    const FieldSpec& field, const ColumnChunkMeta& chunk, std::span<const uint8_t> payload,
+    const BitmapSelection& selection);
 [[nodiscard]] arrow::Result<std::vector<uint8_t>> EncodeNonPlain(
     uint16_t encoding_id, const FieldSpec& field, const arrow::Array& array,
     const StatisticsMeta* statistics = nullptr);

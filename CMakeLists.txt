@@ -183,6 +183,14 @@ if(SNIFFER_BUILD_BENCHMARK)
   target_link_libraries(
     sniffer_core_codec_benchmark PRIVATE sniffer_core benchmark::benchmark
   )
+  add_executable(sniffer_core_selection_benchmark bench/selection_benchmark.cc)
+  target_compile_features(sniffer_core_selection_benchmark PRIVATE cxx_std_20)
+  target_include_directories(
+    sniffer_core_selection_benchmark PRIVATE
+      "${CMAKE_CURRENT_BINARY_DIR}/generated"
+      "${CMAKE_CURRENT_SOURCE_DIR}/src"
+  )
+  target_link_libraries(sniffer_core_selection_benchmark PRIVATE sniffer_core benchmark::benchmark)
   if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
     target_compile_options(
       sniffer_core_performance_benchmark
@@ -194,6 +202,10 @@ if(SNIFFER_BUILD_BENCHMARK)
     )
     target_compile_options(
       sniffer_core_codec_benchmark
+      PRIVATE -Wall -Wextra -Wpedantic -Wconversion
+    )
+    target_compile_options(
+      sniffer_core_selection_benchmark
       PRIVATE -Wall -Wextra -Wpedantic -Wconversion
     )
   endif()
@@ -209,6 +221,10 @@ if(SNIFFER_BUILD_BENCHMARK)
     add_test(
       NAME sniffer_core_codec_benchmark_smoke
       COMMAND sniffer_core_codec_benchmark --benchmark_dry_run
+    )
+    add_test(
+      NAME sniffer_core_selection_benchmark_smoke
+      COMMAND sniffer_core_selection_benchmark --benchmark_dry_run
     )
     add_test(
       NAME sniffer_core_performance_benchmark_json_smoke
@@ -295,12 +311,22 @@ if(SNIFFER_BUILD_BENCHMARK)
         -DEXPECTED_PREFIX=Codec/
         -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/validate_google_benchmark_json.cmake"
     )
+    add_test(
+      NAME sniffer_core_selection_benchmark_json_smoke
+      COMMAND
+        "${CMAKE_COMMAND}"
+        "-DBENCHMARK_EXECUTABLE=$<TARGET_FILE:sniffer_core_selection_benchmark>"
+        "-DBENCHMARK_FILTER=^Selection/Indices/rows:100000/selectivity_percent:1/distribution:0$"
+        -DEXPECTED_PREFIX=Selection/Indices/
+        -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/validate_google_benchmark_json.cmake"
+    )
     # Benchmark smoke cases share fixed temporary paths and measure process CPU.
     # Serialize them so parallel CTest runs neither race nor perturb measurements.
     set_tests_properties(
       sniffer_core_performance_benchmark_smoke
       sniffer_core_compression_benchmark_smoke
       sniffer_core_codec_benchmark_smoke
+      sniffer_core_selection_benchmark_smoke
       sniffer_core_performance_benchmark_json_smoke
       sniffer_core_parquet_performance_benchmark_json_smoke
       sniffer_core_wide_performance_benchmark_json_smoke
@@ -310,6 +336,7 @@ if(SNIFFER_BUILD_BENCHMARK)
       sniffer_core_parquet_compression_benchmark_json_smoke
       sniffer_core_sample_skew_compression_benchmark_json_smoke
       sniffer_core_codec_benchmark_json_smoke
+      sniffer_core_selection_benchmark_json_smoke
       PROPERTIES RESOURCE_LOCK sniffer_benchmark
     )
   endif()
