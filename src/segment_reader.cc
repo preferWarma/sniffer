@@ -1262,6 +1262,7 @@ class ScanState {
       const int64_t take =
           static_cast<int64_t>(std::min<uint64_t>(static_cast<uint64_t>(available), remaining));
       pieces.push_back(front->Slice(buffered_front_offset_, take));
+      ++metrics_->output_slices;
       buffered_front_offset_ += take;
       remaining -= static_cast<uint64_t>(take);
       buffered_rows_ -= static_cast<uint64_t>(take);
@@ -1274,8 +1275,15 @@ class ScanState {
     if (pieces.size() == 1) {
       return pieces.front();
     }
-    internal::NanosecondTimer timer(&metrics_->batch_materialization_nanoseconds);
-    return arrow::ConcatenateRecordBatches(pieces);
+    std::shared_ptr<arrow::RecordBatch> concatenated;
+    {
+      internal::NanosecondTimer batch_timer(&metrics_->batch_materialization_nanoseconds);
+      internal::NanosecondTimer concat_timer(&metrics_->output_concatenation_nanoseconds);
+      ARROW_ASSIGN_OR_RAISE(concatenated, arrow::ConcatenateRecordBatches(pieces));
+    }
+    ++metrics_->output_concatenations;
+    metrics_->output_concatenated_rows += emit_rows;
+    return concatenated;
   }
 
  private:
@@ -1324,6 +1332,7 @@ class ScanState {
 
       const bool full_row_group = plan_.conjunctive_predicates.empty() && !plan_.sort_key_range &&
                                   remaining_limit >= row_group.row_count;
+      bool all_rows_selected = full_row_group;
       std::vector<uint64_t> selection;
       if (!full_row_group) {
         internal::NanosecondTimer timer(&metrics_->predicate_nanoseconds);
@@ -1333,26 +1342,50 @@ class ScanState {
           selection.resize(capacity);
           std::iota(selection.begin(), selection.end(), uint64_t{0});
         } else {
-          selection.reserve(capacity);
           const bool reorder_predicates = plan_.conjunctive_predicates.size() > 1;
-          for (uint64_t row = 0; row < row_group.row_count &&
-                                 static_cast<uint64_t>(selection.size()) < remaining_limit;
-               ++row) {
-            bool matches = false;
-            if (reorder_predicates) {
-              ARROW_ASSIGN_OR_RAISE(matches,
-                                    RowMatchesReordered(row, predicate_columns, sort_key_columns));
-            } else {
-              ARROW_ASSIGN_OR_RAISE(matches, RowMatches(row, predicate_columns, sort_key_columns));
+          const auto row_matches = [&](uint64_t row) {
+            return reorder_predicates
+                       ? RowMatchesReordered(row, predicate_columns, sort_key_columns)
+                       : RowMatches(row, predicate_columns, sort_key_columns);
+          };
+          uint64_t matched_rows = 0;
+          uint64_t row = 0;
+          bool first_miss = false;
+          for (; row < row_group.row_count && matched_rows < remaining_limit; ++row) {
+            ARROW_ASSIGN_OR_RAISE(const bool matches, row_matches(row));
+            if (!matches) {
+              first_miss = true;
+              ++row;  // The first miss was already evaluated; resume after it.
+              break;
             }
-            if (matches) {
-              selection.push_back(row);
+            ++matched_rows;
+          }
+          if (!first_miss) {
+            if (matched_rows == row_group.row_count) {
+              all_rows_selected = true;
+            } else {
+              selection.resize(static_cast<size_t>(matched_rows));
+              std::iota(selection.begin(), selection.end(), uint64_t{0});
+            }
+          } else {
+            selection.reserve(capacity);
+            selection.resize(static_cast<size_t>(matched_rows));
+            std::iota(selection.begin(), selection.end(), uint64_t{0});
+            for (; row < row_group.row_count &&
+                   static_cast<uint64_t>(selection.size()) < remaining_limit;
+                 ++row) {
+              ARROW_ASSIGN_OR_RAISE(const bool matches, row_matches(row));
+              if (matches) {
+                selection.push_back(row);
+              }
             }
           }
+          metrics_->selection_rows_examined += row;
         }
+        metrics_->selection_indices_materialized += static_cast<uint64_t>(selection.size());
       }
       const uint64_t selected_rows =
-          full_row_group ? row_group.row_count : static_cast<uint64_t>(selection.size());
+          all_rows_selected ? row_group.row_count : static_cast<uint64_t>(selection.size());
       if (selected_rows == 0) {
         continue;
       }
@@ -1365,18 +1398,23 @@ class ScanState {
       for (const size_t field_index : resolved_plan_.projection_field_indices) {
         const auto decoded = filter_columns.find(field_index);
         if (decoded != filter_columns.end()) {
-          std::shared_ptr<arrow::Array> selected;
-          {
-            internal::NanosecondTimer timer(&metrics_->projection_nanoseconds);
-            ARROW_ASSIGN_OR_RAISE(selected, SelectArray(decoded->second, selection));
+          if (all_rows_selected) {
+            projected_columns.push_back(decoded->second);
+          } else {
+            std::shared_ptr<arrow::Array> selected;
+            {
+              internal::NanosecondTimer timer(&metrics_->projection_nanoseconds);
+              ARROW_ASSIGN_OR_RAISE(selected, SelectArray(decoded->second, selection));
+            }
+            projected_columns.push_back(std::move(selected));
           }
-          projected_columns.push_back(std::move(selected));
         } else {
-          ARROW_ASSIGN_OR_RAISE(
-              auto selected,
-              DecodeProjectionChunk(row_group, field_index, full_row_group ? nullptr : &selection));
+          ARROW_ASSIGN_OR_RAISE(auto selected,
+                                DecodeProjectionChunk(row_group, field_index,
+                                                      all_rows_selected ? nullptr : &selection));
           projected_columns.push_back(std::move(selected));
         }
+        metrics_->projection_rows_materialized += selected_rows;
       }
       std::shared_ptr<arrow::RecordBatch> batch;
       {
@@ -1423,6 +1461,8 @@ class ScanState {
       }
     }
     ++metrics_->predicate_chunks_decoded;
+    metrics_->predicate_chunk_bytes_read += chunk.length;
+    metrics_->predicate_rows_decoded += row_group.row_count;
     return array;
   }
 
@@ -1449,6 +1489,7 @@ class ScanState {
       }
     }
     ++metrics_->projection_chunks_decoded;
+    metrics_->projection_chunk_bytes_read += chunk.length;
     return array;
   }
 

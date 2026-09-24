@@ -1852,6 +1852,12 @@ TEST(SnifferCoreTest, IOPlanProjectionPredicatesLimitAndBatching) {
   EXPECT_TRUE(metrics->predicate_chunks_decoded == 6 && metrics->projection_chunks_decoded == 6 &&
               metrics->column_chunks_read == 12)
       << "predicate and projection chunks follow separate decode paths";
+  EXPECT_EQ(metrics->predicate_rows_decoded, 30U);
+  EXPECT_EQ(metrics->projection_rows_materialized, 8U);
+  EXPECT_EQ(metrics->selection_indices_materialized, 4U);
+  EXPECT_GE(metrics->selection_rows_examined, 4U);
+  EXPECT_EQ(metrics->predicate_chunk_bytes_read + metrics->projection_chunk_bytes_read,
+            metrics->chunk_bytes_read);
 }
 
 TEST(SnifferCoreTest, NoPredicateFullScanRespectsLimitAndChunkReads) {
@@ -1906,7 +1912,8 @@ TEST(SnifferCoreTest, WholeRowGroupScanPreservesBatchingAndPartialLimit) {
 
   const auto verify = [&](std::optional<uint64_t> limit, uint32_t batch_rows,
                           const std::vector<int64_t>& expected_batch_rows,
-                          uint64_t expected_row_groups) {
+                          uint64_t expected_row_groups, uint64_t expected_indices,
+                          uint64_t expected_slices, uint64_t expected_concatenations) {
     sniffer::IOPlan plan;
     plan.projection_field_ids = {4, 1, 2, 3};
     plan.output_batch_rows = batch_rows;
@@ -1934,12 +1941,24 @@ TEST(SnifferCoreTest, WholeRowGroupScanPreservesBatchingAndPartialLimit) {
     EXPECT_EQ(metrics->predicate_chunks_decoded, 0U);
     EXPECT_EQ(metrics->projection_chunks_decoded, expected_row_groups * 4U);
     EXPECT_EQ(metrics->column_chunks_read, expected_row_groups * 4U);
+    EXPECT_EQ(metrics->predicate_rows_decoded, 0U);
+    EXPECT_EQ(metrics->predicate_chunk_bytes_read, 0U);
+    EXPECT_EQ(metrics->projection_chunk_bytes_read, metrics->chunk_bytes_read);
+    EXPECT_EQ(metrics->projection_rows_materialized, static_cast<uint64_t>(offset) * 4U);
+    EXPECT_EQ(metrics->selection_rows_examined, 0U);
+    EXPECT_EQ(metrics->selection_indices_materialized, expected_indices);
+    EXPECT_EQ(metrics->output_slices, expected_slices);
+    EXPECT_EQ(metrics->output_concatenations, expected_concatenations);
+    if (expected_concatenations == 0) {
+      EXPECT_EQ(metrics->output_concatenated_rows, 0U);
+      EXPECT_EQ(metrics->output_concatenation_nanoseconds, 0U);
+    }
   };
-  verify(std::nullopt, 7, {7, 7, 7, 7, 2}, 6);
-  verify(std::nullopt, 5, {5, 5, 5, 5, 5, 5}, 6);
-  verify(uint64_t{7}, 4, {4, 3}, 2);
-  verify(uint64_t{1}, 4, {1}, 1);
-  verify(uint64_t{0}, 4, {}, 0);
+  verify(std::nullopt, 7, {7, 7, 7, 7, 2}, 6, 0, 10, 4);
+  verify(std::nullopt, 5, {5, 5, 5, 5, 5, 5}, 6, 0, 6, 0);
+  verify(uint64_t{7}, 4, {4, 3}, 2, 2, 3, 1);
+  verify(uint64_t{1}, 4, {1}, 1, 1, 1, 0);
+  verify(uint64_t{0}, 4, {}, 0, 0, 0, 0);
 
   sniffer::IOPlan empty_projection;
   empty_projection.output_batch_rows = 7;
@@ -1987,6 +2006,90 @@ TEST(SnifferCoreTest, WholeRowGroupScanRejectsOversizedRowCount) {
   const auto next = iterator.Next();
   EXPECT_FALSE(next.ok());
   EXPECT_NE(next.status().ToString().find("[sniffer.format.limit]"), std::string::npos);
+}
+
+TEST(SnifferCoreTest, AllMatchingPredicateReusesDecodedColumnsAndPreservesLimit) {
+  const auto data = MakeScanBatch();
+  auto policy = ScanLayout();
+  policy.field_encodings = {{1, sniffer::EncodingKind::kForBitpack},
+                            {2, sniffer::EncodingKind::kDictionary},
+                            {3, sniffer::EncodingKind::kRle},
+                            {4, sniffer::EncodingKind::kPlain}};
+  TempFile file("all_matching_predicate.seg");
+  WriteSegmentWithPolicy(file.path(), data.table_schema, {data.batch}, policy);
+  auto reader = ValueOrThrow(sniffer::SegmentReader::Open(file.path().string()),
+                             "open all-matching predicate file");
+
+  for (const std::optional<uint64_t> limit :
+       std::array<std::optional<uint64_t>, 2>{std::nullopt, uint64_t{7}}) {
+    sniffer::IOPlan plan;
+    plan.projection_field_ids = {1, 4, 2, 3};
+    plan.conjunctive_predicates = {
+        {1, sniffer::Predicate::Op::kGe, std::make_shared<arrow::Int64Scalar>(0)}};
+    plan.output_batch_rows = 7;
+    plan.limit = limit;
+    auto metrics = std::make_shared<sniffer::ScanMetrics>();
+    const auto batches =
+        CollectScan(ValueOrThrow(reader->Scan(plan, metrics), "scan all-matching predicate"));
+    int64_t offset = 0;
+    const std::array<int, 4> source_columns = {0, 3, 1, 2};
+    for (const auto& batch : batches) {
+      for (size_t column = 0; column < source_columns.size(); ++column) {
+        EXPECT_TRUE(
+            batch->column(static_cast<int>(column))
+                ->Equals(
+                    data.batch->column(source_columns[column])->Slice(offset, batch->num_rows())));
+      }
+      offset += batch->num_rows();
+    }
+    EXPECT_EQ(offset, limit ? static_cast<int64_t>(*limit) : data.batch->num_rows());
+    const uint64_t groups = limit ? 2U : 6U;
+    EXPECT_EQ(metrics->predicate_chunks_decoded, groups);
+    EXPECT_EQ(metrics->projection_chunks_decoded, groups * 3U);
+    EXPECT_EQ(metrics->projection_rows_materialized, static_cast<uint64_t>(offset) * 4U);
+    EXPECT_EQ(metrics->selection_indices_materialized, limit ? 2U : 0U);
+  }
+}
+
+TEST(SnifferCoreTest, SelectionPrefixFallsBackAfterFirstMiss) {
+  const auto data = MakeScanBatch();
+  TempFile file("selection_prefix_fallback.seg");
+  WriteSegmentWithPolicy(file.path(), data.table_schema, {data.batch}, ScanLayout());
+  auto reader =
+      ValueOrThrow(sniffer::SegmentReader::Open(file.path().string()), "open prefix fallback file");
+  for (const std::optional<uint64_t> limit :
+       std::array<std::optional<uint64_t>, 2>{std::nullopt, uint64_t{7}}) {
+    sniffer::IOPlan plan;
+    plan.projection_field_ids = {1, 4};
+    plan.conjunctive_predicates = {
+        {1, sniffer::Predicate::Op::kNe, std::make_shared<arrow::Int64Scalar>(2)}};
+    plan.limit = limit;
+    plan.output_batch_rows = 4;
+    auto metrics = std::make_shared<sniffer::ScanMetrics>();
+    const auto batches =
+        CollectScan(ValueOrThrow(reader->Scan(plan, metrics), "scan prefix fallback"));
+    std::vector<int64_t> actual_keys;
+    for (const auto& batch : batches) {
+      const auto& keys = static_cast<const arrow::Int64Array&>(*batch->column(0));
+      const auto& payload = static_cast<const arrow::BinaryArray&>(*batch->column(1));
+      for (int64_t row = 0; row < batch->num_rows(); ++row) {
+        const int64_t key = keys.Value(row);
+        actual_keys.push_back(key);
+        EXPECT_EQ(payload.GetView(row), "p" + std::to_string(key));
+      }
+    }
+    std::vector<int64_t> expected_keys;
+    for (int64_t key = 0; key < data.batch->num_rows() && (!limit || expected_keys.size() < *limit);
+         ++key) {
+      if (key != 2) {
+        expected_keys.push_back(key);
+      }
+    }
+    EXPECT_EQ(actual_keys, expected_keys);
+    EXPECT_EQ(metrics->selection_indices_materialized, limit ? 7U : 4U);
+    EXPECT_EQ(metrics->selection_rows_examined, limit ? 8U : 30U);
+    EXPECT_EQ(metrics->projection_rows_materialized, expected_keys.size() * 2U);
+  }
 }
 
 TEST(SnifferCoreTest, WideTableProjectionSkipsUnneededColumnChunks) {

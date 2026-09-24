@@ -486,10 +486,24 @@ void RunPerformance(benchmark::State& state, Format format, Query query,
     totals.scan_metrics.projection_nanoseconds += value.scan_metrics.projection_nanoseconds;
     totals.scan_metrics.batch_materialization_nanoseconds +=
         value.scan_metrics.batch_materialization_nanoseconds;
+    totals.scan_metrics.output_concatenation_nanoseconds +=
+        value.scan_metrics.output_concatenation_nanoseconds;
     totals.scan_metrics.row_groups_considered += value.scan_metrics.row_groups_considered;
     totals.scan_metrics.row_groups_pruned += value.scan_metrics.row_groups_pruned;
     totals.scan_metrics.column_chunks_read += value.scan_metrics.column_chunks_read;
     totals.scan_metrics.chunk_bytes_read += value.scan_metrics.chunk_bytes_read;
+    totals.scan_metrics.predicate_chunk_bytes_read += value.scan_metrics.predicate_chunk_bytes_read;
+    totals.scan_metrics.projection_chunk_bytes_read +=
+        value.scan_metrics.projection_chunk_bytes_read;
+    totals.scan_metrics.predicate_rows_decoded += value.scan_metrics.predicate_rows_decoded;
+    totals.scan_metrics.projection_rows_materialized +=
+        value.scan_metrics.projection_rows_materialized;
+    totals.scan_metrics.selection_rows_examined += value.scan_metrics.selection_rows_examined;
+    totals.scan_metrics.selection_indices_materialized +=
+        value.scan_metrics.selection_indices_materialized;
+    totals.scan_metrics.output_slices += value.scan_metrics.output_slices;
+    totals.scan_metrics.output_concatenations += value.scan_metrics.output_concatenations;
+    totals.scan_metrics.output_concatenated_rows += value.scan_metrics.output_concatenated_rows;
     benchmark::DoNotOptimize(value.output_rows);
   }
 
@@ -546,6 +560,27 @@ void RunPerformance(benchmark::State& state, Format format, Query query,
     phase("reader_predicate_ms", totals.scan_metrics.predicate_nanoseconds);
     phase("reader_projection_ms", totals.scan_metrics.projection_nanoseconds);
     phase("reader_batch_materialization_ms", totals.scan_metrics.batch_materialization_nanoseconds);
+    phase("reader_output_concatenation_ms", totals.scan_metrics.output_concatenation_nanoseconds);
+    SetAverage(state, "predicate_chunk_bytes_read",
+               static_cast<double>(totals.scan_metrics.predicate_chunk_bytes_read));
+    SetAverage(state, "projection_chunk_bytes_read",
+               static_cast<double>(totals.scan_metrics.projection_chunk_bytes_read));
+    SetAverage(state, "predicate_rows_decoded",
+               static_cast<double>(totals.scan_metrics.predicate_rows_decoded));
+    SetAverage(state, "projection_rows_materialized",
+               static_cast<double>(totals.scan_metrics.projection_rows_materialized));
+    SetAverage(state, "selection_rows_examined",
+               static_cast<double>(totals.scan_metrics.selection_rows_examined));
+    SetAverage(state, "selection_indices_materialized",
+               static_cast<double>(totals.scan_metrics.selection_indices_materialized));
+    SetAverage(
+        state, "selection_index_bytes_materialized",
+        static_cast<double>(totals.scan_metrics.selection_indices_materialized) * sizeof(uint64_t));
+    SetAverage(state, "output_slices", static_cast<double>(totals.scan_metrics.output_slices));
+    SetAverage(state, "output_concatenations",
+               static_cast<double>(totals.scan_metrics.output_concatenations));
+    SetAverage(state, "output_concatenated_rows",
+               static_cast<double>(totals.scan_metrics.output_concatenated_rows));
     SetAverage(state, "row_groups_considered",
                static_cast<double>(totals.scan_metrics.row_groups_considered));
     SetAverage(state, "row_groups_pruned",

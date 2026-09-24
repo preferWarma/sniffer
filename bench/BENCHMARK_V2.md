@@ -206,3 +206,27 @@ scan CV 分别为 2.12%/2.20%。对齐 case 是 Sniffer 的 batch 边界诊断�
   --benchmark_repetitions=11 --benchmark_min_time=0.03s \
   --benchmark_report_aggregates_only=true --benchmark_format=json
 ```
+
+### 谓词全命中 Row Group 的隐式连续范围
+
+2026-09-25，Apple M4 / Release / 单线程 / warm-cache，100,000 行、Row Group 8,192、
+升序 `id >= threshold`、投影 `id,value`；1%/10%/50%/100% 选择率各 11 次，
+`--benchmark_min_time=0.03s`。下表为同一批新增计数存在时的改前/改后 P50；
+`selection bytes` 是显式行号数量乘 8，不是 Arrow 内存池分配量。
+
+| 选择率 | scan 改前 / 改后 ms | 改后 CV | selection bytes 改前 / 改后 | 文件字节 |
+|---:|---:|---:|---:|---:|
+| 1% | 0.244 / 0.243 | 1.64% | 8,000 / 8,000 | 675,943 |
+| 10% | 0.424 / 0.395 | 1.46% | 80,000 / 896 | 675,943 |
+| 50% | 0.940 / 0.817 | 1.73% | 400,000 / 58,752 | 675,943 |
+| 100% | 1.652 / 1.347 | 1.25% | 800,000 / 0 | 675,943 |
+
+完整命中的 Row Group 才不生成行号；部分命中、`limit` 截断依然走现有 selected-decode。
+该有序阈值分布便于出现整组命中，不能外推到随机稀疏过滤。复现：
+
+```sh
+./build-release/sniffer_core_performance_benchmark \
+  '--benchmark_filter=^PerformanceMatrix/Sniffer/rows:100000/row_group_rows:8192/selectivity_percent:(1|10|50|100)/projection_columns:2/manual_time$' \
+  --benchmark_repetitions=11 --benchmark_min_time=0.03s \
+  --benchmark_report_aggregates_only=true --benchmark_format=json
+```
