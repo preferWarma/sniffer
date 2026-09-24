@@ -230,3 +230,15 @@ scan CV 分别为 2.12%/2.20%。对齐 case 是 Sniffer 的 batch 边界诊断�
   --benchmark_repetitions=11 --benchmark_min_time=0.03s \
   --benchmark_report_aggregates_only=true --benchmark_format=json
 ```
+
+### 输出数组与 batch 的重复深度校验
+
+2026-09-25，Apple M4 / Release / 单线程 / warm-cache；100,000 行、Row Group 8,192、
+100% 选择率，投影 `id,group,value`，其中 `group` 为 string。解码/选择器各自确保
+输出数组通过 `ValidateFull()` 后，输出 `RecordBatch` 只做结构校验 `Validate()`；
+与原先 batch 再次逐列深度校验相比，11 次重复 P50 的 batch materialization
+约 0.291 → 0.058 ms，scan 约 2.763 → 2.605 ms，第二轮 2.633 ms。
+相同文件均为 675,943 字节。两列数值投影没有确认收益，不外推到其他分布。
+
+同一三列场景修改前的 chunk I/O P50 为 0.127 ms，decode 为 1.799 ms，
+scan 为 2.798 ms。相邻 chunk 合并读取的 warm-cache 上界较低，尚未测试 cold-cache。

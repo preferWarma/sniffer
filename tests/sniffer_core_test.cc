@@ -1788,6 +1788,14 @@ TEST(SnifferCoreTest, SchemaAndWriterStateValidation) {
   EXPECT_TRUE(!writer->Finish().ok()) << "second Finish must fail";
 }
 
+TEST(SnifferCoreTest, BatchStructuralValidationRejectsLengthMismatch) {
+  auto values = BuildArray<arrow::Int32Builder, int32_t>({1});
+  auto batch = arrow::RecordBatch::Make(
+      arrow::schema({arrow::field("value", arrow::int32(), false)}), 2, {values});
+  EXPECT_FALSE(batch->Validate().ok());
+  EXPECT_FALSE(batch->ValidateFull().ok());
+}
+
 TEST(SnifferCoreTest, IOPlanProjectionPredicatesLimitAndBatching) {
   const auto data = MakeScanBatch();
   TempFile file("scan_projection.seg");

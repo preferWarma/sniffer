@@ -176,6 +176,7 @@ arrow::Result<std::shared_ptr<arrow::Array>> DecodeFixed(uint64_t row_count,
   }
   std::shared_ptr<arrow::Array> result;
   ARROW_RETURN_NOT_OK(builder->Finish(&result));
+  ARROW_RETURN_NOT_OK(result->ValidateFull());
   return result;
 }
 
@@ -405,6 +406,7 @@ arrow::Result<std::shared_ptr<arrow::Array>> SelectPrimitiveValues(
   }
   std::shared_ptr<arrow::Array> result;
   ARROW_RETURN_NOT_OK(builder->Finish(&result));
+  ARROW_RETURN_NOT_OK(result->ValidateFull());
   return result;
 }
 
@@ -428,6 +430,7 @@ arrow::Result<std::shared_ptr<arrow::Array>> SelectBinaryValues(
   }
   std::shared_ptr<arrow::Array> result;
   ARROW_RETURN_NOT_OK(builder->Finish(&result));
+  ARROW_RETURN_NOT_OK(result->ValidateFull());
   return result;
 }
 
@@ -1421,7 +1424,9 @@ class ScanState {
         internal::NanosecondTimer timer(&metrics_->batch_materialization_nanoseconds);
         batch = arrow::RecordBatch::Make(output_schema_, static_cast<int64_t>(selected_rows),
                                          std::move(projected_columns));
-        ARROW_RETURN_NOT_OK(batch->ValidateFull());
+        // Each decoded/selected array passed ValidateFull(); only the batch's
+        // schema and column lengths remain to check here.
+        ARROW_RETURN_NOT_OK(batch->Validate());
       }
       return batch;
     }
