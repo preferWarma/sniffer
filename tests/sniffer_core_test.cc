@@ -3523,6 +3523,42 @@ TEST(SnifferCoreTest, DeterministicEncodingSelector) {
       << "selector chooses CompactPlain for high-cardinality strings";
 }
 
+TEST(SnifferCoreTest, VariableSelectorLowerBoundPreservesLateDuplicates) {
+  const sniffer::TableSchema schema{1, {{1, "text", arrow::utf8(), true, nullptr}}};
+  const auto arrow_schema = ValueOrThrow(schema.ToArrowSchema(), "selector lower-bound schema");
+  sniffer::LayoutPolicy layout;
+  layout.target_row_group_rows = 1024;
+  layout.encoding_sample_rows = 1024;
+  for (const int64_t distinct_count : {255, 257, 800, 900}) {
+    std::vector<std::optional<std::string>> values;
+    values.reserve(1024);
+    for (int64_t row = 0; row < distinct_count; ++row) {
+      std::string value = "unique-" + std::to_string(row);
+      value.resize(24, '-');
+      values.push_back(std::move(value));
+    }
+    for (int64_t row = distinct_count; row < 1024; ++row) {
+      values.push_back(row % 17 == 0 ? std::nullopt
+                                     : values[static_cast<size_t>(row % distinct_count)]);
+    }
+    const auto array = BuildStringArray(values);
+    const uint16_t expected = distinct_count == 900 ? sniffer::internal::kCompactPlainEncodingId
+                                                    : sniffer::internal::kDictionaryEncodingId;
+    EXPECT_EQ(ValueOrThrow(sniffer::internal::SelectEncoding(schema.fields.front(), *array, layout),
+                           "select variable lower-bound case"),
+              expected);
+    const auto batch = arrow::RecordBatch::Make(arrow_schema, 1024, {array});
+    TempFile file("selector_lower_bound_" + std::to_string(distinct_count) + ".seg");
+    WriteSegmentWithPolicy(file.path(), schema, {batch}, layout);
+    EXPECT_EQ(FirstChunkEncoding(file.path(), 17), expected);
+    auto reader = ValueOrThrow(sniffer::SegmentReader::Open(file.path().string()),
+                               "open variable lower-bound segment");
+    const auto actual = ValueOrThrow(reader->ReadAll(), "read variable lower-bound segment");
+    ASSERT_EQ(actual.size(), 1U);
+    EXPECT_TRUE(actual.front()->Equals(*batch));
+  }
+}
+
 TEST(SnifferCoreTest, CompactPlainSegmentScanAndLegacyPlainCompatibility) {
   const sniffer::TableSchema schema{
       1, {{1, "id", arrow::int64(), false, nullptr}, {2, "text", arrow::utf8(), true, nullptr}}};

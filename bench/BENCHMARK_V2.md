@@ -458,3 +458,37 @@ Sniffer scan P50（ms），每轮 11 次重复、至少 0.05 秒。改前逐 Row
   --benchmark_repetitions=11 --benchmark_min_time=0.05s \
   --benchmark_report_aggregates_only=true --benchmark_format=json
 ```
+
+### 变长列字典选择的下界提前终止
+
+2026-09-25，Apple M4、Arrow C++ 23.0.1、Apple Clang 21、Release、单线程、
+warm-cache；100,000 行、Row Group 4,096、每组最多采样 1,024 行；压缩写入不涉及
+查询选择率。高基数字符串为确定性的 24 字节值，低基数字符串有 32 种值。
+每 case 11 次、最短 0.03 秒，下表为完整写入与内部编码选择计时的 P50（ms）；
+基线为提交 `cfaae72`，改后两轮独立测量。`encoding_selection_ms` 是可选 writer
+指标，包含采样大小估算及候选编码判断，不含最终编码、索引和文件写入。
+这三次运行复用了先前配置的构建目录，输出中的 `source_revision` 构建常量
+仍显示旧值 `c2b96f7-dirty`；实际源码版本以本段的 baseline/改后说明为准。
+
+| 数据 | 指标 | 基线 | 改后第 1 轮 | 改后第 2 轮 | 文件字节 |
+|---|---|---:|---:|---:|---:|
+| 高基数字符串 | 编码选择 | 0.947 | 0.816 | 0.820 | 2,803,815 |
+| 高基数字符串 | 完整写入 | 4.030 | 3.847 | 3.955 | 2,803,815 |
+| 低基数字符串 | 编码选择 | 0.267 | 0.274 | 0.284 | 117,044 |
+| 低基数字符串 | 完整写入 | 1.307 | 1.317 | 1.370 | 117,044 |
+
+高基数字符串的选择阶段两轮约减少 13%–14%；完整写入约减少 2%–5%，
+但第二轮写入 CV 达 13%，因此只将选择阶段视为较可信的收益。低基数
+选择阶段略增，需继续关注；它仍选 Dictionary，高基数仍选 CompactPlain，
+两种分布的文件字节不变。优化只在已见不同值的最小字典开销超过当前候选
+时终止，255/257/800/900 个不同值加后续重复/null 值均有选择器与文件
+round-trip 测试；没有用估计基数替代精确选择。
+
+复现：
+
+```sh
+./build-release/sniffer_core_compression_benchmark \
+  '--benchmark_filter=^Compression/(high_cardinality_string|low_cardinality_string)_Sniffer/manual_time$' \
+  --benchmark_repetitions=11 --benchmark_min_time=0.03s \
+  --benchmark_report_aggregates_only=true --benchmark_format=csv
+```

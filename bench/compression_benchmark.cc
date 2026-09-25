@@ -296,6 +296,8 @@ void RunCompressionBenchmark(benchmark::State& state, const Scenario& scenario, 
     file_bytes = result->file_bytes;
     encode_total += result->encode_write_milliseconds;
     decode_total += result->decode_read_milliseconds;
+    encoding_totals.encoding_selection_nanoseconds +=
+        result->writer_metrics.encoding_selection_nanoseconds;
     encoding_totals.adaptive_plain_chunks += result->writer_metrics.adaptive_plain_chunks;
     encoding_totals.adaptive_nonplain_chunks += result->writer_metrics.adaptive_nonplain_chunks;
     encoding_totals.adaptive_size_fallback_chunks +=
@@ -328,6 +330,8 @@ void RunCompressionBenchmark(benchmark::State& state, const Scenario& scenario, 
       static_cast<double>(file_bytes) / static_cast<double>(scenario.batch->num_rows());
   if (format == Format::kSniffer || format == Format::kSnifferPlain ||
       format == Format::kSnifferCompact) {
+    state.counters["encoding_selection_ms"] =
+        static_cast<double>(encoding_totals.encoding_selection_nanoseconds) / iterations / 1e6;
     state.counters["adaptive_plain_chunks"] =
         static_cast<double>(encoding_totals.adaptive_plain_chunks) / iterations;
     state.counters["adaptive_nonplain_chunks"] =

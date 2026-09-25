@@ -1163,6 +1163,10 @@ arrow::Result<uint16_t> SelectEncoding(const FieldSpec& field, const arrow::Arra
     return best_id;
   }
 
+  const uint64_t validity_size =
+      sample_has_nulls
+          ? static_cast<uint64_t>(sample_rows) / 8U + (static_cast<uint64_t>(sample_rows) % 8U != 0)
+          : 0;
   uint64_t dictionary_values_size = 0;
   uint64_t dictionary_count = 0;
   uint64_t runs = 0;
@@ -1176,11 +1180,41 @@ arrow::Result<uint16_t> SelectEncoding(const FieldSpec& field, const arrow::Arra
     std::unordered_set<std::string_view> distinct;
     std::string_view previous;
     const auto& binary = static_cast<const arrow::BinaryArray&>(array);
+    // Dictionary's 48-byte header, validity, initial offset, and index vector
+    // are unavoidable. Each distinct value adds its bytes and one u64 offset.
+    // Once that lower bound exceeds the current winner, later duplicates cannot
+    // make Dictionary competitive, so avoid hashing the remaining sample.
+    const uint64_t budget = best_id == kPlainEncodingId ? threshold : best_size;
+    const auto dictionary_cannot_win = [&](uint64_t count) {
+      uint64_t remaining = budget;
+      if (48U > remaining) {
+        return true;
+      }
+      remaining -= 48U;
+      if (validity_size > remaining) {
+        return true;
+      }
+      remaining -= validity_size;
+      if (dictionary_values_size > remaining) {
+        return true;
+      }
+      remaining -= dictionary_values_size;
+      if (count + 1U > remaining / 8U) {
+        return true;
+      }
+      remaining -= (count + 1U) * 8U;
+      return static_cast<uint64_t>(sample_rows) > remaining / IndexWidth(count);
+    };
     for (int64_t row = 0; row < sample_rows; ++row) {
       const bool valid = binary.IsValid(row);
       const std::string_view value = valid ? binary.GetView(row) : std::string_view{};
       if (valid && distinct.insert(value).second) {
         dictionary_values_size += static_cast<uint64_t>(value.size());
+        // Check in small batches; tiny dictionaries avoid extra cost entirely.
+        if (distinct.size() >= 64U && distinct.size() % 16U == 0U &&
+            dictionary_cannot_win(distinct.size())) {
+          return best_id;
+        }
       }
       if (first || valid != previous_valid || (valid && value != previous)) {
         ++runs;
@@ -1241,10 +1275,6 @@ arrow::Result<uint16_t> SelectEncoding(const FieldSpec& field, const arrow::Arra
     }
     dictionary_count = static_cast<uint64_t>(distinct.size());
   }
-  const uint64_t validity_size =
-      sample_has_nulls
-          ? static_cast<uint64_t>(sample_rows) / 8U + (static_cast<uint64_t>(sample_rows) % 8U != 0)
-          : 0;
   if (supports_dictionary) {
     uint64_t dictionary_size = 48U + validity_size + dictionary_values_size +
                                static_cast<uint64_t>(sample_rows) * IndexWidth(dictionary_count);

@@ -176,6 +176,8 @@ SIMD、多级编码链和新压缩算法只有在标量路径完成剖析和优�
 
 - [ ] 让选择器同时估算最终 payload 大小、编码 CPU 成本和预期解码成本，而不是仅按样本大小阈值
       决策；模型必须确定、可解释、可测试。
+  - [x] 对变长列字典候选用已见不同值计算严格大小下界，确定无胜出可能时提前结束采样；
+        保留原选择阈值和相同的最终 encoding ID。
 - [x] 对所有自适应非 Plain 编码加入实际 payload 不小于 Plain 则回退的保护；显式强制编码
       不受影响，复现采样偏斜时 RLE 膨胀并验证确定性、round-trip 和格式 ID。
 - [ ] 记录编码选择/回退原因供 benchmark 观测，并评估超过“恰好不比 Plain 大”的收益阈值。
@@ -1184,3 +1186,15 @@ CV 为 0.46%。Dictionary payload 仍为 113,058 字节，完整 Segment 仍为 
 - 切片、nullable、空值、随机 binary、selected decode、错误 offset、截断、
   checksum、未知 descriptor/版本和旧 Plain 兼容均有测试。并发及 cold-cache
   等 v0.2 验收项仍未完成。
+
+### 2026-09-25：变长列字典候选的安全提前终止
+
+- 对 string/binary 样本，已见不同值的字节数、offset 数、validity 和最终样本
+  索引向量提供单调不减的字典编码大小下界。每新增 16 个不同值检查一次；
+  下界超过当前候选时才跳过剩余样本，低基数候选继续完整采样，编码决策
+  与原规则一致。压缩 benchmark 增加 `encoding_selection_ms` 观测指标。
+- Apple M4 / Release、100,000 行、Row Group 4,096、高基数 24 字节字符串、
+  11 次 P50：编码选择 0.947 → 0.816/0.820 ms；完整写入 4.030 →
+  3.847/3.955 ms，第二轮写入波动较大。低基数选择阶段 0.267 →
+  0.274/0.284 ms，不能宣称该场景获益。文件字节和选择的 encoding ID
+  都不变；明细见 [`bench/BENCHMARK_V2.md`](../bench/BENCHMARK_V2.md)。
