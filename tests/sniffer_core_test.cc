@@ -959,8 +959,28 @@ TEST(SnifferCoreTest, PlainVariableBulkCopyMatchesReference) {
       const auto slice = strings->Slice(start, length);
       const auto payload = ValueOrThrow(sniffer::internal::EncodePlain(string_field, *slice),
                                         "encode sliced Plain string");
+      EXPECT_EQ(payload, ValueOrThrow(ReferenceEncodePlainVariable(*slice),
+                                      "reference sliced Plain string"));
       EXPECT_EQ(ValueOrThrow(sniffer::internal::PlainEncodedSize(string_field, *slice),
                              "measure sliced Plain string"),
+                payload.size());
+    }
+  }
+
+  const auto nonnull_binary = BuildBinaryArray(
+      {std::vector<uint8_t>{0xFF}, std::vector<uint8_t>{0, 1, 0}, std::vector<uint8_t>{},
+       std::vector<uint8_t>{42, 0xFF}, std::vector<uint8_t>{}});
+  const sniffer::FieldSpec nonnull_binary_field{3, "raw", arrow::binary(), false, nullptr};
+  for (int64_t start = 0; start <= nonnull_binary->length(); ++start) {
+    for (int64_t length = 0; length <= nonnull_binary->length() - start; ++length) {
+      const auto slice = nonnull_binary->Slice(start, length);
+      const auto payload =
+          ValueOrThrow(sniffer::internal::EncodePlain(nonnull_binary_field, *slice),
+                       "encode sliced non-null Plain binary");
+      EXPECT_EQ(payload, ValueOrThrow(ReferenceEncodePlainVariable(*slice),
+                                      "reference sliced non-null Plain binary"));
+      EXPECT_EQ(ValueOrThrow(sniffer::internal::PlainEncodedSize(nonnull_binary_field, *slice),
+                             "measure sliced non-null Plain binary"),
                 payload.size());
     }
   }
@@ -987,6 +1007,144 @@ TEST(SnifferCoreTest, PlainVariableBulkCopyMatchesReference) {
                 payload.size());
     }
   }
+}
+
+TEST(SnifferCoreTest, CompactPlainVariableOffsetsRoundTripAndCorruption) {
+  const sniffer::FieldSpec string_field{1, "text", arrow::utf8(), false, nullptr};
+  const auto strings = BuildStringArray({"discard", "alpha", "", "gamma", "tail"});
+  const auto string_slice = strings->Slice(1, 3);
+  const auto plain = ValueOrThrow(sniffer::internal::EncodePlain(string_field, *string_slice),
+                                  "encode Plain string reference");
+  const auto compact =
+      ValueOrThrow(sniffer::internal::EncodeCompactPlain(string_field, *string_slice),
+                   "encode sliced CompactPlain string");
+  ASSERT_EQ(compact.size() + 4U * static_cast<size_t>(string_slice->length() + 1), plain.size());
+  sniffer::internal::ByteReader payload_reader(compact);
+  EXPECT_EQ(ValueOrThrow(payload_reader.ReadU64(), "read compact validity length"), 0U);
+  EXPECT_EQ(ValueOrThrow(payload_reader.ReadU64(), "read compact offsets length"), 16U);
+  EXPECT_EQ(ValueOrThrow(payload_reader.ReadU64(), "read compact values length"), 10U);
+
+  sniffer::internal::ColumnChunkMeta chunk;
+  chunk.field_id = 1;
+  chunk.physical_type = sniffer::internal::PhysicalTypeId::kString;
+  chunk.encoding_id = sniffer::internal::kCompactPlainEncodingId;
+  chunk.row_count = 3;
+  chunk.null_count = 0;
+  chunk.length = compact.size();
+  chunk.uncompressed_length = plain.size();
+  const auto decoded =
+      ValueOrThrow(sniffer::internal::DecodeCompactPlain(string_field, chunk, compact),
+                   "decode sliced CompactPlain string");
+  EXPECT_TRUE(decoded->Equals(string_slice));
+  const std::vector<uint64_t> selection{0, 2};
+  const auto selected = ValueOrThrow(
+      sniffer::internal::DecodeCompactPlainSelected(string_field, chunk, compact, selection),
+      "selected CompactPlain string decode");
+  EXPECT_TRUE(selected->Equals(BuildStringArray({"alpha", "gamma"})));
+
+  auto malformed = compact;
+  malformed[28] = 0xFFU;  // The first nonzero offset exceeds values_length.
+  EXPECT_FALSE(sniffer::internal::DecodeCompactPlain(string_field, chunk, malformed).ok());
+  EXPECT_FALSE(
+      sniffer::internal::DecodeCompactPlainSelected(string_field, chunk, malformed, selection)
+          .ok());
+  malformed = compact;
+  malformed[24] = 1U;  // Non-normalized first offset.
+  EXPECT_FALSE(sniffer::internal::DecodeCompactPlain(string_field, chunk, malformed).ok());
+  malformed = compact;
+  malformed[8] = 0xFFU;  // Offset length no longer matches the payload.
+  EXPECT_FALSE(sniffer::internal::DecodeCompactPlain(string_field, chunk, malformed).ok());
+  malformed = compact;
+  malformed.pop_back();
+  EXPECT_FALSE(sniffer::internal::DecodeCompactPlain(string_field, chunk, malformed).ok());
+  EXPECT_FALSE(sniffer::internal::DecodeCompactPlainSelected(string_field, chunk, compact,
+                                                             std::vector<uint64_t>{2, 1})
+                   .ok());
+
+  const sniffer::FieldSpec binary_field{2, "bytes", arrow::binary(), true, nullptr};
+  const auto binary = BuildBinaryArray({std::vector<uint8_t>{0x99}, std::vector<uint8_t>{0, 1},
+                                        std::nullopt, std::vector<uint8_t>{},
+                                        std::vector<uint8_t>{0xFF, 0}, std::vector<uint8_t>{0x77}});
+  const auto binary_slice = binary->Slice(1, 4);
+  const auto binary_compact =
+      ValueOrThrow(sniffer::internal::EncodeCompactPlain(binary_field, *binary_slice),
+                   "encode nullable sliced CompactPlain binary");
+  chunk.field_id = 2;
+  chunk.physical_type = sniffer::internal::PhysicalTypeId::kBinary;
+  chunk.row_count = 4;
+  chunk.null_count = 1;
+  chunk.length = binary_compact.size();
+  const auto binary_decoded =
+      ValueOrThrow(sniffer::internal::DecodeCompactPlain(binary_field, chunk, binary_compact),
+                   "decode nullable sliced CompactPlain binary");
+  EXPECT_TRUE(binary_decoded->Equals(binary_slice));
+  const auto binary_selected =
+      ValueOrThrow(sniffer::internal::DecodeCompactPlainSelected(
+                       binary_field, chunk, binary_compact, std::vector<uint64_t>{0, 1, 3}),
+                   "selected nullable CompactPlain binary decode");
+  EXPECT_TRUE(binary_selected->Equals(
+      BuildBinaryArray({std::vector<uint8_t>{0, 1}, std::nullopt, std::vector<uint8_t>{0xFF, 0}})));
+  malformed = binary_compact;
+  malformed[33] = 3U;  // Null row consumes a byte but offsets remain monotonic.
+  malformed[37] = 3U;
+  EXPECT_FALSE(sniffer::internal::DecodeCompactPlain(binary_field, chunk, malformed).ok());
+  EXPECT_FALSE(sniffer::internal::DecodeCompactPlainSelected(binary_field, chunk, malformed,
+                                                             std::vector<uint64_t>{0, 1, 3})
+                   .ok());
+
+  std::mt19937_64 random(0xC04A67ULL);
+  for (int64_t iteration = 0; iteration < 32; ++iteration) {
+    std::vector<std::optional<std::vector<uint8_t>>> source_values;
+    for (int64_t row = 0; row < 25; ++row) {
+      if ((row + iteration) % 7 == 0) {
+        source_values.push_back(std::nullopt);
+      } else {
+        std::vector<uint8_t> value(static_cast<size_t>((row * 11 + iteration) % 17));
+        for (auto& byte : value) {
+          byte = static_cast<uint8_t>(random());
+        }
+        source_values.emplace_back(std::move(value));
+      }
+    }
+    const auto source = BuildBinaryArray(source_values);
+    const int64_t start = iteration % 5;
+    const int64_t length = iteration % (26 - start);
+    const auto slice = source->Slice(start, length);
+    const auto bytes = ValueOrThrow(sniffer::internal::EncodeCompactPlain(binary_field, *slice),
+                                    "encode randomized CompactPlain binary");
+    const auto legacy_bytes = ValueOrThrow(sniffer::internal::EncodePlain(binary_field, *slice),
+                                           "encode randomized legacy Plain binary");
+    EXPECT_EQ(bytes.size() + 4U * static_cast<size_t>(length + 1), legacy_bytes.size());
+    chunk.row_count = static_cast<uint64_t>(length);
+    chunk.null_count = static_cast<uint64_t>(slice->null_count());
+    const auto actual =
+        ValueOrThrow(sniffer::internal::DecodeCompactPlain(binary_field, chunk, bytes),
+                     "decode randomized CompactPlain binary");
+    EXPECT_TRUE(actual->Equals(slice));
+    std::vector<uint64_t> selected_rows;
+    std::vector<std::optional<std::vector<uint8_t>>> expected_values;
+    for (int64_t row = 0; row < length; row += 3) {
+      selected_rows.push_back(static_cast<uint64_t>(row));
+      expected_values.push_back(source_values[static_cast<size_t>(start + row)]);
+    }
+    const auto selected_actual = ValueOrThrow(
+        sniffer::internal::DecodeCompactPlainSelected(binary_field, chunk, bytes, selected_rows),
+        "decode selected randomized CompactPlain binary");
+    EXPECT_TRUE(selected_actual->Equals(BuildBinaryArray(expected_values)));
+  }
+
+  const auto empty = strings->Slice(0, 0);
+  const auto empty_compact = ValueOrThrow(
+      sniffer::internal::EncodeCompactPlain(string_field, *empty), "encode empty CompactPlain");
+  chunk.field_id = 1;
+  chunk.physical_type = sniffer::internal::PhysicalTypeId::kString;
+  chunk.row_count = 0;
+  chunk.null_count = 0;
+  EXPECT_EQ(empty_compact.size(), 28U);
+  EXPECT_TRUE(
+      ValueOrThrow(sniffer::internal::DecodeCompactPlain(string_field, chunk, empty_compact),
+                   "decode empty CompactPlain")
+          ->Equals(empty));
 }
 
 TEST(SnifferCoreTest, EncodingSampleNullsMatchDetachedSlices) {
@@ -1522,21 +1680,15 @@ uint64_t ReadU64(const std::vector<uint8_t>& bytes, size_t offset) {
   return value;
 }
 
-uint16_t ReadU16(const std::vector<uint8_t>& bytes, size_t offset) {
-  return static_cast<uint16_t>(bytes[offset]) |
-         static_cast<uint16_t>(static_cast<uint16_t>(bytes[offset + 1]) << 8U);
-}
-
-uint16_t FirstChunkEncoding(const std::filesystem::path& path, size_t schema_descriptor_bytes) {
+uint16_t FirstChunkEncoding(const std::filesystem::path& path, size_t /*schema_descriptor_bytes*/) {
   const auto bytes = ReadFile(path);
   const size_t trailer_offset = bytes.size() - 40;
   const size_t footer_offset = static_cast<size_t>(ReadU64(bytes, trailer_offset + 8));
-  constexpr size_t kPrefix = 24;
-  constexpr size_t kEncodingDescriptors = 61;
-  constexpr size_t kRowGroupHeader = 16;
-  const size_t chunk_entry =
-      footer_offset + kPrefix + schema_descriptor_bytes + kEncodingDescriptors + kRowGroupHeader;
-  return ReadU16(bytes, chunk_entry + 6);
+  const size_t footer_length = static_cast<size_t>(ReadU64(bytes, trailer_offset + 16));
+  const auto footer = ValueOrThrow(sniffer::internal::ParseFooter(std::span<const uint8_t>(
+                                       bytes.data() + footer_offset, footer_length)),
+                                   "parse first chunk encoding footer");
+  return footer.row_groups.front().chunks.front().encoding_id;
 }
 
 void WriteU16(std::vector<uint8_t>* bytes, size_t offset, uint16_t value) {
@@ -2057,10 +2209,187 @@ TEST(SnifferCoreTest, WholeRowGroupScanPreservesBatchingAndPartialLimit) {
   EXPECT_EQ(empty_metrics->column_chunks_read, 0U);
 }
 
+TEST(SnifferCoreTest, ContiguousPredicateProjectionUsesArrowSlice) {
+  const auto data = MakeScanBatch();
+  auto policy = ScanLayout();
+  policy.target_row_group_rows = 30;
+  TempFile file("contiguous_predicate_projection.seg");
+  WriteSegmentWithPolicy(file.path(), data.table_schema, {data.batch}, policy);
+  auto reader = ValueOrThrow(sniffer::SegmentReader::Open(file.path().string()),
+                             "open contiguous selection segment");
+  sniffer::IOPlan plan;
+  plan.projection_field_ids = {1};
+  plan.conjunctive_predicates = {
+      {1, sniffer::Predicate::Op::kGe, std::make_shared<arrow::Int64Scalar>(10)},
+      {1, sniffer::Predicate::Op::kLt, std::make_shared<arrow::Int64Scalar>(22)}};
+  plan.output_batch_rows = 5;
+  const auto batches =
+      CollectScan(ValueOrThrow(reader->Scan(plan), "scan contiguous predicate rows"));
+  ASSERT_EQ(batches.size(), 3U);
+  const std::vector<int64_t> expected_rows = {5, 5, 2};
+  int64_t source_offset = 10;
+  for (size_t index = 0; index < batches.size(); ++index) {
+    EXPECT_EQ(batches[index]->num_rows(), expected_rows[index]);
+    EXPECT_TRUE(batches[index]->column(0)->Equals(
+        data.batch->column(0)->Slice(source_offset, expected_rows[index])));
+    EXPECT_EQ(batches[index]->column(0)->offset(), source_offset)
+        << "contiguous predicate output retains the decoded Arrow buffer";
+    source_offset += expected_rows[index];
+  }
+}
+
+TEST(SnifferCoreTest, PlainSelectionScanPreservesRowsNullsAndLimit) {
+  constexpr uint64_t kRows = 8192;
+  constexpr uint64_t kRowGroupRows = 4096;
+  const sniffer::TableSchema schema{1,
+                                    {{1, "match", arrow::boolean(), false, nullptr},
+                                     {2, "value", arrow::int64(), true, nullptr}}};
+  auto arrow_schema = ValueOrThrow(schema.ToArrowSchema(), "make bitmap scan schema");
+  for (const uint64_t percent : {uint64_t{1}, uint64_t{10}, uint64_t{50}, uint64_t{100}}) {
+    for (const bool clustered : {false, true}) {
+      std::vector<std::optional<bool>> filter_values;
+      std::vector<std::optional<int64_t>> source_values;
+      std::vector<std::optional<int64_t>> expected_values;
+      filter_values.reserve(kRows);
+      source_values.reserve(kRows);
+      for (uint64_t row = 0; row < kRows; ++row) {
+        const bool matched =
+            clustered ? row < kRows * percent / 100U : (row * 37U + 19U) % 100U < percent;
+        const std::optional<int64_t> value =
+            row % 17U == 0 ? std::nullopt : std::optional<int64_t>(static_cast<int64_t>(row * 3U));
+        filter_values.emplace_back(matched);
+        source_values.push_back(value);
+        if (matched) {
+          expected_values.push_back(value);
+        }
+      }
+      auto batch =
+          arrow::RecordBatch::Make(arrow_schema, static_cast<int64_t>(kRows),
+                                   {BuildArray<arrow::BooleanBuilder, bool>(filter_values),
+                                    BuildArray<arrow::Int64Builder, int64_t>(source_values)});
+      sniffer::LayoutPolicy policy;
+      policy.target_row_group_rows = static_cast<uint32_t>(kRowGroupRows);
+      policy.field_encodings = {{1, sniffer::EncodingKind::kPlain},
+                                {2, sniffer::EncodingKind::kPlain}};
+      TempFile file("adaptive_bitmap_scan.seg");
+      WriteSegmentWithPolicy(file.path(), schema, {batch}, policy);
+      auto reader = ValueOrThrow(sniffer::SegmentReader::Open(file.path().string()),
+                                 "open adaptive bitmap scan");
+      for (const std::optional<uint64_t> limit :
+           std::array<std::optional<uint64_t>, 2>{std::nullopt, uint64_t{7}}) {
+        sniffer::IOPlan plan;
+        plan.projection_field_ids = {2};
+        plan.conjunctive_predicates = {
+            {1, sniffer::Predicate::Op::kEq, std::make_shared<arrow::BooleanScalar>(true)}};
+        plan.output_batch_rows = 1000;
+        plan.limit = limit;
+        auto metrics = std::make_shared<sniffer::ScanMetrics>();
+        auto batches = CollectScan(
+            ValueOrThrow(reader->Scan(plan, metrics), "scan adaptive bitmap selection"));
+        std::vector<std::shared_ptr<arrow::Array>> chunks;
+        for (const auto& output : batches) {
+          chunks.push_back(output->column(0));
+        }
+        ASSERT_FALSE(chunks.empty());
+        auto actual = ValueOrThrow(arrow::Concatenate(chunks), "concatenate bitmap scan output");
+        const size_t expected_count =
+            limit ? std::min<size_t>(expected_values.size(), static_cast<size_t>(*limit))
+                  : expected_values.size();
+        const auto expected =
+            BuildArray<arrow::Int64Builder, int64_t>(std::vector<std::optional<int64_t>>(
+                expected_values.begin(),
+                expected_values.begin() + static_cast<std::ptrdiff_t>(expected_count)));
+        EXPECT_TRUE(actual->Equals(expected)) << "percent=" << percent << " clustered=" << clustered
+                                              << " limit=" << limit.has_value();
+        const uint64_t expected_indices =
+            limit ? *limit
+                  : (percent == 100 || (clustered && percent == 50)
+                         ? 0U
+                         : static_cast<uint64_t>(expected_values.size()));
+        EXPECT_EQ(metrics->selection_indices_materialized, expected_indices)
+            << "percent=" << percent << " clustered=" << clustered
+            << " limit=" << limit.has_value();
+      }
+    }
+  }
+}
+
+TEST(SnifferCoreTest, NonPlainAndSharedProjectionUseIndexSelection) {
+  constexpr uint64_t kRows = 8192;
+  std::vector<std::optional<bool>> filter_values;
+  std::vector<std::optional<int64_t>> source_values;
+  std::vector<std::optional<int64_t>> selected_values;
+  filter_values.reserve(kRows);
+  source_values.reserve(kRows);
+  for (uint64_t row = 0; row < kRows; ++row) {
+    const bool matched = (row * 37U + 19U) % 100U < 50U;
+    filter_values.emplace_back(matched);
+    const std::optional<int64_t> value =
+        row % 17U == 0 ? std::nullopt : std::optional<int64_t>(static_cast<int64_t>(row * 3U));
+    source_values.push_back(value);
+    if (matched) {
+      selected_values.push_back(value);
+    }
+  }
+  const sniffer::TableSchema schema{1,
+                                    {{1, "match", arrow::boolean(), false, nullptr},
+                                     {2, "value", arrow::int64(), true, nullptr}}};
+  auto arrow_schema = ValueOrThrow(schema.ToArrowSchema(), "make non-Plain fallback schema");
+  auto batch = arrow::RecordBatch::Make(arrow_schema, static_cast<int64_t>(kRows),
+                                        {BuildArray<arrow::BooleanBuilder, bool>(filter_values),
+                                         BuildArray<arrow::Int64Builder, int64_t>(source_values)});
+  sniffer::LayoutPolicy policy;
+  policy.target_row_group_rows = 4096;
+  policy.field_encodings = {{1, sniffer::EncodingKind::kPlain},
+                            {2, sniffer::EncodingKind::kForBitpack}};
+  TempFile file("adaptive_bitmap_non_plain_fallback.seg");
+  WriteSegmentWithPolicy(file.path(), schema, {batch}, policy);
+  auto reader = ValueOrThrow(sniffer::SegmentReader::Open(file.path().string()),
+                             "open non-Plain bitmap fallback");
+  sniffer::IOPlan plan;
+  plan.projection_field_ids = {2};
+  plan.conjunctive_predicates = {
+      {1, sniffer::Predicate::Op::kEq, std::make_shared<arrow::BooleanScalar>(true)}};
+  plan.output_batch_rows = 4096;
+  auto metrics = std::make_shared<sniffer::ScanMetrics>();
+  const auto batches =
+      CollectScan(ValueOrThrow(reader->Scan(plan, metrics), "scan non-Plain bitmap fallback"));
+  std::vector<std::shared_ptr<arrow::Array>> chunks;
+  for (const auto& output : batches) {
+    chunks.push_back(output->column(0));
+  }
+  ASSERT_FALSE(chunks.empty());
+  const auto actual = ValueOrThrow(arrow::Concatenate(chunks), "concatenate fallback output");
+  const auto expected = BuildArray<arrow::Int64Builder, int64_t>(selected_values);
+  EXPECT_TRUE(actual->Equals(expected));
+  EXPECT_EQ(metrics->selection_indices_materialized, selected_values.size());
+
+  plan.projection_field_ids = {1};
+  metrics = std::make_shared<sniffer::ScanMetrics>();
+  const auto shared_batches = CollectScan(
+      ValueOrThrow(reader->Scan(plan, metrics), "scan shared predicate projection fallback"));
+  uint64_t shared_rows = 0;
+  for (const auto& output : shared_batches) {
+    shared_rows += static_cast<uint64_t>(output->num_rows());
+    const auto& selected = static_cast<const arrow::BooleanArray&>(*output->column(0));
+    for (int64_t row = 0; row < selected.length(); ++row) {
+      EXPECT_TRUE(selected.Value(row));
+    }
+  }
+  EXPECT_EQ(shared_rows, selected_values.size());
+  EXPECT_EQ(metrics->selection_indices_materialized, selected_values.size());
+  EXPECT_EQ(metrics->projection_chunks_decoded, 0U);
+}
+
 TEST(SnifferCoreTest, WholeRowGroupScanRejectsOversizedRowCount) {
   const auto data = MakeScanBatch();
   TempFile file("oversized_whole_row_group.seg");
-  WriteSegmentWithPolicy(file.path(), data.table_schema, {data.batch}, ScanLayout());
+  auto policy = ScanLayout();
+  policy.field_encodings = {{1, sniffer::EncodingKind::kPlain},
+                            {2, sniffer::EncodingKind::kPlain},
+                            {3, sniffer::EncodingKind::kPlain},
+                            {4, sniffer::EncodingKind::kPlain}};
+  WriteSegmentWithPolicy(file.path(), data.table_schema, {data.batch}, policy);
   auto bytes = ReadFile(file.path());
   const size_t trailer_offset = bytes.size() - 40;
   const size_t footer_offset = static_cast<size_t>(ReadU64(bytes, trailer_offset + 8));
@@ -2250,6 +2579,48 @@ TEST(SnifferCoreTest, PredicateExecutionOrderIsDeterministic) {
       CollectScan(ValueOrThrow(reader->Scan(plan, metrics), "repeat deterministic predicate scan"));
   EXPECT_TRUE(CollectInt64Column(repeated, 1) == std::vector<int64_t>({8, 10}))
       << "predicate planning is deterministic across scans";
+}
+
+TEST(SnifferCoreTest, FilterSlotsSharePredicateSortKeyAndProjectionColumns) {
+  const auto data = MakeScanBatch();
+  TempFile file("shared_filter_slots.seg");
+  WriteSegmentWithPolicy(file.path(), data.table_schema, {data.batch}, ScanLayout());
+  auto reader = ValueOrThrow(sniffer::SegmentReader::Open(file.path().string()),
+                             "open shared filter slots segment");
+
+  sniffer::IOPlan plan;
+  plan.projection_field_ids = {4, 1};
+  plan.conjunctive_predicates = {
+      {1, sniffer::Predicate::Op::kGe, std::make_shared<arrow::Int64Scalar>(8)},
+      {2, sniffer::Predicate::Op::kEq, std::make_shared<arrow::StringScalar>("even")},
+      {1, sniffer::Predicate::Op::kLt, std::make_shared<arrow::Int64Scalar>(22)}};
+  sniffer::SortKeyRange range;
+  range.lower =
+      std::vector<std::shared_ptr<arrow::Scalar>>{std::make_shared<arrow::Int64Scalar>(10)};
+  range.upper =
+      std::vector<std::shared_ptr<arrow::Scalar>>{std::make_shared<arrow::Int64Scalar>(20)};
+  plan.sort_key_range = std::move(range);
+  plan.output_batch_rows = 2;
+
+  auto metrics = std::make_shared<sniffer::ScanMetrics>();
+  const auto batches =
+      CollectScan(ValueOrThrow(reader->Scan(plan, metrics), "scan shared filter slots"));
+  EXPECT_EQ(CollectInt64Column(batches, 1), (std::vector<int64_t>{10, 14, 16}));
+  ASSERT_EQ(batches.size(), 2U);
+  const auto& first_payload = static_cast<const arrow::BinaryArray&>(*batches[0]->column(0));
+  const auto& second_payload = static_cast<const arrow::BinaryArray&>(*batches[1]->column(0));
+  EXPECT_EQ(first_payload.GetView(0), "p10");
+  EXPECT_EQ(first_payload.GetView(1), "p14");
+  EXPECT_EQ(second_payload.GetView(0), "p16");
+  EXPECT_EQ(metrics->predicate_chunks_decoded, 4U)
+      << "duplicate predicates and sort key decode their shared field once per Row Group";
+  EXPECT_EQ(metrics->projection_chunks_decoded, 2U);
+  EXPECT_EQ(metrics->column_chunks_read, 6U);
+
+  plan.limit = 2;
+  const auto limited =
+      CollectScan(ValueOrThrow(reader->Scan(plan), "scan limited shared filter slots"));
+  EXPECT_EQ(CollectInt64Column(limited, 1), (std::vector<int64_t>{10, 14}));
 }
 
 TEST(SnifferCoreTest, BloomPrunesWithoutChunkReads) {
@@ -3145,11 +3516,134 @@ TEST(SnifferCoreTest, DeterministicEncodingSelector) {
       plain_file.path(), string_schema,
       {arrow::RecordBatch::Make(string_arrow_schema, 100, {BuildStringArray(unique_strings)})}, {},
       plain_metrics);
-  EXPECT_EQ(plain_metrics->adaptive_plain_chunks, 1U);
-  EXPECT_EQ(plain_metrics->adaptive_nonplain_chunks, 0U);
+  EXPECT_EQ(plain_metrics->adaptive_plain_chunks, 0U);
+  EXPECT_EQ(plain_metrics->adaptive_nonplain_chunks, 1U);
   EXPECT_TRUE(FirstChunkEncoding(plain_file.path(), 17) ==
-              static_cast<uint16_t>(sniffer::EncodingKind::kPlain))
-      << "selector retains Plain for high-cardinality strings";
+              static_cast<uint16_t>(sniffer::EncodingKind::kCompactPlain))
+      << "selector chooses CompactPlain for high-cardinality strings";
+}
+
+TEST(SnifferCoreTest, CompactPlainSegmentScanAndLegacyPlainCompatibility) {
+  const sniffer::TableSchema schema{
+      1, {{1, "id", arrow::int64(), false, nullptr}, {2, "text", arrow::utf8(), true, nullptr}}};
+  const auto arrow_schema = ValueOrThrow(schema.ToArrowSchema(), "compact segment schema");
+  const auto ids = BuildArray<arrow::Int64Builder, int64_t>({0, 1, 2, 3, 4, 5});
+  const auto texts = BuildStringArray({"alpha", "beta", std::nullopt, "delta", "beta", ""});
+  const auto batch = arrow::RecordBatch::Make(arrow_schema, 6, {ids, texts});
+  sniffer::LayoutPolicy invalid_layout;
+  invalid_layout.field_encodings = {{1, sniffer::EncodingKind::kCompactPlain}};
+  EXPECT_FALSE(invalid_layout.Validate(schema).ok());
+  EXPECT_FALSE(sniffer::internal::EncodeCompactPlain(schema.fields.front(), *ids).ok());
+  sniffer::LayoutPolicy layout;
+  layout.target_row_group_rows = 3;
+  layout.field_encodings = {{2, sniffer::EncodingKind::kCompactPlain}};
+  TempFile compact_file("compact_plain_segment.seg");
+  WriteSegmentWithPolicy(compact_file.path(), schema, {batch}, layout);
+  const auto compact_bytes = ReadFile(compact_file.path());
+  const size_t trailer = compact_bytes.size() - 40;
+  const size_t footer_offset = static_cast<size_t>(ReadU64(compact_bytes, trailer + 8));
+  const size_t footer_length = static_cast<size_t>(ReadU64(compact_bytes, trailer + 16));
+  const auto footer = ValueOrThrow(sniffer::internal::ParseFooter(std::span<const uint8_t>(
+                                       compact_bytes.data() + footer_offset, footer_length)),
+                                   "parse CompactPlain footer");
+  ASSERT_EQ(footer.row_groups.size(), 2U);
+  EXPECT_EQ(footer.encoding_ids.size(), 5U);
+  for (size_t index = 0; index < footer.row_groups.size(); ++index) {
+    const auto& chunk = footer.row_groups[index].chunks[1];
+    EXPECT_EQ(chunk.encoding_id, sniffer::internal::kCompactPlainEncodingId);
+    const auto plain =
+        ValueOrThrow(sniffer::internal::EncodePlain(
+                         schema.fields[1], *texts->Slice(static_cast<int64_t>(index * 3), 3)),
+                     "encode legacy Plain reference");
+    EXPECT_EQ(chunk.uncompressed_length, plain.size());
+    EXPECT_EQ(chunk.length + 4U * 4U, plain.size());
+  }
+  auto reader = ValueOrThrow(sniffer::SegmentReader::Open(compact_file.path().string()),
+                             "open CompactPlain segment");
+  const auto full = ValueOrThrow(reader->ReadAll(), "read CompactPlain segment");
+  ASSERT_EQ(full.size(), 2U);
+  EXPECT_TRUE(full[0]->Equals(*batch->Slice(0, 3)));
+  EXPECT_TRUE(full[1]->Equals(*batch->Slice(3, 3)));
+
+  sniffer::IOPlan plan;
+  plan.projection_field_ids = {1, 2};
+  plan.conjunctive_predicates = {
+      {2, sniffer::Predicate::Op::kEq, std::make_shared<arrow::StringScalar>("beta")}};
+  plan.output_batch_rows = 1;
+  auto metrics = std::make_shared<sniffer::ScanMetrics>();
+  const auto filtered =
+      CollectScan(ValueOrThrow(reader->Scan(plan, metrics), "filter CompactPlain segment"));
+  EXPECT_EQ(CollectInt64Column(filtered, 0), (std::vector<int64_t>{1, 4}));
+  EXPECT_EQ(metrics->predicate_chunks_decoded, 2U);
+  EXPECT_EQ(metrics->projection_chunks_decoded, 2U);
+  EXPECT_EQ(metrics->column_chunks_read, 4U);
+  plan.limit = 1;
+  EXPECT_EQ(CollectInt64Column(
+                CollectScan(ValueOrThrow(reader->Scan(plan), "limited CompactPlain scan")), 0),
+            (std::vector<int64_t>{1}));
+
+  const auto compact_footer_bytes =
+      std::span<const uint8_t>(compact_bytes.data() + footer_offset, footer_length);
+  auto mutated_footer =
+      std::vector<uint8_t>(compact_footer_bytes.begin(), compact_footer_bytes.end());
+  const std::string descriptor_name = "compact_plain";
+  const auto name_begin = std::search(mutated_footer.begin(), mutated_footer.end(),
+                                      descriptor_name.begin(), descriptor_name.end());
+  ASSERT_NE(name_begin, mutated_footer.end());
+  const size_t descriptor_offset =
+      static_cast<size_t>(std::distance(mutated_footer.begin(), name_begin)) - 8U;
+  WriteU16(&mutated_footer, descriptor_offset + 2, 2);
+  EXPECT_TRUE(!sniffer::internal::ParseFooter(mutated_footer).ok())
+      << "future CompactPlain descriptor versions fail explicitly";
+  WriteU16(&mutated_footer, descriptor_offset + 2, 1);
+  WriteU16(&mutated_footer, descriptor_offset, 999);
+  EXPECT_TRUE(!sniffer::internal::ParseFooter(mutated_footer).ok())
+      << "unknown encoding IDs fail explicitly";
+
+  TempFile damaged_file("compact_plain_bad_chunk_checksum.seg");
+  auto damaged_bytes = compact_bytes;
+  const auto& damaged_chunk = footer.row_groups.front().chunks[1];
+  ASSERT_LT(damaged_chunk.offset + 24U, damaged_bytes.size());
+  damaged_bytes[static_cast<size_t>(damaged_chunk.offset + 24U)] ^= 1U;
+  RefreshFooterChecksums(&damaged_bytes);  // Keep the outer file checksum valid.
+  WriteFile(damaged_file.path(), damaged_bytes);
+  auto damaged_reader = ValueOrThrow(sniffer::SegmentReader::Open(damaged_file.path().string()),
+                                     "open damaged CompactPlain chunk");
+  const auto damaged_read = damaged_reader->ReadAll();
+  EXPECT_TRUE(!damaged_read.ok() && damaged_read.status().ToString().find(
+                                        "[sniffer.format.checksum]") != std::string::npos);
+
+  TempFile bad_length_file("compact_plain_bad_reference_length.seg");
+  auto bad_footer = footer;
+  ++bad_footer.row_groups.front().chunks[1].uncompressed_length;
+  const auto bad_footer_bytes =
+      ValueOrThrow(sniffer::internal::SerializeFooter(bad_footer), "serialize bad compact footer");
+  ASSERT_EQ(bad_footer_bytes.size(), footer_length);
+  auto bad_length_bytes = compact_bytes;
+  std::copy(bad_footer_bytes.begin(), bad_footer_bytes.end(),
+            bad_length_bytes.data() + footer_offset);
+  RefreshFooterChecksums(&bad_length_bytes);
+  WriteFile(bad_length_file.path(), bad_length_bytes);
+  EXPECT_FALSE(sniffer::SegmentReader::Open(bad_length_file.path().string()).ok());
+
+  layout.field_encodings = {{2, sniffer::EncodingKind::kPlain}};
+  TempFile plain_file("legacy_plain_after_compact.seg");
+  WriteSegmentWithPolicy(plain_file.path(), schema, {batch}, layout);
+  const auto plain_bytes = ReadFile(plain_file.path());
+  const size_t plain_trailer = plain_bytes.size() - 40;
+  const size_t plain_footer_offset = static_cast<size_t>(ReadU64(plain_bytes, plain_trailer + 8));
+  const size_t plain_footer_length = static_cast<size_t>(ReadU64(plain_bytes, plain_trailer + 16));
+  const auto plain_footer =
+      ValueOrThrow(sniffer::internal::ParseFooter(std::span<const uint8_t>(
+                       plain_bytes.data() + plain_footer_offset, plain_footer_length)),
+                   "parse legacy Plain footer");
+  EXPECT_EQ(plain_footer.encoding_ids.size(), 4U);
+  auto plain_reader = ValueOrThrow(sniffer::SegmentReader::Open(plain_file.path().string()),
+                                   "open legacy Plain segment");
+  const auto legacy = ValueOrThrow(plain_reader->ReadAll(), "read legacy Plain segment");
+  ASSERT_EQ(legacy.size(), 2U);
+  EXPECT_TRUE(legacy[0]->Equals(*batch->Slice(0, 3)));
+  EXPECT_TRUE(legacy[1]->Equals(*batch->Slice(3, 3)));
 }
 
 TEST(SnifferCoreTest, AdaptiveEncodingFallsBackWhenSampleMisleads) {

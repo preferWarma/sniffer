@@ -160,7 +160,9 @@ arrow::Status LayoutPolicy::Validate(const TableSchema& schema) const {
          (integer || type == arrow::Type::STRING || type == arrow::Type::BINARY)) ||
         (override.encoding == EncodingKind::kRle && (integer || type == arrow::Type::BOOL)) ||
         (override.encoding == EncodingKind::kForBitpack &&
-         (integer || type == arrow::Type::TIMESTAMP));
+         (integer || type == arrow::Type::TIMESTAMP)) ||
+        (override.encoding == EncodingKind::kCompactPlain &&
+         (type == arrow::Type::STRING || type == arrow::Type::BINARY));
     if (!supported) {
       return arrow::Status::Invalid("[sniffer.layout.encoding] encoding ",
                                     static_cast<uint16_t>(override.encoding),

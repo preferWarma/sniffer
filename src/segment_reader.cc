@@ -17,7 +17,6 @@
 #include <string>
 #include <string_view>
 #include <type_traits>
-#include <unordered_map>
 #include <unordered_set>
 #include <utility>
 #include <vector>
@@ -180,34 +179,57 @@ arrow::Result<std::shared_ptr<arrow::Array>> DecodeFixed(uint64_t row_count,
   return result;
 }
 
+arrow::Result<std::vector<uint64_t>> ParseVariableOffsets(uint64_t row_count,
+                                                          std::span<const uint8_t> validity,
+                                                          std::span<const uint8_t> offset_bytes,
+                                                          uint64_t values_length,
+                                                          uint32_t offset_width) {
+  ARROW_ASSIGN_OR_RAISE(const uint64_t offset_count, internal::CheckedAdd(row_count, uint64_t{1}));
+  ARROW_ASSIGN_OR_RAISE(const uint64_t expected_offset_bytes,
+                        internal::CheckedMultiply(offset_count, offset_width));
+  if (offset_bytes.size() != expected_offset_bytes) {
+    return InvalidFormat("invalid variable-size offset buffer length");
+  }
+  if (offset_count > static_cast<uint64_t>(std::numeric_limits<size_t>::max())) {
+    return arrow::Status::Invalid("[sniffer.format.limit] offset count exceeds platform limit");
+  }
+  if (offset_width == 4 && values_length > std::numeric_limits<uint32_t>::max()) {
+    return InvalidFormat("CompactPlain values exceed 32-bit offset");
+  }
+  internal::ByteReader offset_reader(offset_bytes);
+  std::vector<uint64_t> offsets;
+  offsets.reserve(static_cast<size_t>(offset_count));
+  for (uint64_t index = 0; index < offset_count; ++index) {
+    uint64_t offset = 0;
+    if (offset_width == 4) {
+      ARROW_ASSIGN_OR_RAISE(const uint32_t compact_offset, offset_reader.ReadU32());
+      offset = compact_offset;
+    } else {
+      ARROW_ASSIGN_OR_RAISE(offset, offset_reader.ReadU64());
+    }
+    if ((!offsets.empty() && offset < offsets.back()) || offset > values_length) {
+      return InvalidFormat("variable-size offsets are not monotonic and bounded");
+    }
+    if (offset_width == 4 && index != 0 && !IsValid(validity, index - 1) &&
+        offset != offsets.back()) {
+      return InvalidFormat("CompactPlain null row advances value offset");
+    }
+    offsets.push_back(offset);
+  }
+  if (offsets.front() != 0 || offsets.back() != values_length) {
+    return InvalidFormat("variable-size offsets are not normalized");
+  }
+  return offsets;
+}
+
 arrow::Result<std::shared_ptr<arrow::Array>> DecodeVariable(internal::PhysicalTypeId type_id,
                                                             uint64_t row_count,
                                                             std::span<const uint8_t> validity,
                                                             std::span<const uint8_t> offset_bytes,
-                                                            std::span<const uint8_t> value_bytes) {
-  ARROW_ASSIGN_OR_RAISE(const uint64_t offset_count, internal::CheckedAdd(row_count, uint64_t{1}));
-  ARROW_ASSIGN_OR_RAISE(const uint64_t expected_offset_bytes,
-                        internal::CheckedMultiply(offset_count, uint64_t{8}));
-  if (offset_bytes.size() != expected_offset_bytes) {
-    return InvalidFormat("invalid variable-size offset buffer length");
-  }
-
-  internal::ByteReader offset_reader(offset_bytes);
-  std::vector<uint64_t> offsets;
-  if (offset_count > static_cast<uint64_t>(std::numeric_limits<size_t>::max())) {
-    return arrow::Status::Invalid("[sniffer.format.limit] offset count exceeds platform limit");
-  }
-  offsets.reserve(static_cast<size_t>(offset_count));
-  for (uint64_t index = 0; index < offset_count; ++index) {
-    ARROW_ASSIGN_OR_RAISE(const uint64_t offset, offset_reader.ReadU64());
-    if ((!offsets.empty() && offset < offsets.back()) || offset > value_bytes.size()) {
-      return InvalidFormat("variable-size offsets are not monotonic and bounded");
-    }
-    offsets.push_back(offset);
-  }
-  if (offsets.front() != 0 || offsets.back() != value_bytes.size()) {
-    return InvalidFormat("variable-size offsets are not normalized");
-  }
+                                                            std::span<const uint8_t> value_bytes,
+                                                            uint32_t offset_width) {
+  ARROW_ASSIGN_OR_RAISE(const auto offsets, ParseVariableOffsets(row_count, validity, offset_bytes,
+                                                                 value_bytes.size(), offset_width));
   if (row_count > static_cast<uint64_t>(std::numeric_limits<int64_t>::max())) {
     return arrow::Status::Invalid("[sniffer.format.limit] row count exceeds Arrow limit");
   }
@@ -259,9 +281,14 @@ arrow::Result<std::shared_ptr<arrow::Array>> DecodeVariable(internal::PhysicalTy
 
 arrow::Result<std::shared_ptr<arrow::Array>> DecodePlainImpl(const FieldSpec& field,
                                                              const internal::ColumnChunkMeta& chunk,
-                                                             std::span<const uint8_t> payload) {
+                                                             std::span<const uint8_t> payload,
+                                                             uint32_t offset_width) {
   // Builders deliberately allocate Arrow-owned output buffers: little-endian
   // wire values cannot be exposed as portable zero-copy Arrow buffers.
+  if (offset_width == 4 && chunk.physical_type != internal::PhysicalTypeId::kString &&
+      chunk.physical_type != internal::PhysicalTypeId::kBinary) {
+    return arrow::Status::NotImplemented("[sniffer.codec.encoding] CompactPlain requires binary");
+  }
   internal::ByteReader payload_reader(payload);
   ARROW_ASSIGN_OR_RAISE(const uint64_t validity_length, payload_reader.ReadU64());
   ARROW_ASSIGN_OR_RAISE(const uint64_t offsets_length, payload_reader.ReadU64());
@@ -276,7 +303,8 @@ arrow::Result<std::shared_ptr<arrow::Array>> DecodePlainImpl(const FieldSpec& fi
 
   if (chunk.physical_type == internal::PhysicalTypeId::kString ||
       chunk.physical_type == internal::PhysicalTypeId::kBinary) {
-    return DecodeVariable(chunk.physical_type, chunk.row_count, validity, offsets, values);
+    return DecodeVariable(chunk.physical_type, chunk.row_count, validity, offsets, values,
+                          offset_width);
   }
   if (!offsets.empty()) {
     return InvalidFormat("fixed-width Plain payload has offsets");
@@ -436,6 +464,16 @@ arrow::Result<std::shared_ptr<arrow::Array>> SelectBinaryValues(
 
 arrow::Result<std::shared_ptr<arrow::Array>> SelectArray(
     const std::shared_ptr<arrow::Array>& source, const std::vector<uint64_t>& selection) {
+  // ScanState builds strictly increasing row IDs. A contiguous selection can
+  // retain the already decoded predicate column's Arrow buffers, including
+  // validity, instead of copying its values into another builder.
+  if (!selection.empty() && selection.back() >= selection.front() &&
+      selection.back() - selection.front() == selection.size() - 1U &&
+      selection.front() < static_cast<uint64_t>(source->length()) &&
+      selection.size() <= static_cast<uint64_t>(source->length()) - selection.front()) {
+    return source->Slice(static_cast<int64_t>(selection.front()),
+                         static_cast<int64_t>(selection.size()));
+  }
   switch (source->type_id()) {
     case arrow::Type::BOOL: {
       arrow::BooleanBuilder builder;
@@ -608,7 +646,11 @@ arrow::Result<std::shared_ptr<arrow::Array>> DecodeSelectedBinary(
 template <typename Rows>
 arrow::Result<std::shared_ptr<arrow::Array>> DecodePlainSelectedImpl(
     const FieldSpec& field, const internal::ColumnChunkMeta& chunk,
-    std::span<const uint8_t> payload, const Rows& selection) {
+    std::span<const uint8_t> payload, const Rows& selection, uint32_t offset_width) {
+  if (offset_width == 4 && chunk.physical_type != internal::PhysicalTypeId::kString &&
+      chunk.physical_type != internal::PhysicalTypeId::kBinary) {
+    return arrow::Status::NotImplemented("[sniffer.codec.encoding] CompactPlain requires binary");
+  }
   internal::ByteReader payload_reader(payload);
   ARROW_ASSIGN_OR_RAISE(const uint64_t validity_length, payload_reader.ReadU64());
   ARROW_ASSIGN_OR_RAISE(const uint64_t offsets_length, payload_reader.ReadU64());
@@ -626,26 +668,8 @@ arrow::Result<std::shared_ptr<arrow::Array>> DecodePlainSelectedImpl(
                         chunk.physical_type == internal::PhysicalTypeId::kBinary;
   const uint32_t width = internal::FixedWidthBytes(chunk.physical_type);
   if (variable) {
-    ARROW_ASSIGN_OR_RAISE(const uint64_t offset_count,
-                          internal::CheckedAdd(chunk.row_count, uint64_t{1}));
-    ARROW_ASSIGN_OR_RAISE(const uint64_t expected_bytes,
-                          internal::CheckedMultiply(offset_count, uint64_t{8}));
-    if (offsets.size() != expected_bytes || offset_count > std::numeric_limits<size_t>::max()) {
-      return InvalidFormat("invalid variable-size offset buffer length");
-    }
-    internal::ByteReader offset_reader(offsets);
-    variable_offsets.reserve(static_cast<size_t>(offset_count));
-    for (uint64_t index = 0; index < offset_count; ++index) {
-      ARROW_ASSIGN_OR_RAISE(const uint64_t offset, offset_reader.ReadU64());
-      if ((!variable_offsets.empty() && offset < variable_offsets.back()) ||
-          offset > values.size()) {
-        return InvalidFormat("variable-size offsets are not monotonic and bounded");
-      }
-      variable_offsets.push_back(offset);
-    }
-    if (variable_offsets.front() != 0 || variable_offsets.back() != values.size()) {
-      return InvalidFormat("variable-size offsets are not normalized");
-    }
+    ARROW_ASSIGN_OR_RAISE(variable_offsets, ParseVariableOffsets(chunk.row_count, validity, offsets,
+                                                                 values.size(), offset_width));
   } else {
     if (!offsets.empty()) {
       return InvalidFormat("fixed-width Plain payload has offsets");
@@ -776,8 +800,11 @@ struct ResolvedScanPlan {
   using PredicateEvaluator = bool (*)(const arrow::Array&, uint64_t, const Predicate&);
   using SortKeyComparator = arrow::Result<int> (*)(const arrow::Array&, uint64_t,
                                                    const arrow::Scalar&);
+  static constexpr size_t kNoFilterSlot = std::numeric_limits<size_t>::max();
 
   std::vector<size_t> projection_field_indices;
+  std::vector<size_t> filter_slots_by_field_index;
+  size_t filter_column_count = 0;
   std::vector<size_t> predicate_field_indices;
   std::vector<PredicateEvaluator> predicate_evaluators;
   std::vector<size_t> predicate_evaluation_order;
@@ -820,6 +847,14 @@ arrow::Result<ResolvedScanPlan> ValidatePlan(const internal::FooterData& footer,
     return arrow::Status::Invalid("[sniffer.plan.batch] output_batch_rows must be positive");
   }
   ResolvedScanPlan resolved;
+  resolved.filter_slots_by_field_index.assign(footer.schema.fields.size(),
+                                              ResolvedScanPlan::kNoFilterSlot);
+  const auto register_filter_field = [&resolved](size_t field_index) {
+    auto& slot = resolved.filter_slots_by_field_index[field_index];
+    if (slot == ResolvedScanPlan::kNoFilterSlot) {
+      slot = resolved.filter_column_count++;
+    }
+  };
   resolved.projection_field_indices.reserve(plan.projection_field_ids.size());
   std::unordered_set<uint32_t> projection_ids;
   for (const uint32_t field_id : plan.projection_field_ids) {
@@ -846,6 +881,7 @@ arrow::Result<ResolvedScanPlan> ValidatePlan(const internal::FooterData& footer,
           "[sniffer.plan.predicate] comparison value must be non-null and exactly typed");
     }
     resolved.predicate_field_indices.push_back(field_index);
+    register_filter_field(field_index);
     ARROW_ASSIGN_OR_RAISE(
         auto evaluator, ResolvePredicateEvaluator(footer.schema.fields[field_index], predicate.op));
     resolved.predicate_evaluators.push_back(evaluator);
@@ -878,6 +914,7 @@ arrow::Result<ResolvedScanPlan> ValidatePlan(const internal::FooterData& footer,
   for (const uint32_t field_id : sort_fields) {
     ARROW_ASSIGN_OR_RAISE(const size_t field_index, FindFieldIndex(footer.schema, field_id));
     resolved.sort_key_field_indices.push_back(field_index);
+    register_filter_field(field_index);
     ARROW_ASSIGN_OR_RAISE(auto comparator,
                           ResolveSortKeyComparator(footer.schema.fields[field_index]));
     resolved.sort_key_comparators.push_back(comparator);
@@ -1218,19 +1255,31 @@ namespace internal {
 arrow::Result<std::shared_ptr<arrow::Array>> DecodePlain(const FieldSpec& field,
                                                          const ColumnChunkMeta& chunk,
                                                          std::span<const uint8_t> payload) {
-  return DecodePlainImpl(field, chunk, payload);
+  return DecodePlainImpl(field, chunk, payload, 8);
+}
+
+arrow::Result<std::shared_ptr<arrow::Array>> DecodeCompactPlain(const FieldSpec& field,
+                                                                const ColumnChunkMeta& chunk,
+                                                                std::span<const uint8_t> payload) {
+  return DecodePlainImpl(field, chunk, payload, 4);
 }
 
 arrow::Result<std::shared_ptr<arrow::Array>> DecodePlainSelected(
     const FieldSpec& field, const ColumnChunkMeta& chunk, std::span<const uint8_t> payload,
     const std::vector<uint64_t>& selection) {
-  return DecodePlainSelectedImpl(field, chunk, payload, selection);
+  return DecodePlainSelectedImpl(field, chunk, payload, selection, 8);
+}
+
+arrow::Result<std::shared_ptr<arrow::Array>> DecodeCompactPlainSelected(
+    const FieldSpec& field, const ColumnChunkMeta& chunk, std::span<const uint8_t> payload,
+    const std::vector<uint64_t>& selection) {
+  return DecodePlainSelectedImpl(field, chunk, payload, selection, 4);
 }
 
 arrow::Result<std::shared_ptr<arrow::Array>> DecodePlainSelectedBitmap(
     const FieldSpec& field, const ColumnChunkMeta& chunk, std::span<const uint8_t> payload,
     const BitmapSelection& selection) {
-  return DecodePlainSelectedImpl(field, chunk, payload, selection);
+  return DecodePlainSelectedImpl(field, chunk, payload, selection, 8);
 }
 
 }  // namespace internal
@@ -1323,30 +1372,32 @@ class ScanState {
         continue;
       }
 
-      std::unordered_map<size_t, std::shared_ptr<arrow::Array>> filter_columns;
+      std::vector<std::shared_ptr<arrow::Array>> filter_columns(resolved_plan_.filter_column_count);
       for (const size_t field_index : resolved_plan_.predicate_field_indices) {
-        if (!filter_columns.contains(field_index)) {
-          ARROW_ASSIGN_OR_RAISE(auto array, DecodePredicateChunk(row_group, field_index));
-          filter_columns.emplace(field_index, std::move(array));
+        auto& column = filter_columns[resolved_plan_.filter_slots_by_field_index[field_index]];
+        if (!column) {
+          ARROW_ASSIGN_OR_RAISE(column, DecodePredicateChunk(row_group, field_index));
         }
       }
       if (plan_.sort_key_range) {
         for (const size_t field_index : resolved_plan_.sort_key_field_indices) {
-          if (!filter_columns.contains(field_index)) {
-            ARROW_ASSIGN_OR_RAISE(auto array, DecodePredicateChunk(row_group, field_index));
-            filter_columns.emplace(field_index, std::move(array));
+          auto& column = filter_columns[resolved_plan_.filter_slots_by_field_index[field_index]];
+          if (!column) {
+            ARROW_ASSIGN_OR_RAISE(column, DecodePredicateChunk(row_group, field_index));
           }
         }
       }
       std::vector<const arrow::Array*> predicate_columns;
       predicate_columns.reserve(resolved_plan_.predicate_field_indices.size());
       for (const size_t field_index : resolved_plan_.predicate_field_indices) {
-        predicate_columns.push_back(filter_columns.at(field_index).get());
+        predicate_columns.push_back(
+            filter_columns[resolved_plan_.filter_slots_by_field_index[field_index]].get());
       }
       std::vector<const arrow::Array*> sort_key_columns;
       sort_key_columns.reserve(resolved_plan_.sort_key_field_indices.size());
       for (const size_t field_index : resolved_plan_.sort_key_field_indices) {
-        sort_key_columns.push_back(filter_columns.at(field_index).get());
+        sort_key_columns.push_back(
+            filter_columns[resolved_plan_.filter_slots_by_field_index[field_index]].get());
       }
 
       const bool full_row_group = plan_.conjunctive_predicates.empty() && !plan_.sort_key_range &&
@@ -1415,15 +1466,16 @@ class ScanState {
       std::vector<std::shared_ptr<arrow::Array>> projected_columns;
       projected_columns.reserve(resolved_plan_.projection_field_indices.size());
       for (const size_t field_index : resolved_plan_.projection_field_indices) {
-        const auto decoded = filter_columns.find(field_index);
-        if (decoded != filter_columns.end()) {
+        const size_t filter_slot = resolved_plan_.filter_slots_by_field_index[field_index];
+        if (filter_slot != ResolvedScanPlan::kNoFilterSlot) {
+          const auto& decoded = filter_columns[filter_slot];
           if (all_rows_selected) {
-            projected_columns.push_back(decoded->second);
+            projected_columns.push_back(decoded);
           } else {
             std::shared_ptr<arrow::Array> selected;
             {
               internal::NanosecondTimer timer(&metrics_->projection_nanoseconds);
-              ARROW_ASSIGN_OR_RAISE(selected, SelectArray(decoded->second, selection));
+              ARROW_ASSIGN_OR_RAISE(selected, SelectArray(decoded, selection));
             }
             projected_columns.push_back(std::move(selected));
           }
@@ -1476,6 +1528,9 @@ class ScanState {
       if (chunk.encoding_id == internal::kPlainEncodingId) {
         ARROW_ASSIGN_OR_RAISE(
             array, internal::DecodePlain(footer_.schema.fields[field_index], chunk, payload));
+      } else if (chunk.encoding_id == internal::kCompactPlainEncodingId) {
+        ARROW_ASSIGN_OR_RAISE(array, internal::DecodeCompactPlain(
+                                         footer_.schema.fields[field_index], chunk, payload));
       } else {
         ARROW_ASSIGN_OR_RAISE(
             array, internal::DecodeNonPlain(footer_.schema.fields[field_index], chunk, payload));
@@ -1503,6 +1558,15 @@ class ScanState {
         } else {
           ARROW_ASSIGN_OR_RAISE(
               array, internal::DecodePlain(footer_.schema.fields[field_index], chunk, payload));
+        }
+      } else if (chunk.encoding_id == internal::kCompactPlainEncodingId) {
+        if (selection) {
+          ARROW_ASSIGN_OR_RAISE(
+              array, internal::DecodeCompactPlainSelected(footer_.schema.fields[field_index], chunk,
+                                                          payload, *selection));
+        } else {
+          ARROW_ASSIGN_OR_RAISE(array, internal::DecodeCompactPlain(
+                                           footer_.schema.fields[field_index], chunk, payload));
         }
       } else {
         ARROW_ASSIGN_OR_RAISE(array, internal::DecodeNonPlain(footer_.schema.fields[field_index],
@@ -1644,14 +1708,28 @@ class SegmentReader::Impl {
         if (!field.nullable && chunk.null_count != 0) {
           return InvalidFormat("non-nullable field contains nulls");
         }
-        const uint64_t minimum_length = chunk.encoding_id == internal::kPlainEncodingId        ? 24U
-                                        : chunk.encoding_id == internal::kDictionaryEncodingId ? 48U
-                                        : chunk.encoding_id == internal::kRleEncodingId        ? 16U
-                                                                                        : 32U;
+        const uint64_t minimum_length =
+            chunk.encoding_id == internal::kPlainEncodingId ||
+                    chunk.encoding_id == internal::kCompactPlainEncodingId
+                ? 24U
+            : chunk.encoding_id == internal::kDictionaryEncodingId ? 48U
+            : chunk.encoding_id == internal::kRleEncodingId        ? 16U
+                                                                   : 32U;
         if (chunk.length < minimum_length || chunk.uncompressed_length < 24U ||
             (chunk.encoding_id == internal::kPlainEncodingId &&
              chunk.uncompressed_length != chunk.length)) {
           return InvalidFormat("invalid encoded column chunk length");
+        }
+        if (chunk.encoding_id == internal::kCompactPlainEncodingId) {
+          ARROW_ASSIGN_OR_RAISE(const uint64_t offset_count,
+                                internal::CheckedAdd(chunk.row_count, uint64_t{1}));
+          ARROW_ASSIGN_OR_RAISE(const uint64_t saved_offset_bytes,
+                                internal::CheckedMultiply(offset_count, uint64_t{4}));
+          ARROW_ASSIGN_OR_RAISE(const uint64_t plain_length,
+                                internal::CheckedAdd(chunk.length, saved_offset_bytes));
+          if (chunk.uncompressed_length != plain_length) {
+            return InvalidFormat("CompactPlain reference Plain length does not match chunk");
+          }
         }
         ARROW_ASSIGN_OR_RAISE(const uint64_t chunk_end,
                               internal::CheckedAdd(chunk.offset, chunk.length));
@@ -1794,6 +1872,9 @@ class SegmentReader::Impl {
         if (chunk.encoding_id == internal::kPlainEncodingId) {
           ARROW_ASSIGN_OR_RAISE(
               array, internal::DecodePlain(footer_.schema.fields[index], chunk, payload));
+        } else if (chunk.encoding_id == internal::kCompactPlainEncodingId) {
+          ARROW_ASSIGN_OR_RAISE(
+              array, internal::DecodeCompactPlain(footer_.schema.fields[index], chunk, payload));
         } else {
           ARROW_ASSIGN_OR_RAISE(
               array, internal::DecodeNonPlain(footer_.schema.fields[index], chunk, payload));

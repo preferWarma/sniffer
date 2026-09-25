@@ -28,7 +28,7 @@ namespace {
 constexpr int64_t kDefaultRows = 100000;
 constexpr uint32_t kDefaultRowGroupRows = 4096;
 
-enum class Format { kSniffer, kParquet, kParquetZstd };
+enum class Format { kSniffer, kSnifferPlain, kSnifferCompact, kParquet, kParquetZstd };
 
 struct Scenario {
   std::string name;
@@ -179,12 +179,15 @@ arrow::Status ValidateBatches(const arrow::RecordBatch& expected,
   return arrow::Status::OK();
 }
 
-arrow::Result<CompressionMeasurement> MeasureSnifferOnce(const std::filesystem::path& path,
-                                                         const Scenario& scenario,
-                                                         uint32_t row_group_rows) {
+arrow::Result<CompressionMeasurement> MeasureSnifferOnce(
+    const std::filesystem::path& path, const Scenario& scenario, uint32_t row_group_rows,
+    std::optional<sniffer::EncodingKind> forced) {
   const auto encode_start = std::chrono::steady_clock::now();
   sniffer::LayoutPolicy policy;
   policy.target_row_group_rows = row_group_rows;
+  if (forced) {
+    policy.field_encodings = {{scenario.schema.fields.front().field_id, *forced}};
+  }
   auto writer_metrics = std::make_shared<sniffer::WriterMetrics>();
   ARROW_ASSIGN_OR_RAISE(auto writer, sniffer::SegmentWriter::Open(path.string(), scenario.schema,
                                                                   policy, writer_metrics));
@@ -239,6 +242,10 @@ std::string_view FormatName(Format format) {
   switch (format) {
     case Format::kSniffer:
       return "Sniffer";
+    case Format::kSnifferPlain:
+      return "SnifferPlain";
+    case Format::kSnifferCompact:
+      return "SnifferCompact";
     case Format::kParquet:
       return "Parquet";
     case Format::kParquetZstd:
@@ -264,8 +271,15 @@ void RunCompressionBenchmark(benchmark::State& state, const Scenario& scenario, 
   for (auto _ : state) {
     (void)_;
     arrow::Result<CompressionMeasurement> result = arrow::Status::Invalid("unknown format");
-    if (format == Format::kSniffer) {
-      result = MeasureSnifferOnce(path, scenario, row_group_rows);
+    if (format == Format::kSniffer || format == Format::kSnifferPlain ||
+        format == Format::kSnifferCompact) {
+      std::optional<sniffer::EncodingKind> forced;
+      if (format == Format::kSnifferPlain) {
+        forced = sniffer::EncodingKind::kPlain;
+      } else if (format == Format::kSnifferCompact) {
+        forced = sniffer::EncodingKind::kCompactPlain;
+      }
+      result = MeasureSnifferOnce(path, scenario, row_group_rows, forced);
     } else {
       result = MeasureParquetOnce(path, scenario, row_group_rows,
                                   format == Format::kParquet ? parquet::Compression::UNCOMPRESSED
@@ -312,7 +326,8 @@ void RunCompressionBenchmark(benchmark::State& state, const Scenario& scenario, 
       static_cast<double>(file_bytes) / static_cast<double>(logical_size);
   state.counters["bytes_per_value"] =
       static_cast<double>(file_bytes) / static_cast<double>(scenario.batch->num_rows());
-  if (format == Format::kSniffer) {
+  if (format == Format::kSniffer || format == Format::kSnifferPlain ||
+      format == Format::kSnifferCompact) {
     state.counters["adaptive_plain_chunks"] =
         static_cast<double>(encoding_totals.adaptive_plain_chunks) / iterations;
     state.counters["adaptive_nonplain_chunks"] =
@@ -385,6 +400,12 @@ BENCHMARK_CAPTURE(Compression, low_cardinality_string_Parquet_ZSTD, 4U, Format::
     ->UseManualTime()
     ->Unit(benchmark::kMillisecond);
 BENCHMARK_CAPTURE(Compression, high_cardinality_string_Sniffer, 5U, Format::kSniffer)
+    ->UseManualTime()
+    ->Unit(benchmark::kMillisecond);
+BENCHMARK_CAPTURE(Compression, high_cardinality_string_SnifferPlain, 5U, Format::kSnifferPlain)
+    ->UseManualTime()
+    ->Unit(benchmark::kMillisecond);
+BENCHMARK_CAPTURE(Compression, high_cardinality_string_SnifferCompact, 5U, Format::kSnifferCompact)
     ->UseManualTime()
     ->Unit(benchmark::kMillisecond);
 BENCHMARK_CAPTURE(Compression, high_cardinality_string_Parquet, 5U, Format::kParquet)

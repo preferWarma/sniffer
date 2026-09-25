@@ -14,6 +14,7 @@ enum class EncodingKind : uint16_t {
   kDictionary = 1,
   kRle = 2,
   kForBitpack = 3,
+  kCompactPlain = 4,
 };
 
 struct FieldEncoding {

@@ -451,11 +451,18 @@ arrow::Result<std::vector<uint8_t>> SerializeFooter(const FooterData& footer) {
   }
 
   ByteWriter writer;
+  const bool has_compact_plain = std::any_of(
+      footer.row_groups.begin(), footer.row_groups.end(), [](const RowGroupMeta& row_group) {
+        return std::any_of(row_group.chunks.begin(), row_group.chunks.end(),
+                           [](const ColumnChunkMeta& chunk) {
+                             return chunk.encoding_id == kCompactPlainEncodingId;
+                           });
+      });
   writer.WriteU16(kFooterPayloadVersion);
   writer.WriteU16(0);
   writer.WriteU32(footer.schema.schema_version);
   writer.WriteU32(static_cast<uint32_t>(footer.schema.fields.size()));
-  writer.WriteU32(4);
+  writer.WriteU32(has_compact_plain ? 5U : 4U);
   writer.WriteU64(static_cast<uint64_t>(footer.row_groups.size()));
 
   for (const auto& field : footer.schema.fields) {
@@ -496,6 +503,13 @@ arrow::Result<std::vector<uint8_t>> SerializeFooter(const FooterData& footer) {
   writer.WriteU16(kEncodingMinor);
   writer.WriteU16(11);
   writer.WriteString("for_bitpack");
+  if (has_compact_plain) {
+    writer.WriteU16(kCompactPlainEncodingId);
+    writer.WriteU16(kEncodingMajor);
+    writer.WriteU16(kEncodingMinor);
+    writer.WriteU16(13);
+    writer.WriteString("compact_plain");
+  }
 
   for (const auto& row_group : footer.row_groups) {
     if (row_group.chunks.size() > std::numeric_limits<uint32_t>::max()) {
@@ -610,6 +624,9 @@ arrow::Result<FooterData> ParseFooter(std::span<const uint8_t> bytes) {
         break;
       case kForBitpackEncodingId:
         expected_name = "for_bitpack";
+        break;
+      case kCompactPlainEncodingId:
+        expected_name = "compact_plain";
         break;
       default:
         return arrow::Status::NotImplemented(

@@ -1097,6 +1097,8 @@ bool EncodingSupports(uint16_t encoding_id, const arrow::DataType& type) {
   switch (encoding_id) {
     case kPlainEncodingId:
       return true;
+    case kCompactPlainEncodingId:
+      return IsVariable(type.id());
     case kDictionaryEncodingId:
       return integer || IsVariable(type.id());
     case kRleEncodingId:
@@ -1149,6 +1151,14 @@ arrow::Result<uint16_t> SelectEncoding(const FieldSpec& field, const arrow::Arra
   const bool supports_dictionary = EncodingSupports(kDictionaryEncodingId, *field.type);
   const bool supports_rle = EncodingSupports(kRleEncodingId, *field.type);
   const bool supports_for = EncodingSupports(kForBitpackEncodingId, *field.type);
+  if (IsVariable(field.type->id())) {
+    ARROW_ASSIGN_OR_RAISE(const uint64_t offset_count,
+                          CheckedAdd(static_cast<uint64_t>(sample_rows), uint64_t{1}));
+    ARROW_ASSIGN_OR_RAISE(const uint64_t saved_bytes, CheckedMultiply(offset_count, uint64_t{4}));
+    if (plain_size >= saved_bytes && plain_size - saved_bytes >= 24U) {
+      consider(kCompactPlainEncodingId, plain_size - saved_bytes);
+    }
+  }
   if (!supports_dictionary && !supports_rle && !supports_for) {
     return best_id;
   }

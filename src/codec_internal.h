@@ -22,9 +22,16 @@ namespace sniffer::internal {
                                                        const arrow::Array& array);
 [[nodiscard]] arrow::Result<std::vector<uint8_t>> EncodePlain(const FieldSpec& field,
                                                               const arrow::Array& array);
+[[nodiscard]] arrow::Result<std::vector<uint8_t>> EncodeCompactPlain(const FieldSpec& field,
+                                                                     const arrow::Array& array);
 [[nodiscard]] arrow::Result<std::shared_ptr<arrow::Array>> DecodePlain(
     const FieldSpec& field, const ColumnChunkMeta& chunk, std::span<const uint8_t> payload);
+[[nodiscard]] arrow::Result<std::shared_ptr<arrow::Array>> DecodeCompactPlain(
+    const FieldSpec& field, const ColumnChunkMeta& chunk, std::span<const uint8_t> payload);
 [[nodiscard]] arrow::Result<std::shared_ptr<arrow::Array>> DecodePlainSelected(
+    const FieldSpec& field, const ColumnChunkMeta& chunk, std::span<const uint8_t> payload,
+    const std::vector<uint64_t>& selection);
+[[nodiscard]] arrow::Result<std::shared_ptr<arrow::Array>> DecodeCompactPlainSelected(
     const FieldSpec& field, const ColumnChunkMeta& chunk, std::span<const uint8_t> payload,
     const std::vector<uint64_t>& selection);
 [[nodiscard]] arrow::Result<std::shared_ptr<arrow::Array>> DecodePlainSelectedBitmap(

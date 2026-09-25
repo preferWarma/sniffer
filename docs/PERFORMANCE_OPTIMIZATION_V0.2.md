@@ -93,6 +93,10 @@ SIMD、多级编码链和新压缩算法只有在标量路径完成剖析和优�
 - [x] 为 `ByteWriter` 增加可计算的容量预留和批量 append，减少 vector 扩容及中间 payload 拷贝。
 - [ ] 评估直接编码到最终 chunk buffer，并在一次顺序遍历中计算 chunk CRC32C；不得改变 CRC
       算法或落盘字节。
+  - [x] 全非空 string/binary 的 Plain payload 直接写入最终 buffer；offset 仍显式按
+        little-endian 归一化，Arrow values 只复制一次。nullable 路径维持原实现，chunk
+        CRC32C 的融合尚未做。切片、空值、binary 非文本字节与参考编码逐字节一致；
+        高基数字符串完整写入没有可确认的速度收益，见 benchmark 记录。
 
 ### 4.2 Reader 与 codec
 
@@ -131,10 +135,24 @@ SIMD、多级编码链和新压缩算法只有在标量路径完成剖析和优�
         index vector，必须完成完整 codec/scan A/B 后才能选择阈值。
   - [x] Plain selected-decode 增加内部 bitmap 候选和 1%/10%/50%/100% 的
         nullable int64 A/B；各 Plain 类型、null、跨 word、非法 bitmap 逐值测试。
-        生产 scan 尚未切换；Dictionary/RLE/FOR、选择构建和完整 scan 待测。
+        生产 scan 尚未切换；非 Plain codec 的 bitmap 接入尚未评估。
+  - [x] 增加真实 SegmentWriter/Reader 的 Plain 投影完整扫描基准，覆盖均匀散点和
+        连续前缀的 1%/10%/50%/100%，核对行数、null、值和 ColumnChunk 读取数。
+        与临时自适应 bitmap 接入做交错 A/B：10%/50% 均匀场景无稳定速度收益，
+        50% 有约 2%–3% 回退，故撤回生产切换；保留 codec 候选与可重复运行的
+        index 基准，详见 [`bench/BENCHMARK_V2.md`](../bench/BENCHMARK_V2.md)。
 - [x] projection 与 predicate 是同一列时，直接从已解码列构造输出，提供 typed take/filter 路径。
+  - [x] 当同一谓词列的命中行号恰好连续时，直接返回已校验 Arrow 数组的 `Slice()`，
+        保留 validity 与值缓冲区；非连续选择仍走 typed take/filter。
 - [ ] 减少跨 Row Group 输出时的 `ConcatenateRecordBatches()` 拷贝；优先返回合法 slice，只有确实
       需要单个连续 batch 时才合并。
+  - [x] 已验证对齐输出整块复用 `RecordBatch` 的候选：虽然可将该场景 25 次 slice
+        降为零，但完整扫描复测 1.017 → 1.037/1.051 ms，无速度收益，已撤回。
+        多列跨组输出若保持当前 `output_batch_rows` 的 batch 边界，仍需生成连续 Arrow
+        数组；不改变公开分批语义来规避拷贝。
+- [x] 将谓词/排序键解码列的逐组哈希表改为计划期确定的紧凑槽位，重复谓词、排序键和
+      投影共享同一份解码结果；不扩大无过滤扫描的逐组临时容器。1K Row Group 和
+      三谓词扫描的 Release A/B、完整测试结果见 benchmark 记录。
 - [x] 针对 `limit` 做早停：selection 达到剩余 limit 后停止逐行匹配，只为这些命中行解码
       projection，并且不读取后续 Row Group；已有谓词测试和无谓词 `limit=0/1/7/30` 测试覆盖。
 - [ ] 增加指标验证：谓词列、投影列、selection、拼接各阶段的行数、字节数和耗时可观测。
@@ -164,12 +182,12 @@ SIMD、多级编码链和新压缩算法只有在标量路径完成剖析和优�
   - [x] 第一小步：writer 可选 metrics 按 chunk 记录直接 Plain、保留非 Plain、实际大小回退、
         显式强制编码，以及回退时被弃 payload 与 Plain payload 的字节数；压缩 benchmark 输出
         对应计数。不改变编码策略，CPU/解码成本与更高收益阈值仍待评估。
-- [ ] 单独分析高基数 string/binary 的 64-bit offset 开销。如果引入 32-bit compact offset 或
+- [x] 单独分析高基数 string/binary 的 64-bit offset 开销。如果引入 32-bit compact offset 或
       CompactPlain，必须分配新 encoding ID，旧 Reader 对未知 ID 明确失败，v0.2 Reader 保持读取
       v0.1 Plain 的能力。
 - [ ] 评估 bool bitpack、delta-of-delta timestamp 和 dictionary index + RLE；只有现有 P0/P1
       优化完成、microbenchmark 证明收益后再进入格式设计。
-- [ ] 新 encoding 必须补齐随机、极值、null、截断、错误 offset、checksum 和 selection decode
+- [x] 新 encoding 必须补齐随机、极值、null、截断、错误 offset、checksum 和 selection decode
       测试，并更新 format decision record。
 
 ## 8. P2：并发能力；P3：可选向量化
@@ -1115,3 +1133,54 @@ CV 为 0.46%。Dictionary payload 仍为 113,058 字节，完整 Segment 仍为 
   [`bench/BENCHMARK_V2.md`](../bench/BENCHMARK_V2.md)。这只测预建 selection 到
   Arrow array，不含 bitmap 构建、谓词、非 Plain codec 和端到端扫描；生产路径
   暂保留 index vector，尚无可信阈值。
+
+### 2026-09-25：连续谓词投影的零拷贝 slice
+
+- 对已解码谓词列与 projection 重合、命中行号连续的情况，`SelectArray()` 直接使用
+  `Array::Slice()`。行号由扫描器保证严格递增；首末跨度即可判定连续，不增加逐行检查。
+  非连续选择仍走原 typed builder；文件格式、过滤和 batch 大小未变。
+- Apple M4 / Release / 单线程 / warm-cache、100,000 行、有序 `id` 单谓词、仅投影
+  `id`、输出 batch 为半组加一、7 次 P50，Row Group 为 8,192 或 65,536。
+  4 个场景 baseline → 改后两轮 scan 分别为 0.348 → 0.345/0.343 ms、
+  0.604 → 0.583/0.577 ms、0.416 → 0.400/0.394 ms、
+  0.809 → 0.792/0.795 ms（顺序为 8K/10%、8K/50%、64K/10%、64K/50%）。
+  projection 阶段由 0.0007–0.034 ms 降至约 0.00007–0.00012 ms；
+  文件字节与 selection 行数一致。完整维度及复现命令见
+  [`bench/BENCHMARK_V2.md`](../bench/BENCHMARK_V2.md)。这是一组有序连续命中
+  场景，不能外推为随机过滤或全部扫描的加速。
+
+### 2026-09-25：bitmap 完整扫描 A/B 与默认接入否决
+
+- 新增 100,000 行、Row Group 8,192、nullable int64 的真实 Segment 扫描基准。
+  过滤列是确定性 boolean mask，投影列强制 Plain；扫描每次只读谓词列及有命中
+  的投影列，并用独立 mask 参考核对命中数、null 数、值求和和读取 chunk 数。
+  另外增加 8,192 行两 Row Group 的逐值测试，覆盖 1%/10%/50%/100%、
+  均匀/连续分布、`limit`、FOR 投影和谓词列复用。
+- 临时接入的自适应 bitmap 在行号字节超过 bitmap 字节时切换，仅限 Plain 投影。
+  Apple M4 / Release / 单线程 / warm-cache，交错 index/bitmap/index/bitmap，
+  每轮 11 次 CPU P50：均匀 10% 时 index 为 0.965/0.990 ms、bitmap 为
+  0.986/0.995 ms；均匀 50% 时 index 为 1.723/1.739 ms、bitmap 为
+  1.762/1.795 ms。连续前缀 10% 时 bitmap 略快，50% 基本持平。
+  文件与 ColumnChunk 读取数一致。尽管均匀 50% 的逻辑选择表示从约
+  400 KB 降到约 19 KB，端到端耗时仍回退，说明先前微基准不能作为生产
+  阈值依据。
+- 已撤回临时生产接入和额外公开指标；默认仍是 index vector，完整匹配组仍
+  是隐式范围。保留 `BitmapSelection` 的内部解码候选与可复跑的完整扫描基准。
+  未来若要以降低峰值内存为目标重新评估，应另设明确内存预算并覆盖非 Plain
+  codec，而非仅依据本次吞吐数据启用 bitmap。
+
+### 2026-09-25：CompactPlain 32-bit offset
+
+- 为 string/binary 新增 encoding ID 4，保留旧 Plain ID 0 及其字节语义；格式兼容规则见
+  [`docs/decisions/0004-compact-plain-variable-offsets.md`](decisions/0004-compact-plain-variable-offsets.md)。
+  自适应选择按现有确定性阈值比较样本大小；旧文件仍可读，新格式对旧 Reader 显式不兼容。
+- 100,000 行、24 字节高基数字符串、Row Group 4,096 的完整文件由 3,203,894
+  降到 2,803,815 字节，压缩比 0.874x → 0.999x，达到本专项 0.98x 目标。
+  强制 CompactPlain 的写入两轮 P50 3.067/3.034 ms，对照强制 Plain
+  3.679/3.490 ms；自适应写入 4.220/4.002 ms，不能把强制编码收益等同
+  于默认写入收益。读取对照和 Parquet 数据见
+  [`bench/BENCHMARK_V2.md`](../bench/BENCHMARK_V2.md)。低基数字符串仍选择
+  Dictionary，文件字节不变。
+- 切片、nullable、空值、随机 binary、selected decode、错误 offset、截断、
+  checksum、未知 descriptor/版本和旧 Plain 兼容均有测试。并发及 cold-cache
+  等 v0.2 验收项仍未完成。

@@ -27,6 +27,7 @@ Arrow `RecordBatch` 写成自描述文件，并通过索引剪枝、列投影和
 | 编码 | 支持类型 | 典型数据 |
 | --- | --- | --- |
 | Plain | 所有 v0.1 类型 | 高基数或无明显模式 |
+| CompactPlain | string、binary | 高基数变长值，32-bit offset |
 | Dictionary | 整数、string、binary | 低基数重复值 |
 | RLE | 整数、bool | 长连续重复值 |
 | FOR + Bitpack | 整数、timestamp | 窄值域或递增值 |

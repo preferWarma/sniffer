@@ -310,3 +310,151 @@ Dictionary/RLE/FOR 的 selected-decode，不能据此设生产阈值。生产全
   --benchmark_repetitions=11 --benchmark_min_time=0.05s \
   --benchmark_report_aggregates_only=true --benchmark_format=json
 ```
+
+### 连续谓词投影的零拷贝 slice
+
+2026-09-25，Apple M4 / Apple Clang 21 / Arrow 23.0.1 / Release / 单线程 / warm-cache。
+100,000 行，升序 `id`，按 `id >= threshold` 过滤且仅投影该谓词列；
+`output_batch_rows = row_group_rows / 2 + 1`。每 case 7 次、至少 0.03 秒，
+下表是 scan 耗时 P50（ms）。baseline 为提交 `40f1f2f`，改后独立跑两轮；
+投影阶段计时包含指标开销，微秒级数值只用于定位瓶颈。
+
+| Row Group | 选择率 | baseline | 改后第一轮 | 改后第二轮 | 文件字节 |
+|---:|---:|---:|---:|---:|---:|
+| 8,192 | 10% | 0.348 | 0.345 | 0.343 | 675,943 |
+| 8,192 | 50% | 0.604 | 0.583 | 0.577 | 675,943 |
+| 65,536 | 10% | 0.416 | 0.400 | 0.394 | 732,101 |
+| 65,536 | 50% | 0.809 | 0.792 | 0.795 | 732,101 |
+
+原先对部分命中组会逐值复制已解码的谓词列；现在连续 selection 直接保留其 Arrow
+buffer，scan 的 projection 阶段在上述场景约从 0.0007–0.034 ms 降至
+0.00007–0.00012 ms。完整 scan 收益较小，因为谓词、I/O 和 batch 拼接未变。
+非连续选择仍沿用原 typed 路径；不改变 Row Group 剪枝、null、limit 和输出
+batch 大小。此处有序命中易形成连续 selection，不能外推随机散点过滤。
+复现：
+
+```sh
+./build-release/sniffer_core_performance_benchmark \
+  '--benchmark_filter=^PerformanceMatrix/Sniffer/rows:100000/row_group_rows:(8192|65536)/selectivity_percent:(10|50)/projection_columns:1/manual_time$' \
+  --benchmark_repetitions=7 --benchmark_min_time=0.03s \
+  --benchmark_report_aggregates_only=true --benchmark_format=json
+```
+
+### bitmap 完整扫描 A/B（默认切换未采纳）
+
+2026-09-25，Apple M4 / Apple Clang 21 / Arrow 23.0.1 / Release / 单线程 / warm-cache。
+`FullScanSelection` 构造真实 Segment：100,000 行、Row Group 8,192、boolean
+谓词列与 nullable int64 Plain 投影列，约每 17 行有 1 个 null；无索引剪枝，
+`output_batch_rows=8192`。mask 是确定性 hash 均匀散点或连续前缀。
+计时包含扫描、选择构建、ColumnChunk I/O/CRC、Plain 解码、Arrow 输出及
+逐值消费，不含一次性写入；预检与独立 mask 参考核对行数、null、求和和
+读取 chunk 数。两种表示处理的文件及读取 chunk 数完全相同。
+
+下表为交错 index/bitmap/index/bitmap 四轮，每轮 11 次、至少 0.05 秒的
+CPU P50，单位 ms。bitmap 是临时实验接入：仅 Plain 投影、无 `limit` 截断，
+行号字节超过 Row Group bitmap 字节后切换；实验后已从生产代码撤回。
+
+| 分布 | 选择率 | index 两轮 | bitmap 两轮 | bitmap 逻辑表示字节 |
+|---|---:|---:|---:|---:|
+| 均匀散点 | 10% | 0.965 / 0.990 | 0.986 / 0.995 | 13,840 |
+| 均匀散点 | 50% | 1.723 / 1.739 | 1.762 / 1.795 | 19,344 |
+| 连续前缀 | 10% | 0.662 / 0.668 | 0.654 / 0.659 | 1,024 |
+| 连续前缀 | 50% | 0.984 / 0.994 | 0.984 / 0.987 | 1,024 |
+
+作为对照，纯 index 路径的均匀 10%/50% 分别持有 10,083/50,051 个逻辑行号，
+即 80,664/400,408 字节；bitmap 逻辑字节不含转换期间的临时 vector 或 allocator
+开销。吞吐上均匀 10% 未稳定改善，50% 两轮均回退约 2%–3%；连续前缀收益较小。
+故本轮不设置生产切换阈值。当前仓库保留的是 index 版本的完整扫描基准，
+临时 bitmap 接入未保留，表中的 bitmap 数据是实验记录，不能直接由当前
+默认构建复跑。index 路径复现：
+
+```sh
+./build-release/sniffer_core_selection_benchmark \
+  '--benchmark_filter=^FullScanSelection/' \
+  --benchmark_repetitions=11 --benchmark_min_time=0.05s \
+  --benchmark_report_aggregates_only=true --benchmark_format=json
+```
+
+### 高基数字符串的 CompactPlain 格式 A/B
+
+2026-09-25，Apple M4 / Apple Clang 21 / Arrow C++ 23.0.1 / Release / 单线程 /
+warm-cache。100,000 行，每个字符串 24 字节，Row Group 4,096（25 个 chunk），
+无查询谓词、选择率不适用；Arrow logical bytes 为 2,800,004。每个 case 11 次重复、
+每次至少 0.03 秒；下表为两轮独立测量的完整写入/回读 CPU 时间 P50（ms），
+包括文件及 checksum，不含输入构造或正确性比较。`Sniffer` 为自适应选择；
+`SnifferPlain` / `SnifferCompact` 强制编码，便于单独归因新格式的成本。
+
+| 格式 | 文件字节 | 压缩比 | 写入 P50 两轮 | 读取 P50 两轮 |
+|---|---:|---:|---:|---:|
+| Sniffer，自适应 CompactPlain | 2,803,815 | 0.999x | 4.220 / 4.002 | 2.491 / 2.480 |
+| SnifferPlain，旧 64-bit offset | 3,203,894 | 0.874x | 3.679 / 3.490 | 2.656 / 2.683 |
+| SnifferCompact，32-bit offset | 2,803,815 | 0.999x | 3.067 / 3.034 | 2.499 / 2.473 |
+| Parquet，未压缩 | 2,957,506 | 0.947x | 4.542 / 4.523 | 1.704 / 1.711 |
+| Parquet + ZSTD | 2,094,070 | 1.337x | 7.583 / 7.536 | 3.753 / 3.731 |
+
+新编码相对强制旧 Plain 节省 400,079 字节（12.49%），文件比未压缩 Parquet
+小约 5.2%；达到 0.98x 空间目标。强制 CompactPlain 的写入和读取均比强制 Plain
+快，但自适应写入包含采样选择成本，不能把强制编码的收益直接外推为默认写入
+提速。Parquet 未压缩读取仍明显更快，ZSTD 文件仍更小。低基数字符串仍选择
+Dictionary，文件保持 117,044 字节。旧 Plain 文件继续可读；新编码使用 ID 4，
+与 Plain v1 不共享字节语义，见
+[`docs/decisions/0004-compact-plain-variable-offsets.md`](../docs/decisions/0004-compact-plain-variable-offsets.md)。
+
+复现（构建和输入参数沿用本报告的 Release 配置）：
+
+```sh
+./build-release/sniffer_core_compression_benchmark \
+  '--benchmark_filter=^Compression/high_cardinality_string_(Sniffer|SnifferPlain|SnifferCompact|Parquet|Parquet_ZSTD)/manual_time$' \
+  --benchmark_repetitions=11 --benchmark_min_time=0.03s \
+  --benchmark_report_aggregates_only=true --benchmark_format=json
+```
+
+### Plain 全非空变长列直接写最终 payload
+
+2026-09-25，Apple M4 / Apple Clang 21 / Arrow 23.0.1 / Release / 单线程 / warm-cache。
+`Compression/high_cardinality_string_Sniffer`：100,000 行、Row Group 4,096，25 个
+chunk 均自适应选择 Plain。11 次重复、每次至少 0.03 秒；完整编码写入 P50 从
+4.551 ms（改前）到 4.519 ms（改后），文件均为 3,203,894 字节，压缩比均为
+0.874x。另一次独立的改后 21 次重复、每次至少 0.05 秒，P50 为 4.542 ms，
+写入耗时 CV 12.4%。首次 A/B 差异约 0.7%，处于波动范围内，**不宣称端到端提速**。
+实现减少了 offsets/values 中间 buffer 到最终 payload 的拷贝与分配；持久化字节
+及 nullable 路径未变。切片、空数组和含 `0x00`/`0xff` 的 binary 与逐行参考编码
+逐字节比较，并通过 Release 全量测试及 ASan 相关测试。复现完整写入测量：
+
+```sh
+./build-release/sniffer_core_compression_benchmark \
+  '--benchmark_filter=^Compression/high_cardinality_string_Sniffer/manual_time$' \
+  --benchmark_repetitions=11 --benchmark_min_time=0.03s \
+  --benchmark_report_aggregates_only=true --benchmark_format=json
+```
+
+### 扫描计划的谓词列紧凑槽位
+
+2026-09-25，Apple M4 / Apple Clang 21 / Arrow 23.0.1 / Release / 单线程 / warm-cache。
+100,000 行，确定性递增 `id`、32 个 `group` 值、nullable `value`；下表为
+Sniffer scan P50（ms），每轮 11 次重复、至少 0.05 秒。改前逐 Row Group 建立
+`unordered_map`；改后在 `IOPlan` 校验时为谓词和排序键列分配紧凑槽位，逐组只
+分配对应数量的指针。三谓词 case 用 4,096 行 Row Group、50% 的第一谓词
+选择率，输出 1,470 行；矩阵 case 用 1,024 行 Row Group，输出列数与选择率
+见表。扫描计时包含 Reader Open、块读取与 CRC、解码、谓词、输出 batch；
+不含本轮写入时间。
+
+| 场景 | 改前 | 改后第一轮 | 改后第二轮 | ColumnChunk 读取数 |
+|---|---:|---:|---:|---:|
+| 三谓词，2 列投影 | 1.576 | 1.542 | 1.537 | 39 |
+| 50% 命中，3 列投影 | 1.878 | 1.837 | 1.820 | 150 |
+| 100% 命中，3 列投影 | 3.351 | 3.231 | 3.244 | 294 |
+
+各 case 的输出行数、读取块数、拼接次数均不变；当前观察到约 2%–4% 的
+扫描耗时下降，但这不是跨机器承诺，也没有解决跨组 Arrow 数组拼接。
+额外试过对齐输出直接复用完整 `RecordBatch`：虽然 25 次 output slice 降为零，
+100,000 行 / Row Group 4,096 / 两列无谓词全扫的 P50 从 1.017 ms 变成
+1.037/1.051 ms，故撤回该路径。当前保持既有 batch 边界与拼接语义。
+复现紧凑槽位测量：
+
+```sh
+./build-release/sniffer_core_performance_benchmark \
+  '--benchmark_filter=^PerformanceMatrix/Sniffer/rows:100000/row_group_rows:1024/selectivity_percent:(50|100)/projection_columns:3/manual_time$|^Performance/SnifferThreePredicates/100000/4096/manual_time$' \
+  --benchmark_repetitions=11 --benchmark_min_time=0.05s \
+  --benchmark_report_aggregates_only=true --benchmark_format=json
+```

@@ -66,11 +66,78 @@ std::vector<uint8_t> EncodeValidity(const arrow::Array& array) {
   return validity;
 }
 
+arrow::Result<std::vector<uint8_t>> EncodePlainAllValidBinary(const arrow::BinaryArray& array,
+                                                              uint32_t offset_width) {
+  ARROW_ASSIGN_OR_RAISE(const uint64_t offset_count,
+                        internal::CheckedAdd(static_cast<uint64_t>(array.length()), uint64_t{1}));
+  ARROW_ASSIGN_OR_RAISE(const uint64_t offset_bytes,
+                        internal::CheckedMultiply(offset_count, offset_width));
+  const int64_t first_offset = array.value_offset(0);
+  const int64_t last_offset = array.value_offset(array.length());
+  if (first_offset < 0 || last_offset < first_offset) {
+    return arrow::Status::Invalid("[sniffer.writer.input] invalid Arrow binary offsets");
+  }
+  const uint64_t value_bytes = static_cast<uint64_t>(last_offset - first_offset);
+  if (offset_width == 4 && value_bytes > std::numeric_limits<uint32_t>::max()) {
+    return arrow::Status::Invalid("[sniffer.codec.limit] CompactPlain values exceed 32-bit offset");
+  }
+  const auto value_data = array.value_data();
+  if (value_bytes != 0 && (!value_data || last_offset > value_data->size())) {
+    return arrow::Status::Invalid("[sniffer.writer.input] missing Arrow binary values");
+  }
+  ARROW_ASSIGN_OR_RAISE(const uint64_t header_and_offsets,
+                        internal::CheckedAdd(uint64_t{24}, offset_bytes));
+  ARROW_ASSIGN_OR_RAISE(const uint64_t payload_size,
+                        internal::CheckedAdd(header_and_offsets, value_bytes));
+  if (payload_size > std::numeric_limits<size_t>::max()) {
+    return arrow::Status::Invalid("[sniffer.format.limit] Plain payload exceeds platform limit");
+  }
+
+  // Persisted offsets must be normalized and little-endian; Arrow value bytes
+  // still need one copy into the owned, immutable payload.
+  ByteWriter payload;
+  payload.Reserve(static_cast<size_t>(payload_size));
+  payload.WriteU64(0);
+  payload.WriteU64(offset_bytes);
+  payload.WriteU64(value_bytes);
+  if (offset_width == 4) {
+    payload.WriteU32(0);
+  } else {
+    payload.WriteU64(0);
+  }
+  for (int64_t index = 0; index < array.length(); ++index) {
+    const int64_t offset = array.value_offset(index + 1) - first_offset;
+    if (offset < 0 || offset > last_offset - first_offset) {
+      return arrow::Status::Invalid("[sniffer.writer.input] invalid Arrow binary offsets");
+    }
+    if (offset_width == 4) {
+      payload.WriteU32(static_cast<uint32_t>(offset));
+    } else {
+      payload.WriteU64(static_cast<uint64_t>(offset));
+    }
+  }
+  if (value_bytes != 0) {
+    payload.WriteBytes(std::span<const uint8_t>(value_data->data() + first_offset,
+                                                static_cast<size_t>(value_bytes)));
+  }
+  return std::move(payload).Finish();
+}
+
 arrow::Result<std::vector<uint8_t>> EncodePlainImpl(const FieldSpec& field,
-                                                    const arrow::Array& array) {
+                                                    const arrow::Array& array,
+                                                    uint32_t offset_width) {
   // Plain serialization deliberately copies values so persisted bytes have an
   // explicit endian and deterministic contents for Arrow null slots.
   ARROW_ASSIGN_OR_RAISE(const auto physical_type, internal::PhysicalTypeFor(*field.type));
+  if (offset_width == 4 && physical_type != internal::PhysicalTypeId::kString &&
+      physical_type != internal::PhysicalTypeId::kBinary) {
+    return arrow::Status::NotImplemented("[sniffer.codec.encoding] CompactPlain requires binary");
+  }
+  if ((physical_type == internal::PhysicalTypeId::kString ||
+       physical_type == internal::PhysicalTypeId::kBinary) &&
+      array.null_count() == 0) {
+    return EncodePlainAllValidBinary(static_cast<const arrow::BinaryArray&>(array), offset_width);
+  }
   auto validity = EncodeValidity(array);
   ByteWriter offsets;
   ByteWriter values;
@@ -144,50 +211,33 @@ arrow::Result<std::vector<uint8_t>> EncodePlainImpl(const FieldSpec& field,
           const uint64_t offset_count,
           internal::CheckedAdd(static_cast<uint64_t>(typed.length()), uint64_t{1}));
       ARROW_ASSIGN_OR_RAISE(const uint64_t offset_bytes,
-                            internal::CheckedMultiply(offset_count, uint64_t{8}));
+                            internal::CheckedMultiply(offset_count, offset_width));
       if (offset_bytes > std::numeric_limits<size_t>::max()) {
         return arrow::Status::Invalid("[sniffer.format.limit] Plain offsets exceed platform limit");
       }
       offsets.Reserve(static_cast<size_t>(offset_bytes));
-      offsets.WriteU64(0);
-      if (typed.null_count() == 0) {
-        const int64_t first_offset = typed.value_offset(0);
-        const int64_t last_offset = typed.value_offset(typed.length());
-        if (first_offset < 0 || last_offset < first_offset) {
-          return arrow::Status::Invalid("[sniffer.writer.input] invalid Arrow binary offsets");
-        }
-        const uint64_t value_bytes = static_cast<uint64_t>(last_offset - first_offset);
-        if (value_bytes > std::numeric_limits<size_t>::max()) {
-          return arrow::Status::Invalid(
-              "[sniffer.format.limit] Plain values exceed platform limit");
-        }
-        values.Reserve(static_cast<size_t>(value_bytes));
-        for (int64_t index = 0; index < typed.length(); ++index) {
-          const int64_t offset = typed.value_offset(index + 1) - first_offset;
-          if (offset < 0) {
-            return arrow::Status::Invalid("[sniffer.writer.input] invalid Arrow binary offsets");
-          }
-          offsets.WriteU64(static_cast<uint64_t>(offset));
-        }
-        const auto value_data = typed.value_data();
-        if (value_bytes != 0 && !value_data) {
-          return arrow::Status::Invalid("[sniffer.writer.input] missing Arrow binary values");
-        }
-        if (value_bytes != 0) {
-          values.WriteBytes(std::span<const uint8_t>(value_data->data() + first_offset,
-                                                     static_cast<size_t>(value_bytes)));
-        }
+      if (offset_width == 4) {
+        offsets.WriteU32(0);
       } else {
-        uint64_t current_offset = 0;
-        for (int64_t index = 0; index < typed.length(); ++index) {
-          if (typed.IsValid(index)) {
-            const std::string_view value = typed.GetView(index);
-            ARROW_ASSIGN_OR_RAISE(
-                current_offset,
-                internal::CheckedAdd(current_offset, static_cast<uint64_t>(value.size())));
-            values.WriteBytes(std::span<const uint8_t>(
-                reinterpret_cast<const uint8_t*>(value.data()), value.size()));
+        offsets.WriteU64(0);
+      }
+      uint64_t current_offset = 0;
+      for (int64_t index = 0; index < typed.length(); ++index) {
+        if (typed.IsValid(index)) {
+          const std::string_view value = typed.GetView(index);
+          ARROW_ASSIGN_OR_RAISE(
+              current_offset,
+              internal::CheckedAdd(current_offset, static_cast<uint64_t>(value.size())));
+          if (offset_width == 4 && current_offset > std::numeric_limits<uint32_t>::max()) {
+            return arrow::Status::Invalid(
+                "[sniffer.codec.limit] CompactPlain values exceed 32-bit offset");
           }
+          values.WriteBytes(std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(value.data()),
+                                                     value.size()));
+        }
+        if (offset_width == 4) {
+          offsets.WriteU32(static_cast<uint32_t>(current_offset));
+        } else {
           offsets.WriteU64(current_offset);
         }
       }
@@ -222,7 +272,12 @@ arrow::Result<std::vector<uint8_t>> EncodePlainImpl(const FieldSpec& field,
 namespace internal {
 
 arrow::Result<std::vector<uint8_t>> EncodePlain(const FieldSpec& field, const arrow::Array& array) {
-  return EncodePlainImpl(field, array);
+  return EncodePlainImpl(field, array, 8);
+}
+
+arrow::Result<std::vector<uint8_t>> EncodeCompactPlain(const FieldSpec& field,
+                                                       const arrow::Array& array) {
+  return EncodePlainImpl(field, array, 4);
 }
 
 }  // namespace internal
@@ -356,9 +411,15 @@ class SegmentWriter::Impl {
                       });
       {
         internal::NanosecondTimer timer(metrics_ ? &metrics_->encoding_nanoseconds : nullptr);
-        if (encoding_id == internal::kPlainEncodingId) {
-          ARROW_ASSIGN_OR_RAISE(payload, internal::EncodePlain(field, *array));
-          uncompressed_length = static_cast<uint64_t>(payload.size());
+        if (encoding_id == internal::kPlainEncodingId ||
+            encoding_id == internal::kCompactPlainEncodingId) {
+          if (encoding_id == internal::kPlainEncodingId) {
+            ARROW_ASSIGN_OR_RAISE(payload, internal::EncodePlain(field, *array));
+            uncompressed_length = static_cast<uint64_t>(payload.size());
+          } else {
+            ARROW_ASSIGN_OR_RAISE(uncompressed_length, internal::PlainEncodedSize(field, *array));
+            ARROW_ASSIGN_OR_RAISE(payload, internal::EncodeCompactPlain(field, *array));
+          }
         } else {
           ARROW_ASSIGN_OR_RAISE(uncompressed_length, internal::PlainEncodedSize(field, *array));
           const internal::StatisticsMeta* statistics = nullptr;

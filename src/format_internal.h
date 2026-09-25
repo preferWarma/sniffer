@@ -27,6 +27,7 @@ inline constexpr uint16_t kPlainEncodingMinor = 0;
 inline constexpr uint16_t kDictionaryEncodingId = 1;
 inline constexpr uint16_t kRleEncodingId = 2;
 inline constexpr uint16_t kForBitpackEncodingId = 3;
+inline constexpr uint16_t kCompactPlainEncodingId = 4;
 inline constexpr uint16_t kEncodingMajor = 1;
 inline constexpr uint16_t kEncodingMinor = 0;
 

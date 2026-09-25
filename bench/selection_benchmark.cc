@@ -2,14 +2,24 @@
 #include <arrow/util/config.h>
 #include <benchmark/benchmark.h>
 
+#include <algorithm>
 #include <bit>
+#include <chrono>
+#include <cstddef>
 #include <cstdint>
+#include <filesystem>
+#include <memory>
 #include <span>
+#include <string>
+#include <system_error>
 #include <utility>
 #include <vector>
 
 #include "benchmark_build_config.h"
 #include "codec_internal.h"
+#include "sniffer/io_plan.h"
+#include "sniffer/segment_reader.h"
+#include "sniffer/segment_writer.h"
 
 namespace {
 
@@ -242,6 +252,163 @@ BENCHMARK_CAPTURE(PlainSelectedDecode, Bitmap, Representation::kBitmap)
     ->Apply(ApplySelectionMatrix)
     ->ArgNames({"rows", "selectivity_percent", "distribution"});
 
+struct ScanResult {
+  uint64_t rows = 0;
+  uint64_t nulls = 0;
+  uint64_t sum = 0;
+  uint64_t indices = 0;
+  uint64_t chunks_read = 0;
+};
+
+arrow::Result<ScanResult> ScanSelectedPlain(const sniffer::SegmentReader& reader,
+                                            const sniffer::IOPlan& plan) {
+  auto metrics = std::make_shared<sniffer::ScanMetrics>();
+  ARROW_ASSIGN_OR_RAISE(auto iterator, reader.Scan(plan, metrics));
+  ScanResult result;
+  while (true) {
+    ARROW_ASSIGN_OR_RAISE(auto batch, iterator.Next());
+    if (!batch) {
+      break;
+    }
+    const auto& values = static_cast<const arrow::Int64Array&>(*batch->column(0));
+    for (int64_t row = 0; row < values.length(); ++row) {
+      if (values.IsNull(row)) {
+        ++result.nulls;
+      } else {
+        result.sum += static_cast<uint64_t>(values.Value(row));
+      }
+    }
+    result.rows += static_cast<uint64_t>(values.length());
+  }
+  result.indices = metrics->selection_indices_materialized;
+  result.chunks_read = metrics->column_chunks_read;
+  return result;
+}
+
+void FullScanSelection(benchmark::State& state) {
+  constexpr uint64_t kRows = 100000;
+  constexpr uint32_t kRowGroupRows = 8192;
+  const auto percent = static_cast<uint64_t>(state.range(0));
+  const auto distribution = static_cast<Distribution>(state.range(1));
+  const auto mask = MakeMask(kRows, percent, distribution);
+  arrow::BooleanBuilder filter_builder;
+  arrow::Int64Builder value_builder;
+  if (!filter_builder.Reserve(static_cast<int64_t>(kRows)).ok() ||
+      !value_builder.Reserve(static_cast<int64_t>(kRows)).ok()) {
+    state.SkipWithError("failed to reserve scan input");
+    return;
+  }
+  ScanResult expected;
+  for (uint64_t row = 0; row < kRows; ++row) {
+    const bool matched = mask[static_cast<size_t>(row)] != 0;
+    const int64_t value = static_cast<int64_t>(Mix(row + kRows));
+    const auto filter_status = filter_builder.Append(matched);
+    const auto value_status =
+        row % 17U == 0 ? value_builder.AppendNull() : value_builder.Append(value);
+    if (!filter_status.ok() || !value_status.ok()) {
+      state.SkipWithError("failed to build scan input");
+      return;
+    }
+    if (matched) {
+      ++expected.rows;
+      if (row % 17U == 0) {
+        ++expected.nulls;
+      } else {
+        expected.sum += static_cast<uint64_t>(value);
+      }
+    }
+  }
+  std::shared_ptr<arrow::Array> filter;
+  std::shared_ptr<arrow::Array> values;
+  if (!filter_builder.Finish(&filter).ok() || !value_builder.Finish(&values).ok()) {
+    state.SkipWithError("failed to finish scan input");
+    return;
+  }
+  sniffer::TableSchema schema{1,
+                              {{1, "match", arrow::boolean(), false, nullptr},
+                               {2, "payload", arrow::int64(), true, nullptr}}};
+  auto arrow_schema = schema.ToArrowSchema();
+  if (!arrow_schema.ok()) {
+    state.SkipWithError(arrow_schema.status().ToString().c_str());
+    return;
+  }
+  auto batch = arrow::RecordBatch::Make(*arrow_schema, static_cast<int64_t>(kRows),
+                                        {std::move(filter), std::move(values)});
+  sniffer::LayoutPolicy policy;
+  policy.target_row_group_rows = kRowGroupRows;
+  policy.field_encodings = {{1, sniffer::EncodingKind::kPlain}, {2, sniffer::EncodingKind::kPlain}};
+  std::error_code error;
+  const auto temp_root = std::filesystem::temp_directory_path(error);
+  if (error) {
+    state.SkipWithError("failed to locate temporary directory");
+    return;
+  }
+  const auto suffix = std::chrono::steady_clock::now().time_since_epoch().count();
+  const auto path = temp_root / ("sniffer_selection_scan_" + std::to_string(suffix) + ".seg");
+  struct Cleanup {
+    std::filesystem::path path;
+    ~Cleanup() {
+      std::error_code ignored;
+      std::filesystem::remove(path, ignored);
+    }
+  } cleanup{path};
+  auto writer = sniffer::SegmentWriter::Open(path.string(), schema, policy);
+  if (!writer.ok() || !(*writer)->Append(batch).ok() || !(*writer)->Finish().ok()) {
+    state.SkipWithError("failed to write selection scan segment");
+    return;
+  }
+  auto reader = sniffer::SegmentReader::Open(path.string());
+  if (!reader.ok()) {
+    state.SkipWithError(reader.status().ToString().c_str());
+    return;
+  }
+  sniffer::IOPlan plan;
+  plan.projection_field_ids = {2};
+  plan.conjunctive_predicates = {
+      {1, sniffer::Predicate::Op::kEq, std::make_shared<arrow::BooleanScalar>(true)}};
+  plan.output_batch_rows = kRowGroupRows;
+  auto reference = ScanSelectedPlain(**reader, plan);
+  uint64_t expected_chunks = (kRows + kRowGroupRows - 1U) / kRowGroupRows;
+  for (uint64_t begin = 0; begin < kRows; begin += kRowGroupRows) {
+    const uint64_t end = std::min<uint64_t>(begin + kRowGroupRows, kRows);
+    if (std::find(mask.begin() + static_cast<std::ptrdiff_t>(begin),
+                  mask.begin() + static_cast<std::ptrdiff_t>(end),
+                  uint8_t{1}) != mask.begin() + static_cast<std::ptrdiff_t>(end)) {
+      ++expected_chunks;
+    }
+  }
+  if (!reference.ok() || reference->rows != expected.rows || reference->nulls != expected.nulls ||
+      reference->sum != expected.sum || reference->chunks_read != expected_chunks) {
+    state.SkipWithError("selection scan differs from independent reference");
+    return;
+  }
+  for (auto _ : state) {
+    auto result = ScanSelectedPlain(**reader, plan);
+    if (!result.ok()) {
+      state.SkipWithError(result.status().ToString().c_str());
+      break;
+    }
+    benchmark::DoNotOptimize(result->sum);
+  }
+  state.counters["selected_rows"] = static_cast<double>(expected.rows);
+  state.counters["selection_indices"] = static_cast<double>(reference->indices);
+  state.counters["chunks_read"] = static_cast<double>(reference->chunks_read);
+  state.counters["row_group_rows"] = kRowGroupRows;
+  state.SetItemsProcessed(state.iterations() * static_cast<int64_t>(kRows));
+}
+
+void ApplyFullScanMatrix(benchmark::internal::Benchmark* benchmark_case) {
+  for (const int64_t percent : {int64_t{1}, int64_t{10}, int64_t{50}, int64_t{100}}) {
+    for (const int64_t distribution : {int64_t{0}, int64_t{1}}) {
+      benchmark_case->Args({percent, distribution});
+    }
+  }
+}
+
+BENCHMARK(FullScanSelection)
+    ->Apply(ApplyFullScanMatrix)
+    ->ArgNames({"selectivity_percent", "distribution"});
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -252,6 +419,7 @@ int main(int argc, char** argv) {
   benchmark::AddCustomContext("timed_work", "build_representation_and_sum_selected_values");
   benchmark::AddCustomContext("plain_decode_timed_work",
                               "prebuilt_selection_to_nullable_int64_Arrow_array");
+  benchmark::AddCustomContext("full_scan_timed_work", "reader_scan_and_consume_nullable_int64");
   benchmark::Initialize(&argc, argv);
   if (benchmark::ReportUnrecognizedArguments(argc, argv)) {
     return 1;
