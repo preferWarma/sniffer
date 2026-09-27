@@ -578,3 +578,43 @@ Parquet 基准适配器针对有序 `id` 使用 min/max + slice，而非通用�
   --benchmark_repetitions=11 --benchmark_min_time=0.05s \
   --benchmark_report_aggregates_only=true --benchmark_format=csv
 ```
+
+### FOR decode 的密集值快路径
+
+2026-09-27，Apple M4 / Apple Clang 21 / Arrow C++ 23.0.1 / Release / warm-cache。
+上述 500,000 行、两列有序 int64、Row Group 8,192、50% 命中查询的
+`ScanMetrics` 显示：改动前单线程总计时 P50 2.598 ms，其中 FOR 等解码
+1.545 ms、谓词 0.744 ms、跨组拼接 0.101 ms（31 次）、chunk I/O
+0.061 ms、CRC 0.091 ms。故跨组拼接虽频繁，却不是此数据集的主要耗时。
+
+针对 FOR decoder，在预留完整输出容量后改用 Arrow builder 的 `UnsafeAppend`
+/`UnsafeAppendNull`；无 null payload 单独走密集循环，避免每行检查 validity。
+delta 域检查、payload 边界校验与最终 `ValidateFull()` 保持不变，不修改文件字节。
+改动前 7 次、改动后 11 次，均为至少 0.05 秒的独立重复，以下为 P50：
+
+| 路径 | 改动前 | 改动后 |
+|---|---:|---:|
+| 共享 Reader，1 线程查询 | 2.598 ms | 1.955 ms |
+| 共享 Reader，8 线程查询 | 3.946 ms | 3.288 ms |
+| 单线程解码阶段 | 1.545 ms | 0.932 ms |
+| 单线程谓词阶段 | 0.744 ms | 0.694 ms |
+| 单线程跨组拼接阶段 | 0.101 ms | 0.103 ms |
+
+单线程端到端约降 25%，8 线程约降 17%；解码阶段约降 40%。这只是
+有序双 int64/FOR 占主导的合成查询，不意味着其他 encoding 均提速。
+FOR codec 的独立 100,000 行、128 值范围 decode microbenchmark 在改动后
+11 次 P50 为 209.15 µs、100,040 encoded bytes；此处不拿历史不同版本的
+microbenchmark 当作同条件 before 值。
+
+复现：
+
+```sh
+./build-release/sniffer_core_concurrency_benchmark \
+  '--benchmark_filter=^ConcurrentScan/(SharedReader|IndependentReaders)/real_time/threads:(1|8)$' \
+  --benchmark_repetitions=11 --benchmark_min_time=0.05s \
+  --benchmark_report_aggregates_only=true --benchmark_format=csv
+./build-release/sniffer_core_codec_benchmark \
+  '--benchmark_filter=^Codec/for_bitpack_128_range_Decode$' \
+  --benchmark_repetitions=11 --benchmark_min_time=0.05s \
+  --benchmark_report_aggregates_only=true --benchmark_format=csv
+```

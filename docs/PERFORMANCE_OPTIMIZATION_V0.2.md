@@ -1239,3 +1239,14 @@ CV 为 0.46%。Dictionary payload 仍为 113,058 字节，完整 Segment 仍为 
 - 结论限定于有序双 int64 合成数据：Parquet 无 codec 压缩更快但文件更大；
   Sniffer 比 Parquet ZSTD 更小且更快。尚未覆盖冷缓存、RSS/分配量、不同
   选择率或单请求内部并行，不能泛化为整体格式胜负。
+
+### 2026-09-27：FOR 解码热点定位与密集值快路径
+
+- 对前述并发查询补 `ScanMetrics` 阶段耗时：改动前 1 线程 2.598 ms P50，
+  解码 1.545 ms、谓词 0.744 ms、跨组拼接 0.101 ms，故优先处理 FOR
+  decoder 而非拼接。
+- FOR 在 `Reserve` 后使用 builder `UnsafeAppend`；无 null 时避免逐行 validity
+  检查，null 路径保留，delta 域检查和 `ValidateFull()` 不变。1/8 线程查询
+  P50 2.598/3.946 → 1.955/3.288 ms；单线程解码 1.545 → 0.932 ms。
+  文件格式与输出语义不变。全部位宽的含 null、无 null、selected decode
+  回归已补齐；原始方法与数据见 [`bench/BENCHMARK_V2.md`](../bench/BENCHMARK_V2.md)。

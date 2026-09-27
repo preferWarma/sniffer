@@ -197,8 +197,9 @@ const arrow::Result<std::shared_ptr<Fixture>>& SharedFixture() {
 }
 
 arrow::Result<int64_t> ScanSniffer(const sniffer::SegmentReader& reader,
-                                   const sniffer::IOPlan& plan, bool verify_values) {
-  ARROW_ASSIGN_OR_RAISE(auto iterator, reader.Scan(plan));
+                                   const sniffer::IOPlan& plan, bool verify_values,
+                                   const std::shared_ptr<sniffer::ScanMetrics>& metrics) {
+  ARROW_ASSIGN_OR_RAISE(auto iterator, reader.Scan(plan, metrics));
   int64_t selected_rows = 0;
   int64_t expected_id = kRows / 2;
   while (true) {
@@ -247,15 +248,17 @@ void ConcurrentScan(benchmark::State& state, bool share_reader) {
   plan.conjunctive_predicates = {
       {1, sniffer::Predicate::Op::kGe, std::make_shared<arrow::Int64Scalar>(kRows / 2)}};
   plan.output_batch_rows = kRowGroupRows;
-  const auto verified = ScanSniffer(reader, plan, true);
+  const auto verified = ScanSniffer(reader, plan, true, nullptr);
   if (!verified.ok() || *verified != kRows / 2) {
     state.SkipWithError(verified.ok() ? "Sniffer reference scan row count mismatch"
                                       : verified.status().ToString());
     return;
   }
+  sniffer::ScanMetrics totals;
   for (auto _ : state) {
     (void)_;
-    auto result = ScanSniffer(reader, plan, false);
+    auto metrics = std::make_shared<sniffer::ScanMetrics>();
+    auto result = ScanSniffer(reader, plan, false, metrics);
     if (!result.ok()) {
       state.SkipWithError(result.status().ToString());
       return;
@@ -264,7 +267,32 @@ void ConcurrentScan(benchmark::State& state, bool share_reader) {
       state.SkipWithError("concurrent scan row count mismatch");
       return;
     }
+    totals.pruning_nanoseconds += metrics->pruning_nanoseconds;
+    totals.chunk_io_nanoseconds += metrics->chunk_io_nanoseconds;
+    totals.chunk_checksum_nanoseconds += metrics->chunk_checksum_nanoseconds;
+    totals.decode_nanoseconds += metrics->decode_nanoseconds;
+    totals.predicate_nanoseconds += metrics->predicate_nanoseconds;
+    totals.projection_nanoseconds += metrics->projection_nanoseconds;
+    totals.batch_materialization_nanoseconds += metrics->batch_materialization_nanoseconds;
+    totals.output_concatenation_nanoseconds += metrics->output_concatenation_nanoseconds;
+    totals.output_concatenations += metrics->output_concatenations;
   }
+  const double metric_divisor =
+      static_cast<double>(state.iterations()) * 1e6 * static_cast<double>(state.threads());
+  const auto phase = [&](const char* name, uint64_t nanoseconds) {
+    state.counters[name] = static_cast<double>(nanoseconds) / metric_divisor;
+  };
+  phase("prune_ms", totals.pruning_nanoseconds);
+  phase("chunk_io_ms", totals.chunk_io_nanoseconds);
+  phase("chunk_crc_ms", totals.chunk_checksum_nanoseconds);
+  phase("decode_ms", totals.decode_nanoseconds);
+  phase("predicate_ms", totals.predicate_nanoseconds);
+  phase("projection_ms", totals.projection_nanoseconds);
+  phase("batch_ms", totals.batch_materialization_nanoseconds);
+  phase("concat_ms", totals.output_concatenation_nanoseconds);
+  state.counters["concats"] =
+      static_cast<double>(totals.output_concatenations) /
+      (static_cast<double>(state.iterations()) * static_cast<double>(state.threads()));
   state.counters["input_rows"] = static_cast<double>(kRows);
   state.counters["selected_rows"] = static_cast<double>(kRows / 2);
   state.counters["row_group_rows"] = static_cast<double>(kRowGroupRows);

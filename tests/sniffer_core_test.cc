@@ -1425,6 +1425,27 @@ TEST(SnifferCoreTest, ForBitpackAllBitWidthsMatchReference) {
         {uint64_t{0}, std::nullopt, maximum / 3U, maximum});
     EXPECT_TRUE(selected->Equals(selected_expected))
         << "FOR selected round-trip differs at bit width " << bit_width;
+
+    const auto dense =
+        BuildArray<arrow::UInt64Builder, uint64_t>({uint64_t{0}, maximum, maximum / 3U, maximum});
+    const auto dense_payload = ValueOrThrow(
+        sniffer::internal::EncodeNonPlain(sniffer::internal::kForBitpackEncodingId, field, *dense),
+        "encode dense FOR bit-width payload");
+    chunk.row_count = static_cast<uint64_t>(dense->length());
+    chunk.null_count = 0;
+    chunk.length = static_cast<uint64_t>(dense_payload.size());
+    const auto dense_decoded =
+        ValueOrThrow(sniffer::internal::DecodeNonPlain(field, chunk, dense_payload),
+                     "decode dense FOR bit-width payload");
+    EXPECT_TRUE(dense_decoded->Equals(dense))
+        << "dense FOR round-trip differs at bit width " << bit_width;
+    const std::vector<uint64_t> dense_selection = {1, 3};
+    const auto dense_selected = ValueOrThrow(
+        sniffer::internal::DecodeNonPlain(field, chunk, dense_payload, &dense_selection),
+        "decode selected dense FOR bit-width payload");
+    const auto dense_expected = BuildArray<arrow::UInt64Builder, uint64_t>({maximum, maximum});
+    EXPECT_TRUE(dense_selected->Equals(dense_expected))
+        << "dense selected FOR round-trip differs at bit width " << bit_width;
   }
 }
 

@@ -914,16 +914,26 @@ arrow::Result<std::shared_ptr<arrow::Array>> DecodeForRows(const Rows& rows,
     return InvalidCodec("decoded FOR array exceeds Arrow limit");
   }
   ARROW_RETURN_NOT_OK(builder->Reserve(static_cast<int64_t>(output_rows)));
-  for (const uint64_t row : rows) {
-    if (!IsValid(validity, row)) {
-      ARROW_RETURN_NOT_OK(builder->AppendNull());
-      continue;
+  if (validity.empty()) {
+    for (const uint64_t row : rows) {
+      const uint64_t delta = ReadPackedDelta(packed, row, bit_width);
+      if (delta > maximum_delta) {
+        return InvalidCodec("FOR delta exceeds physical type domain");
+      }
+      builder->UnsafeAppend(convert(base_bits + delta));
     }
-    const uint64_t delta = ReadPackedDelta(packed, row, bit_width);
-    if (delta > maximum_delta) {
-      return InvalidCodec("FOR delta exceeds physical type domain");
+  } else {
+    for (const uint64_t row : rows) {
+      if (!IsValid(validity, row)) {
+        builder->UnsafeAppendNull();
+        continue;
+      }
+      const uint64_t delta = ReadPackedDelta(packed, row, bit_width);
+      if (delta > maximum_delta) {
+        return InvalidCodec("FOR delta exceeds physical type domain");
+      }
+      builder->UnsafeAppend(convert(base_bits + delta));
     }
-    ARROW_RETURN_NOT_OK(builder->Append(convert(base_bits + delta)));
   }
   std::shared_ptr<arrow::Array> result;
   ARROW_RETURN_NOT_OK(builder->Finish(&result));
