@@ -201,7 +201,8 @@ if(SNIFFER_BUILD_BENCHMARK)
     sniffer_core_concurrency_benchmark PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/generated"
   )
   target_link_libraries(
-    sniffer_core_concurrency_benchmark PRIVATE sniffer_core benchmark::benchmark Threads::Threads
+    sniffer_core_concurrency_benchmark
+    PRIVATE sniffer_core sniffer_parquet benchmark::benchmark Threads::Threads
   )
   if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
     target_compile_options(
@@ -246,6 +247,12 @@ if(SNIFFER_BUILD_BENCHMARK)
       NAME sniffer_core_concurrency_benchmark_smoke
       COMMAND sniffer_core_concurrency_benchmark
         "--benchmark_filter=^ConcurrentScan/SharedReader/real_time/threads:2$"
+        --benchmark_dry_run
+    )
+    add_test(
+      NAME sniffer_core_parquet_concurrency_benchmark_smoke
+      COMMAND sniffer_core_concurrency_benchmark
+        "--benchmark_filter=^ParquetConcurrentScan/Parquet/real_time/threads:2$"
         --benchmark_dry_run
     )
     add_test(
@@ -350,6 +357,7 @@ if(SNIFFER_BUILD_BENCHMARK)
       sniffer_core_codec_benchmark_smoke
       sniffer_core_selection_benchmark_smoke
       sniffer_core_concurrency_benchmark_smoke
+      sniffer_core_parquet_concurrency_benchmark_smoke
       sniffer_core_performance_benchmark_json_smoke
       sniffer_core_parquet_performance_benchmark_json_smoke
       sniffer_core_wide_performance_benchmark_json_smoke

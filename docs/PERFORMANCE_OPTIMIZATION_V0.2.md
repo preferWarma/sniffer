@@ -229,6 +229,8 @@ SIMD、多级编码链和新压缩算法只有在标量路径完成剖析和优�
       错误/取消传播，不创建无上限异步任务。若需要新公共配置，先确定向后兼容的 API 语义。
 - [ ] 增加 1/2/4/8 线程吞吐、单请求延迟、峰值 RSS 和分配量 benchmark；并发多查询与单查询
       内部并行分别报告，在相同硬件、数据、Row Group、选择率与线程预算下对照 Parquet。
+  - [x] 多查询 1/2/4/8 线程的 Sniffer 共享/独立 Reader、Parquet 无 codec 压缩/ZSTD
+        对照已测；逐值验证 Parquet 结果。单请求内部并行、RSS 和分配量仍未测。
 
 ### 8.3 可选向量化（P3）
 
@@ -1223,3 +1225,17 @@ CV 为 0.46%。Dictionary payload 仍为 113,058 字节，完整 Segment 仍为 
   对照、内存预算和受控内部并行仍未完成。
 - Release 与 ASan/UBSan 全量 82/82 通过，ThreadSanitizer 单测全量 66/66 通过；
   尚未在当前报告中给出 Parquet 同条件线程扩展、长时压力或大文件冷缓存结果。
+
+### 2026-09-27：同条件 Parquet 多查询并发基线
+
+- 同一确定性 500,000 行双 int64、Row Group 8,192、50% 选择率、两列投影；
+  Parquet 采用每线程独立 Reader、Row Group 统计剪枝和有序 `id` 边界 slice，
+  不含内部线程池或 Reader 构造时间；两边计时前均逐值验证并热身。
+- Apple M4 / Release / warm-cache、7 次 P50（ms），1/8 线程：Sniffer 独立
+  Reader 2.634/4.049；Parquet 无 codec 压缩 1.104/2.797；Parquet ZSTD
+  4.519/6.568。11 次复测维持同方向。文件分别为 1.958/9.654/2.721 MB。
+  完整 1/2/4/8 线程数据与复现命令见
+  [`bench/BENCHMARK_V2.md`](../bench/BENCHMARK_V2.md)。
+- 结论限定于有序双 int64 合成数据：Parquet 无 codec 压缩更快但文件更大；
+  Sniffer 比 Parquet ZSTD 更小且更快。尚未覆盖冷缓存、RSS/分配量、不同
+  选择率或单请求内部并行，不能泛化为整体格式胜负。

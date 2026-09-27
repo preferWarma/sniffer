@@ -537,3 +537,44 @@ cmake --build build-release-stream -j --target sniffer_core_concurrency_benchmar
   --benchmark_repetitions=7 --benchmark_min_time=0.05s \
   --benchmark_report_aggregates_only=true --benchmark_format=csv
 ```
+
+### 多查询并发：同条件 Parquet 对照
+
+2026-09-27，在上述 Apple M4 / Arrow 23.0.1 / Apple Clang 21 / Release / warm-cache
+环境下，使用相同的 500,000 行双 int64 输入、Row Group 8,192、
+`id >= 250000` 和两列投影。Parquet 使用仓库已有 Arrow C++ reader/writer，
+分别测试无 codec 压缩与 ZSTD（均保留默认 dictionary 设置）。每线程持有独立
+Parquet Reader，Reader 构造和写文件不计时；Arrow reader 内部线程关闭。
+每次查询用 `id` Row Group min/max 剪枝、仅读两列，再利用本数据全局有序且
+非 null 的 `id` 对边界 batch 做零拷贝 slice。Sniffer 独立 Reader 是最直接的
+对照，另保留共享 Reader 的服务端常见用法。基准计时外均先热身扫描并逐值验证
+输出等于生成数据，计时内校验两边命中行数。两边均未使用内部并行扫描。
+
+每 case 7 次、最短 0.05 秒，表中为 Google Benchmark `real_time` P50（ms）；
+1/8 线程又各做 11 次独立复测。
+
+| 格式 / Reader | 文件大小 | 1 线程 | 2 线程 | 4 线程 | 8 线程 | 复测 1 / 8 线程 |
+|---|---:|---:|---:|---:|---:|---:|
+| Sniffer / 共享 | 1.958 MB | 2.612 | 2.782 | 2.892 | 3.969 | 2.680 / 3.990 |
+| Sniffer / 独立 | 1.958 MB | 2.634 | 2.696 | 2.887 | 4.049 | 2.726 / 3.999 |
+| Parquet / 无 codec 压缩 | 9.654 MB | 1.104 | 1.268 | 1.531 | 2.797 | 1.094 / 2.830 |
+| Parquet / ZSTD | 2.721 MB | 4.519 | 4.699 | 4.908 | 6.568 | 4.520 / 6.528 |
+
+此数据集上，Parquet 无 codec 压缩以约 4.9 倍的文件大小换来最快的查询；
+Sniffer 的文件比 Parquet ZSTD 约小 28%，且扫描更快。这个结果只说明该数据
+分布和查询的速度/空间取舍，不代表对所有 Parquet 压缩或编码配置占优。
+Parquet 基准适配器针对有序 `id` 使用 min/max + slice，而非通用表达式执行；
+单次请求的延迟与多请求总吞吐应分开解读。未计入 cold-cache、Reader 构造、
+写入、峰值 RSS 或分配量。
+
+复现命令：
+
+```sh
+./build-release/sniffer_core_concurrency_benchmark \
+  --benchmark_repetitions=7 --benchmark_min_time=0.05s \
+  --benchmark_report_aggregates_only=true --benchmark_format=csv
+./build-release/sniffer_core_concurrency_benchmark \
+  '--benchmark_filter=(ConcurrentScan/(SharedReader|IndependentReaders)|ParquetConcurrentScan/Parquet(_ZSTD)?)/real_time/threads:(1|8)$' \
+  --benchmark_repetitions=11 --benchmark_min_time=0.05s \
+  --benchmark_report_aggregates_only=true --benchmark_format=csv
+```
