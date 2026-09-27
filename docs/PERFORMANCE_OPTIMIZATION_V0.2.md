@@ -266,10 +266,43 @@ SIMD、多级编码链和新压缩算法只有在标量路径完成剖析和优�
 - [ ] 所有性能结论都有 profiler 证据和至少 7 次重复测量；
 - [ ] 生成 `bench/BENCHMARK_V2.md`，同时记录绝对值、相对 v1 的变化、压缩比、峰值内存和原始
       运行参数；
-- [ ] 所有新增格式语义均有 decision record，v0.2 Reader 可读取 v0.1 Segment；
+- [x] 所有新增格式语义均有 decision record，v0.2 Reader 可读取 v0.1 Segment；
 - [ ] 更新 README 的性能状态，不把合成 benchmark 结果表述为通用生产性能。
 
 ## 11. 执行记录
+
+### 2026-09-28：v0.2 收尾验收快照
+
+结论：**尚不能按第 10 节定义宣布 v0.2 完成**。这不是编码正确性阻塞，而是
+发布级性能与兼容性证据尚未闭环。当前已完成的生产路径保持单线程 fallback；
+同一 Reader 的独立 Scan 可并发，但单请求内部并行尚未实现或证明不值得实现。
+
+| 验收项 | 当前证据 | 状态 |
+| --- | --- | --- |
+| 正确性与竞态 | 当前工作树 Release 88/88、TSan 71/71；ASan/UBSan 87/87 全量在提交 `57354a4` 上通过，新增旧版样本用例另在 ASan/UBSan 下通过；含 fuzz/benchmark smoke | 本轮通过 |
+| 固定性能场景 | Apple M4、Arrow 23.0.1、Release、100,000 行、RG 4,096、50% 选择率、投影 2 列、warm-cache；7 次 P50：写入 4.215 ms、scan 0.450 ms、端到端 4.668 ms；12/25 组剪枝、26 块/172,228 字节读取 | 仅此场景达第 2 节对应吞吐门槛 |
+| 高基数字符串空间 | 100,000 行、24 字节高基数字符串，同环境 7 次复测：2,803,815 文件字节，0.999x 压缩比 | 达 0.98x 门槛 |
+| 缓存/规模 | 现有矩阵与宽表均为 warm-cache；尚无超页缓存数据和可信 cold-cache 结果 | 未完成 |
+| 并发 | 多查询 1/2/4/8 线程基准与同 Reader 正确性/TSan 已覆盖；单请求内部并行、预算及取消语义没有 A/B | 未完成 |
+| 版本回归 | `aeb6a17`（v0.2 前）原版 example 生成的 2,052 字节 Segment 已固定为 hex 样本；当前 Reader 的 schema、全量读取、checksum、过滤/范围/limit 测试通过。CompactPlain 格式决策见 0004；仍缺同机同口径 v0.1→v0.2 全矩阵性能对照 | 文件兼容已验证；性能回归未完成 |
+| 内存与完整报告 | Arrow 分配和进程 RSS 指标已接入，尚缺每个代表性 case 独立进程的峰值、完整矩阵原始结果和最终汇总 | 未完成 |
+
+固定场景复测命令：
+
+```sh
+./build-release/sniffer_core_performance_benchmark \
+  '--benchmark_filter=^Performance/(Sniffer|Parquet|Parquet_ZSTD)/100000/4096/manual_time$' \
+  --benchmark_repetitions=7 --benchmark_min_time=0.05s \
+  --benchmark_report_aggregates_only=true --benchmark_format=json
+./build-release/sniffer_core_compression_benchmark \
+  '--benchmark_filter=^Compression/(narrow_int64|high_cardinality_string)_(Sniffer|Parquet|Parquet_ZSTD)/manual_time$' \
+  --benchmark_repetitions=7 --benchmark_min_time=0.05s \
+  --benchmark_report_aggregates_only=true --benchmark_format=json
+```
+
+下一步优先补“同口径旧版性能回归”与“代表性矩阵/独立进程内存”两项；
+cold-cache 和单请求内部并行需要明确实验预算或正式调整版本范围，不应靠勾选 TODO
+代替实测。与 `DESIGN.md` 无偏离；没有改变文件格式或公共 API。
 
 ### 2026-09-17：CRC32C slicing-by-8 与 ARM hardware path
 

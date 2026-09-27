@@ -4,7 +4,10 @@
 Arrow `RecordBatch` 写成自描述文件，并通过索引剪枝、列投影和谓词下推，以
 `RecordBatchIterator` 的形式流式读取查询结果。
 
-项目当前处于 **v0.1 / experimental** 阶段，已完成格式、索引扫描和基础编码三阶段实现。
+项目当前处于 **experimental** 阶段：v0.1 的格式、索引扫描和基础编码三阶段已实现，
+v0.2 的性能与并发读取专项正在收尾，尚未通过全部发布验收。当前基准只代表指定硬件、
+数据分布与 warm-cache 条件，不能视为通用生产性能承诺。验收进度与未完成项见
+[`docs/PERFORMANCE_OPTIMIZATION_V0.2.md`](docs/PERFORMANCE_OPTIMIZATION_V0.2.md)。
 
 ## 当前能力
 
