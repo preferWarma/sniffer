@@ -103,7 +103,7 @@ const std::vector<uint8_t>& CrcPayload() {
 
 arrow::Result<std::vector<Scenario>> MakeScenarios(int64_t rows) {
   std::vector<Scenario> scenarios;
-  scenarios.reserve(6);
+  scenarios.reserve(7);
   ARROW_ASSIGN_OR_RAISE(
       auto plain,
       MakeInt64Scenario("plain_random_int64", "plain", sniffer::internal::kPlainEncodingId, rows,
@@ -167,6 +167,12 @@ arrow::Result<std::vector<Scenario>> MakeScenarios(int64_t rows) {
                                                : std::optional<int64_t>(1000000 + row % 128);
                         }));
   scenarios.push_back(std::move(for_bitpack));
+  ARROW_ASSIGN_OR_RAISE(auto for_dense, MakeInt64Scenario("for_bitpack_dense_23bit", "for_bitpack",
+                                                          sniffer::internal::kForBitpackEncodingId,
+                                                          rows, false, [](int64_t row) {
+                                                            return std::optional<int64_t>(row * 71);
+                                                          }));
+  scenarios.push_back(std::move(for_dense));
   return scenarios;
 }
 
@@ -336,6 +342,7 @@ BENCHMARK_CAPTURE(Codec, rle_128_runs_Decode, 3U, false)->Unit(benchmark::kMicro
 BENCHMARK_CAPTURE(Codec, rle_selected_int64_1pct_Decode, 4U, false)->Unit(benchmark::kMicrosecond);
 BENCHMARK_CAPTURE(Codec, for_bitpack_128_range_Encode, 5U, true)->Unit(benchmark::kMicrosecond);
 BENCHMARK_CAPTURE(Codec, for_bitpack_128_range_Decode, 5U, false)->Unit(benchmark::kMicrosecond);
+BENCHMARK_CAPTURE(Codec, for_bitpack_dense_23bit_Decode, 6U, false)->Unit(benchmark::kMicrosecond);
 BENCHMARK(Crc32c)->Name("Codec/crc32c_1MiB")->Unit(benchmark::kMicrosecond);
 
 void AddBenchmarkContext() {

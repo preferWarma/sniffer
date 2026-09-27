@@ -208,17 +208,20 @@ arrow::Result<int64_t> ScanSniffer(const sniffer::SegmentReader& reader,
       break;
     }
     if (verify_values) {
-      const auto& ids = static_cast<const arrow::Int64Array&>(*batch->column(0));
-      const auto& values = static_cast<const arrow::Int64Array&>(*batch->column(1));
+      const bool includes_id = plan.projection_field_ids.size() == 2;
+      const auto& values =
+          static_cast<const arrow::Int64Array&>(*batch->column(includes_id ? 1 : 0));
       for (int64_t row = 0; row < batch->num_rows(); ++row, ++expected_id) {
-        if (ids.IsNull(row) || values.IsNull(row) || ids.Value(row) != expected_id ||
-            values.Value(row) != expected_id * 17 + 3) {
+        if (values.IsNull(row) || values.Value(row) != expected_id * 17 + 3 ||
+            (includes_id && (batch->column(0)->IsNull(row) ||
+                             static_cast<const arrow::Int64Array&>(*batch->column(0)).Value(row) !=
+                                 expected_id))) {
           return arrow::Status::Invalid("Sniffer scan differs from generated reference values");
         }
       }
     }
     selected_rows += batch->num_rows();
-    benchmark::DoNotOptimize(batch->column(1)->data().get());
+    benchmark::DoNotOptimize(batch->column(batch->num_columns() - 1)->data().get());
   }
   if (verify_values && expected_id != kRows) {
     return arrow::Status::Invalid("Sniffer scan omitted generated reference rows");
@@ -226,7 +229,7 @@ arrow::Result<int64_t> ScanSniffer(const sniffer::SegmentReader& reader,
   return selected_rows;
 }
 
-void ConcurrentScan(benchmark::State& state, bool share_reader) {
+void ConcurrentScan(benchmark::State& state, bool share_reader, bool project_predicate) {
   const auto& fixture_result = SharedFixture();
   if (!fixture_result.ok()) {
     state.SkipWithError(fixture_result.status().ToString());
@@ -244,7 +247,8 @@ void ConcurrentScan(benchmark::State& state, bool share_reader) {
   }
   const auto& reader = share_reader ? *fixture->reader : *independent;
   sniffer::IOPlan plan;
-  plan.projection_field_ids = {1, 2};
+  plan.projection_field_ids =
+      project_predicate ? std::vector<uint32_t>{1, 2} : std::vector<uint32_t>{2};
   plan.conjunctive_predicates = {
       {1, sniffer::Predicate::Op::kGe, std::make_shared<arrow::Int64Scalar>(kRows / 2)}};
   plan.output_batch_rows = kRowGroupRows;
@@ -276,6 +280,10 @@ void ConcurrentScan(benchmark::State& state, bool share_reader) {
     totals.batch_materialization_nanoseconds += metrics->batch_materialization_nanoseconds;
     totals.output_concatenation_nanoseconds += metrics->output_concatenation_nanoseconds;
     totals.output_concatenations += metrics->output_concatenations;
+    totals.predicate_chunks_decoded += metrics->predicate_chunks_decoded;
+    totals.projection_chunks_decoded += metrics->projection_chunks_decoded;
+    totals.column_chunks_read += metrics->column_chunks_read;
+    totals.chunk_bytes_read += metrics->chunk_bytes_read;
   }
   const double metric_divisor =
       static_cast<double>(state.iterations()) * 1e6 * static_cast<double>(state.threads());
@@ -293,8 +301,17 @@ void ConcurrentScan(benchmark::State& state, bool share_reader) {
   state.counters["concats"] =
       static_cast<double>(totals.output_concatenations) /
       (static_cast<double>(state.iterations()) * static_cast<double>(state.threads()));
+  const auto per_scan = [&](const char* name, uint64_t count) {
+    state.counters[name] =
+        static_cast<double>(count) / (static_cast<double>(state.iterations()) * state.threads());
+  };
+  per_scan("predicate_chunks", totals.predicate_chunks_decoded);
+  per_scan("projection_chunks", totals.projection_chunks_decoded);
+  per_scan("chunks_read", totals.column_chunks_read);
+  per_scan("chunk_bytes_read", totals.chunk_bytes_read);
   state.counters["input_rows"] = static_cast<double>(kRows);
   state.counters["selected_rows"] = static_cast<double>(kRows / 2);
+  state.counters["projection_columns"] = project_predicate ? 2.0 : 1.0;
   state.counters["row_group_rows"] = static_cast<double>(kRowGroupRows);
   state.counters["file_bytes"] =
       static_cast<double>(fixture->file_bytes) / static_cast<double>(state.threads());
@@ -303,14 +320,28 @@ void ConcurrentScan(benchmark::State& state, bool share_reader) {
   state.SetItemsProcessed(state.iterations() * kRows * state.threads());
 }
 
-BENCHMARK_CAPTURE(ConcurrentScan, SharedReader, true)
+BENCHMARK_CAPTURE(ConcurrentScan, SharedReader, true, true)
     ->Threads(1)
     ->Threads(2)
     ->Threads(4)
     ->Threads(8)
     ->UseRealTime()
     ->Unit(benchmark::kMillisecond);
-BENCHMARK_CAPTURE(ConcurrentScan, IndependentReaders, false)
+BENCHMARK_CAPTURE(ConcurrentScan, IndependentReaders, false, true)
+    ->Threads(1)
+    ->Threads(2)
+    ->Threads(4)
+    ->Threads(8)
+    ->UseRealTime()
+    ->Unit(benchmark::kMillisecond);
+BENCHMARK_CAPTURE(ConcurrentScan, SharedReaderValueOnly, true, false)
+    ->Threads(1)
+    ->Threads(2)
+    ->Threads(4)
+    ->Threads(8)
+    ->UseRealTime()
+    ->Unit(benchmark::kMillisecond);
+BENCHMARK_CAPTURE(ConcurrentScan, IndependentReadersValueOnly, false, false)
     ->Threads(1)
     ->Threads(2)
     ->Threads(4)
@@ -344,7 +375,9 @@ int main(int argc, char** argv) {
   benchmark::AddCustomContext("build_mode", "debug_or_sanitized");
 #endif
   benchmark::AddCustomContext("data", "500000 int64 pairs, increasing id and affine value");
-  benchmark::AddCustomContext("query", "id >= 250000, project both columns");
+  benchmark::AddCustomContext(
+      "query",
+      "id >= 250000; Sniffer projects id+value or value-only; Parquet projects both columns");
   benchmark::AddCustomContext("parquet_config",
                               "UNCOMPRESSED/ZSTD, dictionary defaults, row-group min/max pruning, "
                               "sorted-id boundary slicing, one reader per benchmark thread, "

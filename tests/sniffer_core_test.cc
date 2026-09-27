@@ -1449,6 +1449,71 @@ TEST(SnifferCoreTest, ForBitpackAllBitWidthsMatchReference) {
   }
 }
 
+TEST(SnifferCoreTest, DenseForDecodeMatchesTypedArraysAndRejectsBadDelta) {
+  const auto timestamp_type =
+      std::static_pointer_cast<arrow::TimestampType>(arrow::timestamp(arrow::TimeUnit::NANO));
+  const std::vector<std::pair<sniffer::FieldSpec, std::shared_ptr<arrow::Array>>> cases = {
+      {{1, "i8", arrow::int8(), false, nullptr},
+       BuildArray<arrow::Int8Builder, int8_t>({int8_t{-128}, int8_t{-1}, int8_t{127}})},
+      {{2, "u8", arrow::uint8(), false, nullptr},
+       BuildArray<arrow::UInt8Builder, uint8_t>({uint8_t{0}, uint8_t{1}, uint8_t{255}})},
+      {{3, "i16", arrow::int16(), false, nullptr},
+       BuildArray<arrow::Int16Builder, int16_t>({int16_t{-32768}, int16_t{0}, int16_t{32767}})},
+      {{4, "u16", arrow::uint16(), false, nullptr},
+       BuildArray<arrow::UInt16Builder, uint16_t>({uint16_t{0}, uint16_t{1}, uint16_t{65535}})},
+      {{5, "i32", arrow::int32(), false, nullptr},
+       BuildArray<arrow::Int32Builder, int32_t>(
+           {std::numeric_limits<int32_t>::min(), int32_t{0}, std::numeric_limits<int32_t>::max()})},
+      {{6, "u32", arrow::uint32(), false, nullptr},
+       BuildArray<arrow::UInt32Builder, uint32_t>(
+           {uint32_t{0}, uint32_t{1}, std::numeric_limits<uint32_t>::max()})},
+      {{7, "i64", arrow::int64(), false, nullptr},
+       BuildArray<arrow::Int64Builder, int64_t>(
+           {std::numeric_limits<int64_t>::min(), int64_t{0}, std::numeric_limits<int64_t>::max()})},
+      {{8, "u64", arrow::uint64(), false, nullptr},
+       BuildArray<arrow::UInt64Builder, uint64_t>(
+           {uint64_t{0}, uint64_t{1}, std::numeric_limits<uint64_t>::max()})},
+      {{9, "time", timestamp_type, false, nullptr},
+       BuildTimestampArray(timestamp_type, {int64_t{-100}, int64_t{0}, int64_t{100}})},
+      {{10, "empty", arrow::uint8(), false, nullptr}, BuildArray<arrow::UInt8Builder, uint8_t>({})},
+  };
+  for (const auto& [field, array] : cases) {
+    const auto payload = ValueOrThrow(
+        sniffer::internal::EncodeNonPlain(sniffer::internal::kForBitpackEncodingId, field, *array),
+        "encode dense typed FOR");
+    sniffer::internal::ColumnChunkMeta chunk;
+    chunk.field_id = field.field_id;
+    chunk.physical_type = ValueOrThrow(sniffer::internal::PhysicalTypeFor(*field.type),
+                                       "dense typed FOR physical type");
+    chunk.encoding_id = sniffer::internal::kForBitpackEncodingId;
+    chunk.row_count = static_cast<uint64_t>(array->length());
+    chunk.null_count = 0;
+    chunk.length = static_cast<uint64_t>(payload.size());
+    const auto decoded = ValueOrThrow(sniffer::internal::DecodeNonPlain(field, chunk, payload),
+                                      "decode dense typed FOR");
+    EXPECT_TRUE(decoded->Equals(array)) << field.name;
+    EXPECT_EQ(decoded->null_count(), 0) << field.name;
+  }
+
+  const sniffer::FieldSpec field{11, "bad_delta", arrow::uint8(), false, nullptr};
+  const auto array = BuildArray<arrow::UInt8Builder, uint8_t>({uint8_t{250}, uint8_t{251}});
+  auto payload = ValueOrThrow(
+      sniffer::internal::EncodeNonPlain(sniffer::internal::kForBitpackEncodingId, field, *array),
+      "encode bad-delta reference");
+  ASSERT_GT(payload.size(), 33U);
+  payload[32] = 255U;  // Base is at byte 32; the second delta now exceeds uint8.
+  sniffer::internal::ColumnChunkMeta chunk;
+  chunk.field_id = field.field_id;
+  chunk.physical_type = sniffer::internal::PhysicalTypeId::kUInt8;
+  chunk.encoding_id = sniffer::internal::kForBitpackEncodingId;
+  chunk.row_count = 2;
+  chunk.null_count = 0;
+  chunk.length = static_cast<uint64_t>(payload.size());
+  EXPECT_FALSE(sniffer::internal::DecodeNonPlain(field, chunk, payload).ok());
+  const std::vector<uint64_t> selection = {1};
+  EXPECT_FALSE(sniffer::internal::DecodeNonPlain(field, chunk, payload, &selection).ok());
+}
+
 TEST(SnifferCoreTest, TypedDictionaryMatchesScalarReference) {
   const auto data = MakeAllTypesBatch();
   const std::array<size_t, 10> field_indexes = {1, 2, 3, 4, 5, 6, 7, 8, 12, 13};
@@ -2606,7 +2671,7 @@ TEST(SnifferCoreTest, WholeRowGroupScanRejectsOversizedRowCount) {
   EXPECT_NE(next.status().ToString().find("[sniffer.format.limit]"), std::string::npos);
 }
 
-TEST(SnifferCoreTest, AllMatchingPredicateReusesDecodedColumnsAndPreservesLimit) {
+TEST(SnifferCoreTest, AllMatchingPredicateProjectsColumnsAndPreservesLimit) {
   const auto data = MakeScanBatch();
   auto policy = ScanLayout();
   policy.field_encodings = {{1, sniffer::EncodingKind::kForBitpack},
@@ -2642,8 +2707,8 @@ TEST(SnifferCoreTest, AllMatchingPredicateReusesDecodedColumnsAndPreservesLimit)
     }
     EXPECT_EQ(offset, limit ? static_cast<int64_t>(*limit) : data.batch->num_rows());
     const uint64_t groups = limit ? 2U : 6U;
-    EXPECT_EQ(metrics->predicate_chunks_decoded, groups);
-    EXPECT_EQ(metrics->projection_chunks_decoded, groups * 3U);
+    EXPECT_EQ(metrics->predicate_chunks_decoded, 0U);
+    EXPECT_EQ(metrics->projection_chunks_decoded, groups * 4U);
     EXPECT_EQ(metrics->projection_rows_materialized, static_cast<uint64_t>(offset) * 4U);
     EXPECT_EQ(metrics->selection_indices_materialized, limit ? 2U : 0U);
   }
@@ -2685,9 +2750,149 @@ TEST(SnifferCoreTest, SelectionPrefixFallsBackAfterFirstMiss) {
     }
     EXPECT_EQ(actual_keys, expected_keys);
     EXPECT_EQ(metrics->selection_indices_materialized, limit ? 7U : 4U);
-    EXPECT_EQ(metrics->selection_rows_examined, limit ? 8U : 30U);
+    // Statistics prove that every group after the first excludes key 2.
+    EXPECT_EQ(metrics->selection_rows_examined, 5U);
     EXPECT_EQ(metrics->projection_rows_materialized, expected_keys.size() * 2U);
   }
+}
+
+TEST(SnifferCoreTest, StatisticsProveWholeRowGroupMatchesWithSequentialFallback) {
+  const auto data = MakeScanBatch();
+  const std::array<bool, 2> with_statistics = {true, false};
+  for (const bool indexed : with_statistics) {
+    TempFile file(indexed ? "all_match_indexed.seg" : "all_match_fallback.seg");
+    auto layout = ScanLayout();
+    if (!indexed) {
+      layout.statistics_field_ids.clear();
+    }
+    WriteSegmentWithPolicy(file.path(), data.table_schema, {data.batch}, layout);
+    auto reader = ValueOrThrow(sniffer::SegmentReader::Open(file.path().string()),
+                               "open all-match statistics segment");
+    for (const std::optional<uint64_t> limit :
+         std::array<std::optional<uint64_t>, 2>{std::nullopt, uint64_t{7}}) {
+      sniffer::IOPlan plan;
+      plan.projection_field_ids = {4};
+      plan.conjunctive_predicates = {
+          {1, sniffer::Predicate::Op::kGe, std::make_shared<arrow::Int64Scalar>(10)}};
+      plan.limit = limit;
+      plan.output_batch_rows = 7;
+      auto metrics = std::make_shared<sniffer::ScanMetrics>();
+      const auto batches = CollectScan(
+          ValueOrThrow(reader->Scan(plan, metrics), "scan all-match statistics segment"));
+      std::vector<std::string> actual;
+      for (const auto& batch : batches) {
+        const auto& payload = static_cast<const arrow::BinaryArray&>(*batch->column(0));
+        for (int64_t row = 0; row < batch->num_rows(); ++row) {
+          actual.emplace_back(payload.GetView(row));
+        }
+      }
+      const int64_t end = limit ? 17 : 30;
+      std::vector<std::string> expected;
+      for (int64_t row = 10; row < end; ++row) {
+        expected.push_back("p" + std::to_string(row));
+      }
+      EXPECT_EQ(actual, expected);
+      EXPECT_EQ(metrics->row_groups_pruned, indexed ? 2U : 0U);
+      EXPECT_EQ(metrics->predicate_chunks_decoded, indexed ? 0U : (limit ? 4U : 6U));
+      EXPECT_EQ(metrics->projection_chunks_decoded, limit ? 2U : 4U);
+      EXPECT_EQ(metrics->column_chunks_read, indexed ? (limit ? 2U : 4U) : (limit ? 6U : 10U));
+      EXPECT_EQ(metrics->selection_rows_examined, indexed ? 0U : (limit ? 17U : 30U));
+      EXPECT_EQ(metrics->selection_indices_materialized, limit ? 2U : 0U);
+    }
+  }
+}
+
+TEST(SnifferCoreTest, WholeRowGroupProofSkipsUnprojectedCorruptPredicateChunk) {
+  const auto data = MakeScanBatch();
+  TempFile file("all_match_skips_corrupt_predicate.seg");
+  WriteSegmentWithPolicy(file.path(), data.table_schema, {data.batch}, ScanLayout());
+  auto bytes = ReadFile(file.path());
+  const size_t trailer_offset = bytes.size() - 40;
+  const size_t footer_offset = static_cast<size_t>(ReadU64(bytes, trailer_offset + 8));
+  const size_t footer_length = static_cast<size_t>(ReadU64(bytes, trailer_offset + 16));
+  const auto footer = ValueOrThrow(sniffer::internal::ParseFooter(std::span<const uint8_t>(
+                                       bytes.data() + footer_offset, footer_length)),
+                                   "parse all-match corrupt footer");
+  ASSERT_EQ(footer.row_groups.size(), 6U);
+  const auto& damaged = footer.row_groups[3].chunks[0];
+  ASSERT_LT(damaged.offset + 24U, bytes.size());
+  bytes[static_cast<size_t>(damaged.offset + 24U)] ^= 1U;
+  RefreshFooterChecksums(&bytes);
+  WriteFile(file.path(), bytes);
+  auto reader = ValueOrThrow(sniffer::SegmentReader::Open(file.path().string()),
+                             "open all-match corrupt segment");
+
+  sniffer::IOPlan plan;
+  plan.projection_field_ids = {4};
+  plan.conjunctive_predicates = {
+      {1, sniffer::Predicate::Op::kGe, std::make_shared<arrow::Int64Scalar>(10)}};
+  auto metrics = std::make_shared<sniffer::ScanMetrics>();
+  const auto batches = CollectScan(
+      ValueOrThrow(reader->Scan(plan, metrics), "scan without corrupt predicate chunk"));
+  size_t rows = 0;
+  for (const auto& batch : batches) {
+    const auto& payload = static_cast<const arrow::BinaryArray&>(*batch->column(0));
+    for (int64_t row = 0; row < batch->num_rows(); ++row, ++rows) {
+      EXPECT_EQ(payload.GetView(row), "p" + std::to_string(rows + 10));
+    }
+  }
+  EXPECT_EQ(rows, 20U);
+  EXPECT_EQ(metrics->predicate_chunks_decoded, 0U);
+  EXPECT_EQ(metrics->column_chunks_read, 4U);
+  EXPECT_FALSE(reader->ReadAll().ok()) << "accessing damaged predicate chunk must fail";
+}
+
+TEST(SnifferCoreTest, WholeRowGroupProofPreservesNullAndNaNSemantics) {
+  const sniffer::TableSchema schema{
+      1,
+      {{1, "id", arrow::int64(), false, nullptr}, {2, "value", arrow::float32(), true, nullptr}}};
+  auto arrow_schema = ValueOrThrow(schema.ToArrowSchema(), "all-match nullable schema");
+  arrow::Int64Builder ids;
+  arrow::FloatBuilder values;
+  for (int64_t row = 0; row < 12; ++row) {
+    RequireOk(ids.Append(row), "append all-match id");
+    if (row >= 4 && row < 8) {
+      RequireOk(values.AppendNull(), "append all-match null");
+    } else if (row >= 8 && row % 2 == 0) {
+      RequireOk(values.Append(std::numeric_limits<float>::quiet_NaN()), "append all-match NaN");
+    } else {
+      RequireOk(values.Append(1.5F), "append all-match value");
+    }
+  }
+  std::shared_ptr<arrow::Array> id_array;
+  std::shared_ptr<arrow::Array> value_array;
+  RequireOk(ids.Finish(&id_array), "finish all-match ids");
+  RequireOk(values.Finish(&value_array), "finish all-match values");
+  auto batch = arrow::RecordBatch::Make(arrow_schema, 12, {id_array, value_array});
+  sniffer::LayoutPolicy layout;
+  layout.target_row_group_rows = 4;
+  layout.statistics_field_ids = {2};
+  TempFile file("all_match_null_nan.seg");
+  WriteSegmentWithPolicy(file.path(), schema, {batch}, layout);
+  auto reader = ValueOrThrow(sniffer::SegmentReader::Open(file.path().string()),
+                             "open all-match nullable segment");
+
+  const auto run = [&](sniffer::Predicate::Op op, std::shared_ptr<arrow::Scalar> value = nullptr) {
+    sniffer::IOPlan plan;
+    plan.projection_field_ids = {1};
+    plan.conjunctive_predicates = {{2, op, std::move(value)}};
+    plan.output_batch_rows = 3;
+    auto metrics = std::make_shared<sniffer::ScanMetrics>();
+    const auto batches =
+        CollectScan(ValueOrThrow(reader->Scan(plan, metrics), "scan all-match nullable segment"));
+    return std::pair{CollectInt64Column(batches, 0), metrics};
+  };
+  const auto [equal_ids, equal_metrics] =
+      run(sniffer::Predicate::Op::kEq, std::make_shared<arrow::FloatScalar>(1.5F));
+  EXPECT_EQ(equal_ids, (std::vector<int64_t>{0, 1, 2, 3, 9, 11}));
+  EXPECT_EQ(equal_metrics->selection_rows_examined, 4U)
+      << "NaN group has no min/max and must use per-row evaluation";
+  const auto [null_ids, null_metrics] = run(sniffer::Predicate::Op::kIsNull);
+  EXPECT_EQ(null_ids, (std::vector<int64_t>{4, 5, 6, 7}));
+  EXPECT_EQ(null_metrics->selection_rows_examined, 0U);
+  const auto [nonnull_ids, nonnull_metrics] = run(sniffer::Predicate::Op::kIsNotNull);
+  EXPECT_EQ(nonnull_ids, (std::vector<int64_t>{0, 1, 2, 3, 8, 9, 10, 11}));
+  EXPECT_EQ(nonnull_metrics->selection_rows_examined, 0U);
 }
 
 TEST(SnifferCoreTest, WideTableProjectionSkipsUnneededColumnChunks) {
@@ -2734,8 +2939,8 @@ TEST(SnifferCoreTest, WideTableProjectionSkipsUnneededColumnChunks) {
     EXPECT_EQ(second[index], row * 16);
   }
   EXPECT_EQ(metrics->row_groups_pruned, 2U);
-  EXPECT_EQ(metrics->predicate_chunks_decoded, 4U);
-  EXPECT_EQ(metrics->projection_chunks_decoded, 4U);
+  EXPECT_EQ(metrics->predicate_chunks_decoded, 1U);
+  EXPECT_EQ(metrics->projection_chunks_decoded, 7U);
   EXPECT_EQ(metrics->column_chunks_read, 8U);
 }
 

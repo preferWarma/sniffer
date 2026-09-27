@@ -618,3 +618,112 @@ microbenchmark 当作同条件 before 值。
   --benchmark_repetitions=11 --benchmark_min_time=0.05s \
   --benchmark_report_aggregates_only=true --benchmark_format=csv
 ```
+
+### Statistics 证明整组命中，跳过逐行谓词
+
+2026-09-27，同一 Apple M4 / Arrow C++ 23.0.1 / Apple Clang 21 / Release / warm-cache，
+500,000 行双 int64，Row Group 8,192、`id >= 250000`、50% 命中、投影两列。
+改动前为提交 `6d9e469`；改动后仅增加保守的 Row Group 全命中证明：
+所有谓词均能由统计信息证明为真且没有 sort-key range 时，不再逐行检查。
+缺失统计、比较列含 null/NaN 或不能证明时按原路径执行（`IS NULL` 与
+`IS NOT NULL` 可直接利用 `null_count`）；谓词列读取/CRC、
+解码、列投影和输出 batch 语义保持不变。文件仍为 1,958,476 bytes，
+每查询跨组拼接 31 次。两版各运行 11 次、最短 0.05 秒，P50：
+
+| 指标 | 改动前 | 改动后 |
+|---|---:|---:|
+| 共享 Reader，1 线程完整查询 | 1.942 ms | 1.273 ms |
+| 共享 Reader，8 线程完整查询 | 3.294 ms | 2.203 ms |
+| 独立 Reader，1 线程完整查询 | 1.961 ms | 1.281 ms |
+| 独立 Reader，8 线程完整查询 | 3.260 ms | 2.168 ms |
+| 单线程谓词阶段 | 0.696 ms | 0.022 ms |
+| 单线程解码阶段 | 0.931 ms | 0.936 ms |
+
+端到端约降 34%（1 线程）和 33%（8 线程）；解码耗时基本未动，
+证明收益来自跳过已被索引证明的逐行判断。此结果依赖统计信息和查询分布，
+不能推广到索引缺失或每个 Row Group 都混合命中的场景。测试另验证无统计
+顺序回退、`limit`、全 null、含 NaN 和投影列与过滤列分离。
+
+复现：
+
+```sh
+./build-release/sniffer_core_concurrency_benchmark \
+  '--benchmark_filter=^ConcurrentScan/(SharedReader|IndependentReaders)/real_time/threads:(1|8)$' \
+  --benchmark_repetitions=11 --benchmark_min_time=0.05s \
+  --benchmark_report_aggregates_only=true --benchmark_format=csv
+```
+
+### 已证明整组命中时跳过未投影的谓词块
+
+2026-09-27，同一 Apple M4 / Apple Clang 21 / Arrow C++ 23.0.1 / Release /
+warm-cache，500,000 行有序双 int64、Row Group 8,192、`id >= 250000`，
+仅投影 `value`。在上述整组命中证明基础上，未被投影且不需逐行过滤的
+`id` ColumnChunk 不再读取、校验或解码；跨越阈值的 Row Group 仍按原路径
+读取并过滤。投影谓词列时仍须读该列，并按投影解码路径计数。
+
+变更前后各 9 次、每次至少 0.05 秒，以下为 P50。独立 Reader 的 1/8
+线程也由 1.210/2.04 ms 降至 0.677/1.19 ms。
+
+| 指标（共享 Reader） | 改动前 | 改动后 |
+|---|---:|---:|
+| 1 线程端到端 | 1.21 ms | 0.681 ms |
+| 8 线程端到端 | 2.04 ms | 1.20 ms |
+| 1 线程 decode 阶段 | 0.933 ms | 0.478 ms |
+| 每查询读取 ColumnChunk | 64 | 33 |
+| 每查询读取 chunk 字节 | 987,416 | 586,492 |
+| 每查询谓词 ColumnChunk 解码 | 32 | 1 |
+
+1 线程约降 44%，8 线程约降 41%；文件仍为 1,958,476 bytes。这里的
+Parquet benchmark 固定双列投影，故此 value-only Sniffer 查询不能直接
+拿来与其比较。无统计信息时继续逐行回退；单测还通过损坏一个全命中
+Row Group 的未投影 `id` 块，验证该查询不读取它，而 `ReadAll()` 读到
+该块仍报告 checksum 错误。收益依赖可证明整组命中、谓词列未投影的查询。
+
+复现：
+
+```sh
+./build-release/sniffer_core_concurrency_benchmark \
+  '--benchmark_filter=ConcurrentScan/(SharedReaderValueOnly|IndependentReadersValueOnly)/real_time/threads:(1|8)$' \
+  --benchmark_repetitions=9 --benchmark_min_time=0.05s \
+  --benchmark_report_aggregates_only=true --benchmark_format=csv
+```
+
+### Dense FOR 解码直接填充 Arrow 值缓冲区
+
+2026-09-28，Apple M4 / Apple Clang 21 / Arrow C++ 23.0.1 / Release /
+warm-cache。上一节的 value-only 查询解码阶段占约 0.478 ms。针对 FOR
+无 null 且无 selection 的全量解码，预先分配 Arrow-owned 值缓冲区并逐值
+填充；nullable 和 selected decode 仍使用 builder。所有 payload 边界、
+delta 域检查与最终 `ValidateFull()` 保留，文件字节与查询读取量不变。
+
+先尝试的 8 字节窗口 bit-unpack 在 7-bit nullable 和 23-bit dense 的
+100,000 行 microbenchmark 都慢了约 3%，已撤回。以下是保留的缓冲区
+快路径；改前 microbenchmark 11 次、完整扫描 9 次，改后均 11 次，
+每轮至少 0.05 秒，取 P50：
+
+| 指标 | 改动前 | 改动后 |
+|---|---:|---:|
+| FOR dense 23-bit，无 null，100,000 行解码 | 196 µs | 160 µs |
+| FOR 7-bit，含 null，100,000 行解码 | 210 µs | 209 µs |
+| 共享 Reader、value-only、1 线程完整查询 | 0.681 ms | 0.590 ms |
+| 共享 Reader、value-only、8 线程完整查询 | 1.20 ms | 1.06 ms |
+| 1 线程完整查询的解码阶段 | 0.478 ms | 0.387 ms |
+
+完整查询为 500,000 行有序双 int64、Row Group 8,192、`id >= 250000`
+（50% 命中）、仅投影 `value`；仍读取 33 个 ColumnChunk、586,492
+chunk 字节，文件仍为 1,958,476 字节。单线程端到端约降 13%；结果
+不能推广到 nullable、selected decode 或其他编码。全类型极值、所有
+0–64 bit width、空列、selected fallback 和越界 delta 均有测试。
+
+复现：
+
+```sh
+./build-release/sniffer_core_codec_benchmark \
+  '--benchmark_filter=Codec/for_bitpack_(128_range|dense_23bit)_Decode$' \
+  --benchmark_repetitions=11 --benchmark_min_time=0.05s \
+  --benchmark_report_aggregates_only=true --benchmark_format=csv
+./build-release/sniffer_core_concurrency_benchmark \
+  '--benchmark_filter=ConcurrentScan/SharedReaderValueOnly/real_time/threads:(1|8)$' \
+  --benchmark_repetitions=11 --benchmark_min_time=0.05s \
+  --benchmark_report_aggregates_only=true --benchmark_format=csv
+```

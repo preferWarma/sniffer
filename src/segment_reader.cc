@@ -1303,6 +1303,49 @@ arrow::Result<bool> PredicatePrunes(const TableSchema& schema,
   return false;
 }
 
+arrow::Result<bool> PredicateMatchesEntireRowGroup(const internal::RowGroupMeta& row_group,
+                                                   const internal::RowGroupIndex& index,
+                                                   const Predicate& predicate) {
+  const auto* statistics = FindStatistics(index, predicate.field_id);
+  if (!statistics) {
+    return false;
+  }
+  if (predicate.op == Predicate::Op::kIsNull) {
+    return statistics->null_count == row_group.row_count;
+  }
+  if (predicate.op == Predicate::Op::kIsNotNull) {
+    return statistics->null_count == 0;
+  }
+  // A comparison may only be skipped when nulls and NaNs cannot change the
+  // per-row result. Floating statistics leave min/max absent if any NaN exists.
+  if (statistics->null_count != 0 || !statistics->min || !statistics->max ||
+      internal::ScalarHasNaN(*predicate.value)) {
+    return false;
+  }
+  ARROW_ASSIGN_OR_RAISE(const int min_order,
+                        internal::CompareScalars(*statistics->min, *predicate.value));
+  ARROW_ASSIGN_OR_RAISE(const int max_order,
+                        internal::CompareScalars(*statistics->max, *predicate.value));
+  switch (predicate.op) {
+    case Predicate::Op::kEq:
+      return min_order == 0 && max_order == 0;
+    case Predicate::Op::kNe:
+      return min_order > 0 || max_order < 0;
+    case Predicate::Op::kLt:
+      return max_order < 0;
+    case Predicate::Op::kLe:
+      return max_order <= 0;
+    case Predicate::Op::kGt:
+      return min_order > 0;
+    case Predicate::Op::kGe:
+      return min_order >= 0;
+    case Predicate::Op::kIsNull:
+    case Predicate::Op::kIsNotNull:
+      break;
+  }
+  return false;
+}
+
 arrow::Result<bool> SortRangePrunes(const internal::FooterData& footer,
                                     const internal::RowGroupIndex& index,
                                     const SortKeyRange& range) {
@@ -1459,11 +1502,28 @@ class ScanState {
         continue;
       }
 
+      bool predicates_guaranteed_true = !plan_.sort_key_range;
+      if (predicates_guaranteed_true) {
+        internal::NanosecondTimer timer(&metrics_->pruning_nanoseconds);
+        for (const auto& predicate : plan_.conjunctive_predicates) {
+          ARROW_ASSIGN_OR_RAISE(const bool matches,
+                                PredicateMatchesEntireRowGroup(row_group, index, predicate));
+          if (!matches) {
+            predicates_guaranteed_true = false;
+            break;
+          }
+        }
+      }
+
       std::vector<std::shared_ptr<arrow::Array>> filter_columns(resolved_plan_.filter_column_count);
-      for (const size_t field_index : resolved_plan_.predicate_field_indices) {
-        auto& column = filter_columns[resolved_plan_.filter_slots_by_field_index[field_index]];
-        if (!column) {
-          ARROW_ASSIGN_OR_RAISE(column, DecodePredicateChunk(row_group, field_index));
+      // A whole-group proof needs no predicate payload. Projected predicate
+      // fields are decoded below; unprojected ones remain unread.
+      if (!predicates_guaranteed_true) {
+        for (const size_t field_index : resolved_plan_.predicate_field_indices) {
+          auto& column = filter_columns[resolved_plan_.filter_slots_by_field_index[field_index]];
+          if (!column) {
+            ARROW_ASSIGN_OR_RAISE(column, DecodePredicateChunk(row_group, field_index));
+          }
         }
       }
       if (plan_.sort_key_range) {
@@ -1487,15 +1547,15 @@ class ScanState {
             filter_columns[resolved_plan_.filter_slots_by_field_index[field_index]].get());
       }
 
-      const bool full_row_group = plan_.conjunctive_predicates.empty() && !plan_.sort_key_range &&
-                                  remaining_limit >= row_group.row_count;
+      const bool full_row_group =
+          predicates_guaranteed_true && remaining_limit >= row_group.row_count;
       bool all_rows_selected = full_row_group;
       std::vector<uint64_t> selection;
       if (!full_row_group) {
         internal::NanosecondTimer timer(&metrics_->predicate_nanoseconds);
         const size_t capacity =
             static_cast<size_t>(std::min<uint64_t>(row_group.row_count, remaining_limit));
-        if (plan_.conjunctive_predicates.empty() && !plan_.sort_key_range) {
+        if (predicates_guaranteed_true) {
           selection.resize(capacity);
           std::iota(selection.begin(), selection.end(), uint64_t{0});
         } else {
@@ -1554,7 +1614,7 @@ class ScanState {
       projected_columns.reserve(resolved_plan_.projection_field_indices.size());
       for (const size_t field_index : resolved_plan_.projection_field_indices) {
         const size_t filter_slot = resolved_plan_.filter_slots_by_field_index[field_index];
-        if (filter_slot != ResolvedScanPlan::kNoFilterSlot) {
+        if (filter_slot != ResolvedScanPlan::kNoFilterSlot && filter_columns[filter_slot]) {
           const auto& decoded = filter_columns[filter_slot];
           if (all_rows_selected) {
             projected_columns.push_back(decoded);

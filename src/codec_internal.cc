@@ -941,11 +941,48 @@ arrow::Result<std::shared_ptr<arrow::Array>> DecodeForRows(const Rows& rows,
   return result;
 }
 
+template <typename Value, typename Convert>
+arrow::Result<std::shared_ptr<arrow::Array>> DecodeForDenseValues(
+    const std::shared_ptr<arrow::DataType>& type, uint64_t row_count,
+    std::span<const uint8_t> packed, uint8_t bit_width, uint64_t base_bits, uint64_t maximum_delta,
+    Convert convert) {
+  if (row_count > static_cast<uint64_t>(std::numeric_limits<int64_t>::max())) {
+    return InvalidCodec("decoded FOR array exceeds Arrow limit");
+  }
+  ARROW_ASSIGN_OR_RAISE(const uint64_t byte_count,
+                        CheckedMultiply(row_count, static_cast<uint64_t>(sizeof(Value))));
+  if (byte_count > static_cast<uint64_t>(std::numeric_limits<int64_t>::max())) {
+    return InvalidCodec("decoded FOR buffer exceeds Arrow limit");
+  }
+  ARROW_ASSIGN_OR_RAISE(auto values, arrow::AllocateBuffer(static_cast<int64_t>(byte_count)));
+  auto data =
+      arrow::ArrayData::Make(type, static_cast<int64_t>(row_count),
+                             {nullptr, std::shared_ptr<arrow::Buffer>(std::move(values))}, 0);
+  // The output buffer is newly owned by ArrayData and is filled before an
+  // Array is published; input packed bytes remain bounds-validated above.
+  Value* output = data->GetMutableValues<Value>(1);
+  for (uint64_t row = 0; row < row_count; ++row) {
+    const uint64_t delta = ReadPackedDelta(packed, row, bit_width);
+    if (delta > maximum_delta) {
+      return InvalidCodec("FOR delta exceeds physical type domain");
+    }
+    output[row] = convert(base_bits + delta);
+  }
+  auto result = arrow::MakeArray(std::move(data));
+  ARROW_RETURN_NOT_OK(result->ValidateFull());
+  return result;
+}
+
 template <typename Builder, typename Convert>
 arrow::Result<std::shared_ptr<arrow::Array>> DecodeForValues(
-    uint64_t row_count, const std::vector<uint64_t>* selection, std::span<const uint8_t> validity,
+    const std::shared_ptr<arrow::DataType>& type, uint64_t row_count,
+    const std::vector<uint64_t>* selection, std::span<const uint8_t> validity,
     std::span<const uint8_t> packed, uint8_t bit_width, uint64_t base_bits, uint64_t maximum_delta,
     Builder* builder, Convert convert) {
+  if (!selection && validity.empty()) {
+    return DecodeForDenseValues<typename Builder::value_type>(type, row_count, packed, bit_width,
+                                                              base_bits, maximum_delta, convert);
+  }
   if (selection) {
     return DecodeForRows(*selection, validity, packed, bit_width, base_bits, maximum_delta, builder,
                          convert);
@@ -997,59 +1034,60 @@ arrow::Result<std::shared_ptr<arrow::Array>> DecodeForBitpack(
   switch (field.type->id()) {
     case arrow::Type::INT8: {
       arrow::Int8Builder builder;
-      return DecodeForValues(chunk.row_count, selection, validity, packed, bit_width, base_bits,
-                             maximum_delta, &builder, [](uint64_t bits) {
+      return DecodeForValues(field.type, chunk.row_count, selection, validity, packed, bit_width,
+                             base_bits, maximum_delta, &builder, [](uint64_t bits) {
                                return std::bit_cast<int8_t>(static_cast<uint8_t>(bits));
                              });
     }
     case arrow::Type::INT16: {
       arrow::Int16Builder builder;
-      return DecodeForValues(chunk.row_count, selection, validity, packed, bit_width, base_bits,
-                             maximum_delta, &builder, [](uint64_t bits) {
+      return DecodeForValues(field.type, chunk.row_count, selection, validity, packed, bit_width,
+                             base_bits, maximum_delta, &builder, [](uint64_t bits) {
                                return std::bit_cast<int16_t>(static_cast<uint16_t>(bits));
                              });
     }
     case arrow::Type::INT32: {
       arrow::Int32Builder builder;
-      return DecodeForValues(chunk.row_count, selection, validity, packed, bit_width, base_bits,
-                             maximum_delta, &builder, [](uint64_t bits) {
+      return DecodeForValues(field.type, chunk.row_count, selection, validity, packed, bit_width,
+                             base_bits, maximum_delta, &builder, [](uint64_t bits) {
                                return std::bit_cast<int32_t>(static_cast<uint32_t>(bits));
                              });
     }
     case arrow::Type::INT64: {
       arrow::Int64Builder builder;
-      return DecodeForValues(chunk.row_count, selection, validity, packed, bit_width, base_bits,
-                             maximum_delta, &builder,
+      return DecodeForValues(field.type, chunk.row_count, selection, validity, packed, bit_width,
+                             base_bits, maximum_delta, &builder,
                              [](uint64_t bits) { return std::bit_cast<int64_t>(bits); });
     }
     case arrow::Type::UINT8: {
       arrow::UInt8Builder builder;
-      return DecodeForValues(chunk.row_count, selection, validity, packed, bit_width, base_bits,
-                             maximum_delta, &builder,
+      return DecodeForValues(field.type, chunk.row_count, selection, validity, packed, bit_width,
+                             base_bits, maximum_delta, &builder,
                              [](uint64_t bits) { return static_cast<uint8_t>(bits); });
     }
     case arrow::Type::UINT16: {
       arrow::UInt16Builder builder;
-      return DecodeForValues(chunk.row_count, selection, validity, packed, bit_width, base_bits,
-                             maximum_delta, &builder,
+      return DecodeForValues(field.type, chunk.row_count, selection, validity, packed, bit_width,
+                             base_bits, maximum_delta, &builder,
                              [](uint64_t bits) { return static_cast<uint16_t>(bits); });
     }
     case arrow::Type::UINT32: {
       arrow::UInt32Builder builder;
-      return DecodeForValues(chunk.row_count, selection, validity, packed, bit_width, base_bits,
-                             maximum_delta, &builder,
+      return DecodeForValues(field.type, chunk.row_count, selection, validity, packed, bit_width,
+                             base_bits, maximum_delta, &builder,
                              [](uint64_t bits) { return static_cast<uint32_t>(bits); });
     }
     case arrow::Type::UINT64: {
       arrow::UInt64Builder builder;
-      return DecodeForValues(chunk.row_count, selection, validity, packed, bit_width, base_bits,
-                             maximum_delta, &builder, [](uint64_t bits) { return bits; });
+      return DecodeForValues(field.type, chunk.row_count, selection, validity, packed, bit_width,
+                             base_bits, maximum_delta, &builder,
+                             [](uint64_t bits) { return bits; });
     }
     case arrow::Type::TIMESTAMP: {
       arrow::TimestampBuilder builder(std::static_pointer_cast<arrow::TimestampType>(field.type),
                                       arrow::default_memory_pool());
-      return DecodeForValues(chunk.row_count, selection, validity, packed, bit_width, base_bits,
-                             maximum_delta, &builder,
+      return DecodeForValues(field.type, chunk.row_count, selection, validity, packed, bit_width,
+                             base_bits, maximum_delta, &builder,
                              [](uint64_t bits) { return std::bit_cast<int64_t>(bits); });
     }
     default:

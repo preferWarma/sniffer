@@ -108,6 +108,9 @@ SIMD、多级编码链和新压缩算法只有在标量路径完成剖析和优�
       `AppendScalar()` 动态分派。
 - [x] `RowsToDecode()` 的全量路径改为顺序迭代视图，避免构造 `[0..row_count)` 临时 vector。
 - [ ] 对每项 typed fast path 保留通用安全 fallback，并用 property tests 证明两条路径逐值一致。
+  - [x] FOR 无 null、无 selection 的全量解码直接填充 Arrow 值缓冲区；nullable
+        和 selected decode 保留 builder 路径。全类型极值、0–64 bit width、
+        空列与坏 delta 测试通过；其他 codec 的 fallback 仍待逐项审查。
 
 ## 5. P1：优化扫描执行
 
@@ -1250,3 +1253,55 @@ CV 为 0.46%。Dictionary payload 仍为 113,058 字节，完整 Segment 仍为 
   P50 2.598/3.946 → 1.955/3.288 ms；单线程解码 1.545 → 0.932 ms。
   文件格式与输出语义不变。全部位宽的含 null、无 null、selected decode
   回归已补齐；原始方法与数据见 [`bench/BENCHMARK_V2.md`](../bench/BENCHMARK_V2.md)。
+
+### 2026-09-27：Statistics 证明整组命中，跳过逐行谓词
+
+- 对每个候选 Row Group，仅在全部谓词都能由统计信息证明为真且没有排序键范围时，
+  跳过逐行谓词判断；缺统计、比较列含 null/NaN 或无法证明时保守回退，
+  null 测试则使用 `null_count`。仍读取/校验
+  谓词 ColumnChunk，并保持 projection、limit、输出 batch 和格式语义不变。
+- Apple M4 / Release / warm-cache、11 次 P50，500,000 行双 int64、Row Group
+  8,192、50% 选择率：共享 Reader 的 1/8 线程查询 1.942/3.294 →
+  1.273/2.203 ms，谓词阶段 0.696 → 0.022 ms；解码阶段基本不变。
+  无统计回退、`limit`、全 null 和 NaN 均有回归测试。数据与复现命令见
+  [`bench/BENCHMARK_V2.md`](../bench/BENCHMARK_V2.md)。
+
+### 2026-09-27：整组命中时不读未投影谓词列
+
+- 全组匹配证明成立后，谓词列若未投影，就不读取该 ColumnChunk；若投影，
+  仍通过投影路径读取与校验。边界组及无统计回退保持逐行过滤。
+- 500,000 行双 int64、50% 选择率、仅投影 `value`，Apple M4 Release
+  9 次 P50：共享 Reader 1/8 线程 1.21/2.04 → 0.681/1.20 ms；
+  每查询读取块数 64 → 33、读取字节 987,416 → 586,492，文件字节不变。
+  损坏未访问的谓词块不影响该投影查询，但 `ReadAll()` 仍检测 checksum 错误。
+  详细限制及复现见 [`bench/BENCHMARK_V2.md`](../bench/BENCHMARK_V2.md)。
+
+### 2026-09-28：Dense FOR 直接写 Arrow 值缓冲区
+
+- 在无 null、无 selection 的 FOR 解码中，直接填充一次分配的 Arrow-owned
+  buffer；原 builder 仍处理 nullable 与 selected decode，检查和格式不变。
+  8 字节窗口 bit-unpack 候选令 microbenchmark 变慢，已撤回。
+- Apple M4 / Release，100,000 行 23-bit dense FOR microbenchmark 11 次
+  P50 196 → 160 µs；500,000 行、50% 命中、仅投影一列的完整扫描
+  1/8 线程 P50 0.681/1.20 → 0.590/1.06 ms，文件大小与读取量不变。
+  详细基准与限制见 [`bench/BENCHMARK_V2.md`](../bench/BENCHMARK_V2.md)。
+
+### 2026-09-28：Arrow 25 位解包 SIMD 可复用性调查
+
+- Arrow 25 增加兼容 CPU 上的 SVE bit-unpack 动态分派；实际入口为
+  `arrow::internal::unpack`（`bpacking_internal.h`），不是稳定公共 API。
+  当前构建仅有 Arrow 23.0.1，安装的头文件中没有该入口，因此无法在同机
+  对 Arrow 25 kernel 做可信 A/B，也不把其内部 ABI 接入生产 Reader。
+- Sniffer FOR 使用连续、低位优先的 0–64 bit delta 流；Arrow 的
+  `UnpackOptions` 有 bit width、bit offset 和批量大小，具备做独立实验的
+  形态，但还需逐位宽验证实际兼容性、末尾边界以及解包后的 base 加法、
+  delta 域检查成本。稀疏 selection/nullable 路径不能只按 dense unpack
+  microbenchmark 判定收益；输出临时缓冲也必须计入内存和计时。
+- 后续若单独批准 Arrow 25 依赖升级，在隔离构建中先跑 0–64 bit、空列、
+  null、极值、截断输入的正确性/ASan，再按相同输入比较 Sniffer 当前完整
+  FOR decode 与 Arrow unpack + base 重建的 P50/P95 和完整 scan；只有整体
+  稳定获益且依赖边界可接受，才考虑生产路径。
+
+参考：[Arrow 25 发布说明](https://arrow.apache.org/blog/2026/07/10/25.0.0-release/)、
+[Arrow bit-unpack 变更](https://github.com/apache/arrow/pull/49756)、
+[Arrow 位解包接口源码](https://github.com/apache/arrow/blob/main/cpp/src/arrow/util/bpacking_internal.h)。
