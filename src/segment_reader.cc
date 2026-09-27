@@ -21,6 +21,15 @@
 #include <utility>
 #include <vector>
 
+#if (defined(__unix__) || defined(__APPLE__)) && !defined(SNIFFER_FORCE_STREAM_IO)
+#define SNIFFER_USE_PREAD 1
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
+#include <cerrno>
+#endif
+
 #include "codec_internal.h"
 #include "format_internal.h"
 #include "index_internal.h"
@@ -43,6 +52,21 @@ class RandomAccessFile {
   static arrow::Result<std::shared_ptr<RandomAccessFile>> Open(
       std::string path, const std::shared_ptr<ReaderMetrics>& metrics) {
     auto file = std::shared_ptr<RandomAccessFile>(new RandomAccessFile(std::move(path)));
+#if defined(SNIFFER_USE_PREAD)
+    int flags = O_RDONLY;
+#ifdef O_CLOEXEC
+    flags |= O_CLOEXEC;
+#endif
+    file->fd_ = ::open(file->path_.c_str(), flags);
+    if (file->fd_ < 0) {
+      return IoError("cannot open segment for reading", file->path_);
+    }
+    struct stat file_stat{};
+    if (::fstat(file->fd_, &file_stat) != 0 || file_stat.st_size < 0) {
+      return IoError("cannot determine segment size", file->path_);
+    }
+    file->size_ = static_cast<uint64_t>(file_stat.st_size);
+#else
     file->stream_.open(file->path_, std::ios::binary | std::ios::ate);
     if (!file->stream_.is_open()) {
       return IoError("cannot open segment for reading", file->path_);
@@ -52,10 +76,19 @@ class RandomAccessFile {
       return IoError("cannot determine segment size", file->path_);
     }
     file->size_ = static_cast<uint64_t>(end_position);
+#endif
     if (metrics) {
       ++metrics->file_handles_opened;
     }
     return file;
+  }
+
+  ~RandomAccessFile() {
+#if defined(SNIFFER_USE_PREAD)
+    if (fd_ >= 0) {
+      ::close(fd_);
+    }
+#endif
   }
 
   [[nodiscard]] uint64_t size() const { return size_; }
@@ -65,12 +98,20 @@ class RandomAccessFile {
     if (end > size_) {
       return arrow::Status::Invalid("[sniffer.format.bounds] read range exceeds file size");
     }
-    if (offset > static_cast<uint64_t>(std::numeric_limits<std::streamoff>::max()) ||
-        length > static_cast<uint64_t>(std::numeric_limits<std::streamsize>::max()) ||
+    if (end > static_cast<uint64_t>(std::numeric_limits<int64_t>::max()) ||
         length > static_cast<uint64_t>(std::numeric_limits<size_t>::max())) {
       return arrow::Status::Invalid("[sniffer.format.limit] read range exceeds platform limits");
     }
 
+#if defined(SNIFFER_USE_PREAD)
+    std::vector<uint8_t> bytes(static_cast<size_t>(length));
+    ARROW_RETURN_NOT_OK(ReadExactAt(offset, bytes));
+    return bytes;
+#else
+    if (offset > static_cast<uint64_t>(std::numeric_limits<std::streamoff>::max()) ||
+        length > static_cast<uint64_t>(std::numeric_limits<std::streamsize>::max())) {
+      return arrow::Status::Invalid("[sniffer.format.limit] read range exceeds stream limits");
+    }
     std::lock_guard<std::mutex> lock(mutex_);
     stream_.clear();
     stream_.seekg(static_cast<std::streamoff>(offset));
@@ -85,12 +126,28 @@ class RandomAccessFile {
       }
     }
     return bytes;
+#endif
   }
 
   arrow::Result<uint32_t> ChecksumPrefix(uint64_t length) {
     if (length > size_) {
       return arrow::Status::Invalid("[sniffer.format.bounds] checksum range exceeds file size");
     }
+#if defined(SNIFFER_USE_PREAD)
+    uint64_t remaining = length;
+    uint64_t offset = 0;
+    uint32_t checksum = 0;
+    std::array<uint8_t, 64 * 1024> buffer{};
+    while (remaining != 0) {
+      const size_t to_read =
+          static_cast<size_t>(std::min<uint64_t>(remaining, static_cast<uint64_t>(buffer.size())));
+      ARROW_RETURN_NOT_OK(ReadExactAt(offset, std::span<uint8_t>(buffer.data(), to_read)));
+      checksum = internal::Crc32c(std::span<const uint8_t>(buffer.data(), to_read), checksum);
+      offset += to_read;
+      remaining -= to_read;
+    }
+    return checksum;
+#else
     std::lock_guard<std::mutex> lock(mutex_);
     stream_.clear();
     stream_.seekg(0);
@@ -111,15 +168,45 @@ class RandomAccessFile {
       remaining -= static_cast<uint64_t>(to_read);
     }
     return checksum;
+#endif
   }
 
  private:
   explicit RandomAccessFile(std::string path) : path_(std::move(path)) {}
 
+#if defined(SNIFFER_USE_PREAD)
+  arrow::Status ReadExactAt(uint64_t offset, std::span<uint8_t> output) const {
+    size_t read_bytes = 0;
+    while (read_bytes < output.size()) {
+      const uint64_t position = offset + read_bytes;
+      if (position > static_cast<uint64_t>(std::numeric_limits<off_t>::max())) {
+        return arrow::Status::Invalid("[sniffer.format.limit] read offset exceeds platform limit");
+      }
+      const size_t remaining = output.size() - read_bytes;
+      const size_t request =
+          std::min<size_t>(remaining, static_cast<size_t>(std::numeric_limits<ssize_t>::max()));
+      const ssize_t count =
+          ::pread(fd_, output.data() + read_bytes, request, static_cast<off_t>(position));
+      if (count < 0 && errno == EINTR) {
+        continue;
+      }
+      if (count <= 0) {
+        return IoError("cannot read segment range", path_);
+      }
+      read_bytes += static_cast<size_t>(count);
+    }
+    return arrow::Status::OK();
+  }
+#endif
+
   std::string path_;
   uint64_t size_ = 0;
+#if defined(SNIFFER_USE_PREAD)
+  int fd_ = -1;
+#else
   std::ifstream stream_;
   std::mutex mutex_;
+#endif
 };
 
 bool IsValid(std::span<const uint8_t> validity, uint64_t index) {

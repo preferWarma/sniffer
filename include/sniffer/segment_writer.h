@@ -41,6 +41,7 @@ class SegmentWriter {
   SegmentWriter& operator=(SegmentWriter&&) = delete;
   ~SegmentWriter();
 
+  // A Writer is single-threaded: callers must serialize Append/Finish.
   [[nodiscard]] arrow::Status Append(const std::shared_ptr<arrow::RecordBatch>& batch);
   [[nodiscard]] arrow::Status Finish();
 

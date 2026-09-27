@@ -7,6 +7,10 @@ option(SNIFFER_BUILD_BENCHMARK "Build sniffer-core benchmark" ON)
 option(SNIFFER_BUILD_FUZZ_SMOKE "Build standalone fuzz smoke" ON)
 option(SNIFFER_BUILD_EXAMPLES "Build sniffer-core examples" ON)
 
+if(SNIFFER_BUILD_TESTS OR SNIFFER_BUILD_BENCHMARK)
+  find_package(Threads REQUIRED)
+endif()
+
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(Arrow REQUIRED arrow)
 
@@ -85,7 +89,7 @@ if(SNIFFER_BUILD_TESTS)
   add_executable(sniffer_core_tests tests/sniffer_core_test.cc)
   target_compile_features(sniffer_core_tests PRIVATE cxx_std_20)
   target_include_directories(sniffer_core_tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
-  target_link_libraries(sniffer_core_tests PRIVATE sniffer_core GTest::gtest_main)
+  target_link_libraries(sniffer_core_tests PRIVATE sniffer_core GTest::gtest_main Threads::Threads)
   if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
     target_compile_options(sniffer_core_tests PRIVATE -Wall -Wextra -Wpedantic -Wconversion)
   endif()
@@ -191,6 +195,14 @@ if(SNIFFER_BUILD_BENCHMARK)
       "${CMAKE_CURRENT_SOURCE_DIR}/src"
   )
   target_link_libraries(sniffer_core_selection_benchmark PRIVATE sniffer_core benchmark::benchmark)
+  add_executable(sniffer_core_concurrency_benchmark bench/concurrency_benchmark.cc)
+  target_compile_features(sniffer_core_concurrency_benchmark PRIVATE cxx_std_20)
+  target_include_directories(
+    sniffer_core_concurrency_benchmark PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/generated"
+  )
+  target_link_libraries(
+    sniffer_core_concurrency_benchmark PRIVATE sniffer_core benchmark::benchmark Threads::Threads
+  )
   if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
     target_compile_options(
       sniffer_core_performance_benchmark
@@ -206,6 +218,10 @@ if(SNIFFER_BUILD_BENCHMARK)
     )
     target_compile_options(
       sniffer_core_selection_benchmark
+      PRIVATE -Wall -Wextra -Wpedantic -Wconversion
+    )
+    target_compile_options(
+      sniffer_core_concurrency_benchmark
       PRIVATE -Wall -Wextra -Wpedantic -Wconversion
     )
   endif()
@@ -225,6 +241,12 @@ if(SNIFFER_BUILD_BENCHMARK)
     add_test(
       NAME sniffer_core_selection_benchmark_smoke
       COMMAND sniffer_core_selection_benchmark --benchmark_dry_run
+    )
+    add_test(
+      NAME sniffer_core_concurrency_benchmark_smoke
+      COMMAND sniffer_core_concurrency_benchmark
+        "--benchmark_filter=^ConcurrentScan/SharedReader/real_time/threads:2$"
+        --benchmark_dry_run
     )
     add_test(
       NAME sniffer_core_performance_benchmark_json_smoke
@@ -327,6 +349,7 @@ if(SNIFFER_BUILD_BENCHMARK)
       sniffer_core_compression_benchmark_smoke
       sniffer_core_codec_benchmark_smoke
       sniffer_core_selection_benchmark_smoke
+      sniffer_core_concurrency_benchmark_smoke
       sniffer_core_performance_benchmark_json_smoke
       sniffer_core_parquet_performance_benchmark_json_smoke
       sniffer_core_wide_performance_benchmark_json_smoke

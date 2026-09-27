@@ -205,12 +205,19 @@ SIMD、多级编码链和新压缩算法只有在标量路径完成剖析和优�
 - [ ] 明确并测试对象级线程安全边界：多个 Reader 读同一不可变 Segment、同一 Reader 创建的多个
       独立 Scan iterator 并发读取应正确；同一 iterator 的并发 `Next()`、同一 Writer 的并发
       `Append()`/`Finish()` 若不支持，应在 API 文档中明确禁止，不能含糊承诺。
+  - [x] 已在公开 API 和 README 明确独立 iterator/Reader 可并发、单个 iterator 和 Writer
+        不可并发；四种 IOPlan 的同一 Reader 并发测试与独立 Reader 基准已覆盖基本边界。
 - [ ] 审核共享文件句柄、footer/index、Arrow 内存池及可选 metrics 的所有权和同步。避免把所有
       并发 scan 串行化在一个 seek/read 互斥锁上；评估每 scan 独立句柄或有界 `pread` 路径，
       同时保留 offset 检查、checksum、索引剪枝与“只读候选列块”契约。
+  - [x] macOS/Linux 共享只读 fd 改为 `pread`，其他平台保留互斥流回退；ScanState 自有
+        footer/index 副本和独立 metrics，同一 Reader 多扫描与损坏块剪枝测试已覆盖。
 - [ ] 补多线程正确性与压力测试：不同 IOPlan、projection、limit、空结果和损坏文件同时扫描；
       与单线程结果逐字段比较，并在可用平台运行 ThreadSanitizer。明确 Reader/iterator 销毁、
       错误传播与取消时的生命周期语义。
+  - [x] 4 线程 × 40 轮不同计划、损坏块与剪枝隔离、Reader 销毁后继续消费 iterator、
+        同时 `ReadAll()`/checksum；ThreadSanitizer 全量单测 66/66 通过。
+        内部并行任务的取消/预算语义仍待设计。
 
 ### 8.2 受控的内部并行（P2）
 
@@ -1198,3 +1205,21 @@ CV 为 0.46%。Dictionary payload 仍为 113,058 字节，完整 Segment 仍为 
   3.847/3.955 ms，第二轮写入波动较大。低基数选择阶段 0.267 →
   0.274/0.284 ms，不能宣称该场景获益。文件字节和选择的 encoding ID
   都不变；明细见 [`bench/BENCHMARK_V2.md`](../bench/BENCHMARK_V2.md)。
+
+### 2026-09-25：并发读取第一步——独立 Scan 与 `pread`
+
+- 同一 Reader 的不同 Scan iterator 各有计划、缓冲、footer/index 副本和 metrics；
+  单个 iterator 的 `Next()`、单个 Writer 的写入仍须由调用方串行化。
+  macOS/Linux 改用同一只读 fd 上按 offset 的 `pread`，其他平台保留带互斥的
+  流式回退；保持原有 bounds、chunk CRC 和 Reader/iterator 生命周期语义。
+- 四线程不同 IOPlan、空结果、`limit`、跨组分批反复与串行参考逐 batch 比较；
+  同时 `ReadAll()`/文件校验、Reader 销毁后 iterator 消费、一个查询剪枝损坏块
+  另一个查询读出 checksum 错误均有测试。未开启内部线程池。
+- Apple M4 / Release / warm-cache、500,000 行双列、Row Group 8,192、
+  50% 选择率、双列投影，8 线程共享 Reader 的每查询 P50 从
+  6.228/7.075 ms 降到 4.036/3.986 ms；`pread` 路径与每线程独立 Reader
+  接近。完整 1/2/4/8 线程数据及复现命令见
+  [`bench/BENCHMARK_V2.md`](../bench/BENCHMARK_V2.md)。冷缓存、Parquet 并发
+  对照、内存预算和受控内部并行仍未完成。
+- Release 与 ASan/UBSan 全量 82/82 通过，ThreadSanitizer 单测全量 66/66 通过；
+  尚未在当前报告中给出 Parquet 同条件线程扩展、长时压力或大文件冷缓存结果。

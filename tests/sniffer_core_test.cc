@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <array>
+#include <barrier>
 #include <bit>
 #include <cstddef>
 #include <cstdint>
@@ -17,6 +18,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -2379,6 +2381,171 @@ TEST(SnifferCoreTest, NonPlainAndSharedProjectionUseIndexSelection) {
   EXPECT_EQ(shared_rows, selected_values.size());
   EXPECT_EQ(metrics->selection_indices_materialized, selected_values.size());
   EXPECT_EQ(metrics->projection_chunks_decoded, 0U);
+}
+
+TEST(SnifferCoreTest, IndependentScansShareReaderAcrossThreads) {
+  const auto data = MakeScanBatch();
+  TempFile file("concurrent_scans.seg");
+  WriteSegmentWithPolicy(file.path(), data.table_schema, {data.batch}, ScanLayout());
+  auto reader = ValueOrThrow(sniffer::SegmentReader::Open(file.path().string()),
+                             "open concurrent scan segment");
+
+  std::array<sniffer::IOPlan, 4> plans;
+  plans[0].projection_field_ids = {1, 4};
+  plans[0].output_batch_rows = 7;
+  plans[1].projection_field_ids = {4, 1};
+  plans[1].conjunctive_predicates = {
+      {1, sniffer::Predicate::Op::kGe, std::make_shared<arrow::Int64Scalar>(15)}};
+  plans[1].output_batch_rows = 3;
+  plans[2].projection_field_ids = {1};
+  plans[2].conjunctive_predicates = {
+      {1, sniffer::Predicate::Op::kGe, std::make_shared<arrow::Int64Scalar>(5)}};
+  plans[2].limit = 4;
+  plans[2].output_batch_rows = 2;
+  plans[3].projection_field_ids = {1};
+  plans[3].conjunctive_predicates = {
+      {1, sniffer::Predicate::Op::kGt, std::make_shared<arrow::Int64Scalar>(1000)}};
+  plans[3].output_batch_rows = 5;
+
+  std::array<std::vector<std::shared_ptr<arrow::RecordBatch>>, 4> expected;
+  std::array<uint64_t, 4> expected_chunks{};
+  for (size_t index = 0; index < plans.size(); ++index) {
+    auto metrics = std::make_shared<sniffer::ScanMetrics>();
+    expected[index] = CollectScan(
+        ValueOrThrow(reader->Scan(plans[index], metrics), "prepare reference concurrent scan"));
+    expected_chunks[index] = metrics->column_chunks_read;
+  }
+
+  std::array<std::string, 4> errors;
+  std::vector<std::thread> workers;
+  std::barrier start(static_cast<ptrdiff_t>(plans.size()));
+  for (size_t index = 0; index < plans.size(); ++index) {
+    workers.emplace_back([&, index] {
+      start.arrive_and_wait();
+      for (int repeat = 0; repeat < 40; ++repeat) {
+        if (index == 0 && repeat == 0) {
+          auto all = reader->ReadAll();
+          if (!all.ok() || all->size() != 6U) {
+            errors[index] =
+                all.ok() ? "concurrent ReadAll returned wrong groups" : all.status().ToString();
+            return;
+          }
+          const auto checksum = reader->VerifyFileChecksum();
+          if (!checksum.ok()) {
+            errors[index] = checksum.ToString();
+            return;
+          }
+        }
+        auto metrics = std::make_shared<sniffer::ScanMetrics>();
+        auto result = reader->Scan(plans[index], metrics);
+        if (!result.ok()) {
+          errors[index] = result.status().ToString();
+          return;
+        }
+        auto iterator = std::move(result).ValueUnsafe();
+        size_t batch_index = 0;
+        while (true) {
+          auto next = iterator.Next();
+          if (!next.ok()) {
+            errors[index] = next.status().ToString();
+            return;
+          }
+          auto batch = std::move(next).ValueUnsafe();
+          if (!batch) {
+            break;
+          }
+          if (batch_index >= expected[index].size() ||
+              !batch->Equals(*expected[index][batch_index])) {
+            errors[index] = "concurrent scan differs from sequential reference";
+            return;
+          }
+          ++batch_index;
+        }
+        if (batch_index != expected[index].size() ||
+            metrics->column_chunks_read != expected_chunks[index]) {
+          errors[index] = "concurrent scan changed output or chunk pruning";
+          return;
+        }
+      }
+    });
+  }
+  for (auto& worker : workers) {
+    worker.join();
+  }
+  for (const auto& error : errors) {
+    EXPECT_TRUE(error.empty()) << error;
+  }
+
+  auto survivor = ValueOrThrow(reader->Scan(plans[1]), "create surviving scan iterator");
+  reader.reset();
+  const auto survived = CollectScan(std::move(survivor));
+  ASSERT_EQ(survived.size(), expected[1].size());
+  for (size_t index = 0; index < survived.size(); ++index) {
+    EXPECT_TRUE(survived[index]->Equals(*expected[1][index]));
+  }
+}
+
+TEST(SnifferCoreTest, ConcurrentScansIsolatePrunedCorruptChunks) {
+  const auto data = MakeScanBatch();
+  TempFile file("concurrent_corrupt_chunk.seg");
+  WriteSegmentWithPolicy(file.path(), data.table_schema, {data.batch}, ScanLayout());
+  auto bytes = ReadFile(file.path());
+  const size_t trailer_offset = bytes.size() - 40;
+  const size_t footer_offset = static_cast<size_t>(ReadU64(bytes, trailer_offset + 8));
+  const size_t footer_length = static_cast<size_t>(ReadU64(bytes, trailer_offset + 16));
+  const auto footer = ValueOrThrow(sniffer::internal::ParseFooter(std::span<const uint8_t>(
+                                       bytes.data() + footer_offset, footer_length)),
+                                   "parse concurrent corrupt footer");
+  const auto& damaged = footer.row_groups.back().chunks[3];
+  ASSERT_LT(damaged.offset + 24U, bytes.size());
+  bytes[static_cast<size_t>(damaged.offset + 24U)] ^= 1U;
+  RefreshFooterChecksums(&bytes);
+  WriteFile(file.path(), bytes);
+  auto reader = ValueOrThrow(sniffer::SegmentReader::Open(file.path().string()),
+                             "open concurrent corrupt segment");
+
+  sniffer::IOPlan pruned;
+  pruned.projection_field_ids = {4};
+  pruned.conjunctive_predicates = {
+      {1, sniffer::Predicate::Op::kLt, std::make_shared<arrow::Int64Scalar>(10)}};
+  pruned.output_batch_rows = 5;
+  sniffer::IOPlan unpruned;
+  unpruned.projection_field_ids = {4};
+  unpruned.output_batch_rows = 5;
+  uint64_t pruned_rows = 0;
+  std::string pruned_error;
+  std::string unpruned_error;
+  std::barrier start(2);
+  const auto scan = [&](sniffer::IOPlan plan, uint64_t* rows, std::string* error) {
+    start.arrive_and_wait();
+    auto result = reader->Scan(std::move(plan));
+    if (!result.ok()) {
+      *error = result.status().ToString();
+      return;
+    }
+    auto iterator = std::move(result).ValueUnsafe();
+    while (true) {
+      auto next = iterator.Next();
+      if (!next.ok()) {
+        *error = next.status().ToString();
+        return;
+      }
+      const auto batch = std::move(next).ValueUnsafe();
+      if (!batch) {
+        return;
+      }
+      if (rows) {
+        *rows += static_cast<uint64_t>(batch->num_rows());
+      }
+    }
+  };
+  std::thread good([&] { scan(pruned, &pruned_rows, &pruned_error); });
+  std::thread bad([&] { scan(unpruned, nullptr, &unpruned_error); });
+  good.join();
+  bad.join();
+  EXPECT_TRUE(pruned_error.empty()) << pruned_error;
+  EXPECT_EQ(pruned_rows, 10U);
+  EXPECT_NE(unpruned_error.find("[sniffer.format.checksum]"), std::string::npos);
 }
 
 TEST(SnifferCoreTest, WholeRowGroupScanRejectsOversizedRowCount) {

@@ -48,6 +48,17 @@ Writer 默认根据固定样本和固定阈值确定性选择编码，也可以�
 - 未配置统计或 Bloom 时安全降级为顺序扫描
 - `ScanMetrics` 可观测 Row Group 剪枝、ColumnChunk 读取和解码字节数
 
+### 并发读取边界
+
+同一不可变 Segment 可由多个 Reader 同时读取；同一 Reader 可并发创建和推进**不同的**
+Scan 迭代器，也可同时调用 `ReadAll()`。迭代器拥有自己的执行状态，可在 Reader 销毁后继续
+读取。单个迭代器的 `Next()` 不支持并发调用；同一 Writer 的 `Append()`/`Finish()`
+也须由调用方串行化。并发扫描不要共用一个可写 `ScanMetrics`，调用期间也不要修改
+`IOPlan` 引用的 scalar。库不会自动创建后台线程；线程数由上层控制。
+
+macOS/Linux 的文件读取使用独立 offset 的 `pread`，避免共享文件位置争用；其他平台使用
+互斥保护的流式读取回退。两条路径都执行相同的范围检查和 ColumnChunk checksum。
+
 ## 依赖
 
 - C++20 编译器

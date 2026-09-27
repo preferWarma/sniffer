@@ -492,3 +492,48 @@ round-trip 测试；没有用估计基数替代精确选择。
   --benchmark_repetitions=11 --benchmark_min_time=0.03s \
   --benchmark_report_aggregates_only=true --benchmark_format=csv
 ```
+
+### 多查询并发：共享 Reader 的独立 offset 读取
+
+2026-09-25，Apple M4（10 逻辑核）、macOS arm64、Apple Clang 21、Arrow C++ 23.0.1、
+Release、warm-cache。确定性 500,000 行双 int64 列：递增 `id`、`value=17*id+3`；
+Row Group 8,192，Segment 文件 1,958,476 bytes。每个线程独立执行 `id >= 250000`、投影两列的完整 Scan，
+每查询命中 250,000 行；所有线程同时复用同一不可变 Segment。
+旧路径使用共享 `ifstream` 加互斥 seek/read；新路径在 macOS/Linux 使用单个
+只读 fd 的 `pread`。独立 Reader 对照为每线程各打开一个 Reader；不含 Reader
+构造和 Segment 写入时间。每 case 7 次重复、至少 0.05 秒，表中为每查询
+wall-time P50（ms）；8 线程另做 11 次独立复测。
+
+| Reader | 线程 | 流式互斥 P50 | `pread` P50 | 复测流式互斥 / `pread` |
+|---|---:|---:|---:|---:|
+| 共享 | 1 | 2.788 | 2.729 | 2.956 / 2.639 |
+| 共享 | 2 | 3.015 | 2.825 | — |
+| 共享 | 4 | 3.273 | 2.939 | — |
+| 共享 | 8 | 6.228 | 4.036 | 7.075 / 3.986 |
+| 独立 | 1 | 2.850 | 2.724 | 2.998 / 2.630 |
+| 独立 | 2 | 2.953 | 2.788 | — |
+| 独立 | 4 | 3.130 | 2.989 | — |
+| 独立 | 8 | 4.372 | 4.001 | 4.519 / 3.962 |
+
+8 线程共享 Reader 的两轮 P50 分别降低约 35% 和 44%；`pread` 共享与
+独立 Reader 接近，说明旧共享流锁是该场景的可归因瓶颈。按 8 个线程各扫
+500,000 输入行计算，总处理量约为 4,000,000 行 / 4 ms，即约 1.0 G
+输入行/s；这是 warm-cache 合成查询的多请求吞吐，不是单请求 Scan 提速，
+也不是 Parquet 对照。单线程变化较小，不能据此声称普遍加速。
+扫描仍验证 ColumnChunk checksum、按索引剪枝且仅读投影/谓词列。
+当前基准尚未覆盖 cold-cache、峰值 RSS、分配量或 Parquet 并发对照。
+
+基线与新路径由同一源码构建，只有后端宏不同：
+
+```sh
+cmake -S . -B build-release-stream -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_CXX_FLAGS=-DSNIFFER_FORCE_STREAM_IO \
+  -DSNIFFER_BUILD_TESTS=OFF -DSNIFFER_BUILD_EXAMPLES=OFF
+cmake --build build-release-stream -j --target sniffer_core_concurrency_benchmark
+./build-release-stream/sniffer_core_concurrency_benchmark \
+  --benchmark_repetitions=7 --benchmark_min_time=0.05s \
+  --benchmark_report_aggregates_only=true --benchmark_format=csv
+./build-release/sniffer_core_concurrency_benchmark \
+  --benchmark_repetitions=7 --benchmark_min_time=0.05s \
+  --benchmark_report_aggregates_only=true --benchmark_format=csv
+```

@@ -37,7 +37,12 @@ class SegmentReader {
 
   [[nodiscard]] const TableSchema& schema() const;
   [[nodiscard]] uint64_t num_row_groups() const;
+  // ReadAll and independent Scan calls may run concurrently on the same Reader.
+  // Do not call Next() concurrently on one iterator or share one ScanMetrics
+  // object between concurrent scans. The caller must not mutate IOPlan scalars
+  // while scans that reference them are active.
   [[nodiscard]] arrow::Result<std::vector<std::shared_ptr<arrow::RecordBatch>>> ReadAll() const;
+  // Each Scan iterator owns its execution state and outlives Reader destruction.
   [[nodiscard]] arrow::Result<arrow::RecordBatchIterator> Scan(
       IOPlan plan, std::shared_ptr<ScanMetrics> metrics = nullptr) const;
   [[nodiscard]] arrow::Status VerifyFileChecksum() const;
