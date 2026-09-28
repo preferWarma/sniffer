@@ -2086,6 +2086,60 @@ TEST(SnifferCoreTest, ChunkCorruptionFailsLazyReadAndFileVerify) {
       << "chunk corruption must fail whole-file verification";
 }
 
+TEST(SnifferCoreTest, DroppedScanAndLimitDoNotReadFutureCorruptRowGroup) {
+  const auto data = MakeScanBatch();
+  TempFile file("dropped_scan_skips_future_chunk.seg");
+  WriteSegmentWithPolicy(file.path(), data.table_schema, {data.batch}, ScanLayout());
+  auto bytes = ReadFile(file.path());
+  const size_t trailer_offset = bytes.size() - 40;
+  const size_t footer_offset = static_cast<size_t>(ReadU64(bytes, trailer_offset + 8));
+  const size_t footer_length = static_cast<size_t>(ReadU64(bytes, trailer_offset + 16));
+  const auto footer = ValueOrThrow(sniffer::internal::ParseFooter(std::span<const uint8_t>(
+                                       bytes.data() + footer_offset, footer_length)),
+                                   "parse footer for future-chunk test");
+  ASSERT_EQ(footer.row_groups.size(), 6U);
+  const auto& damaged = footer.row_groups[1].chunks[3];
+  ASSERT_LT(damaged.offset + 24U, bytes.size());
+  bytes[static_cast<size_t>(damaged.offset + 24U)] ^= 1U;
+  RefreshFooterChecksums(&bytes);
+  WriteFile(file.path(), bytes);
+  auto reader = ValueOrThrow(sniffer::SegmentReader::Open(file.path().string()),
+                             "open segment with damaged future Row Group");
+
+  sniffer::IOPlan plan;
+  plan.projection_field_ids = {4};
+  plan.output_batch_rows = 5;
+  auto metrics = std::make_shared<sniffer::ScanMetrics>();
+  {
+    auto iterator = ValueOrThrow(reader->Scan(plan, metrics), "create stoppable scan");
+    const auto first = ValueOrThrow(iterator.Next(), "read first Row Group before drop");
+    ASSERT_NE(first, nullptr);
+    ASSERT_EQ(first->num_rows(), 5);
+    const auto& payload = static_cast<const arrow::BinaryArray&>(*first->column(0));
+    EXPECT_EQ(payload.GetView(0), "p0");
+    EXPECT_EQ(payload.GetView(4), "p4");
+  }
+  EXPECT_EQ(metrics->row_groups_considered, 1U);
+  EXPECT_EQ(metrics->column_chunks_read, 1U)
+      << "dropping an iterator must not touch the next candidate Row Group";
+
+  plan.limit = 5;
+  metrics = std::make_shared<sniffer::ScanMetrics>();
+  const auto limited =
+      CollectScan(ValueOrThrow(reader->Scan(plan, metrics), "scan with early limit"));
+  ASSERT_EQ(limited.size(), 1U);
+  EXPECT_EQ(limited[0]->num_rows(), 5);
+  EXPECT_EQ(metrics->row_groups_considered, 1U);
+  EXPECT_EQ(metrics->column_chunks_read, 1U);
+
+  plan.limit.reset();
+  auto iterator = ValueOrThrow(reader->Scan(plan), "create full scan of damaged segment");
+  EXPECT_TRUE(iterator.Next().ok());
+  const auto second = iterator.Next();
+  EXPECT_FALSE(second.ok());
+  EXPECT_NE(second.status().ToString().find("[sniffer.format.checksum]"), std::string::npos);
+}
+
 TEST(SnifferCoreTest, InvalidChunkOffsetFailsOpen) {
   sniffer::TableSchema schema{1, {{77, "x", arrow::int32(), true, nullptr}}};
   auto arrow_schema = ValueOrThrow(schema.ToArrowSchema(), "single schema");
