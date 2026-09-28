@@ -9,6 +9,7 @@
 
 #if defined(__APPLE__) || defined(__linux__)
 #include <sys/resource.h>
+#include <unistd.h>
 #endif
 
 #include <algorithm>
@@ -412,8 +413,16 @@ void RunPerformance(benchmark::State& state, Format format, Query query,
   const std::string suffix = format == Format::kSniffer
                                  ? "sniffer"
                                  : (format == Format::kParquet ? "parquet" : "parquet_zstd");
-  const auto path =
-      std::filesystem::temp_directory_path() / ("sniffer_performance_" + suffix + ".tmp");
+#if defined(__APPLE__) || defined(__linux__)
+  const std::string process_id = std::to_string(getpid());
+#else
+  const std::string process_id = "portable";
+#endif
+  const std::string run_id =
+      process_id + "_" +
+      std::to_string(std::chrono::steady_clock::now().time_since_epoch().count());
+  const auto path = std::filesystem::temp_directory_path() /
+                    ("sniffer_performance_" + suffix + "_" + run_id + ".tmp");
   Measurement totals;
   for (auto _ : state) {
     (void)_;

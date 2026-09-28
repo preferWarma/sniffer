@@ -277,6 +277,18 @@ SIMD、多级编码链和新压缩算法只有在标量路径完成剖析和优�
 
 ## 11. 执行记录
 
+### 2026-09-28：按物理 Row Group 的处理单元
+
+在 Decision 0005 和早停基线提交 `d0d6d6a` 后，将内部单组读取/剪枝/过滤/
+投影抽为 `ScanState::ReadRowGroupAt(index, remaining_limit)`；原串行遍历只负责
+选择下一组，公开 API 与文件字节不变。100K/10M Reader-only before/after
+见 [`bench/BENCHMARK_V2.md`](../bench/BENCHMARK_V2.md)：10M 无可信小幅差异，
+100K 本轮约慢 3%，故不将重构称作性能提升；后续必须以有界调度收益覆盖
+该成本。Row Group 处理单元仍只由串行路径调用，正式内部并行尚未接入。
+Release 与 ASan+UBSan 跨构建并发运行 CTest 时，benchmark smoke 曾因固定临时
+文件名互相覆盖而失败；单个 CTest 的资源锁不能覆盖不同构建目录。性能与压缩
+基准现使用含进程 ID 和时戳的独立临时路径，不改变库扫描行为。
+
 ### 2026-09-28：有界内部并行的执行契约与早停基线
 
 提交 `cc8e55a` 已同步远端，开始本项时工作树无待提交改动。上一轮 10M 行

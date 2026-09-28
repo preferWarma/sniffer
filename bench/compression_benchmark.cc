@@ -18,6 +18,10 @@
 #include <utility>
 #include <vector>
 
+#if defined(__APPLE__) || defined(__linux__)
+#include <unistd.h>
+#endif
+
 #include "benchmark_build_config.h"
 #include "parquet_benchmark_util.h"
 #include "sniffer/segment_reader.h"
@@ -261,9 +265,17 @@ void RunCompressionBenchmark(benchmark::State& state, const Scenario& scenario, 
     state.SkipWithError("logical size must be positive");
     return;
   }
-  const auto path =
-      std::filesystem::temp_directory_path() /
-      ("sniffer_compression_" + scenario.name + "_" + std::string(FormatName(format)) + ".tmp");
+#if defined(__APPLE__) || defined(__linux__)
+  const std::string process_id = std::to_string(getpid());
+#else
+  const std::string process_id = "portable";
+#endif
+  const std::string run_id =
+      process_id + "_" +
+      std::to_string(std::chrono::steady_clock::now().time_since_epoch().count());
+  const auto path = std::filesystem::temp_directory_path() /
+                    ("sniffer_compression_" + scenario.name + "_" +
+                     std::string(FormatName(format)) + "_" + run_id + ".tmp");
   double encode_total = 0;
   double decode_total = 0;
   uint64_t file_bytes = 0;

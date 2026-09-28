@@ -1523,168 +1523,185 @@ class ScanState {
       uint64_t remaining_limit) {
     while (next_row_group_ < footer_.row_groups.size() && remaining_limit != 0) {
       const size_t row_group_index = next_row_group_++;
-      const auto& row_group = footer_.row_groups[row_group_index];
-      const auto& index = indexes_[row_group_index];
-      ++metrics_->row_groups_considered;
-      bool pruned = false;
-      {
-        internal::NanosecondTimer timer(&metrics_->pruning_nanoseconds);
-        ARROW_ASSIGN_OR_RAISE(pruned, IsPruned(row_group, index));
+      ARROW_ASSIGN_OR_RAISE(auto batch, ReadRowGroupAt(row_group_index, remaining_limit));
+      if (batch) {
+        return batch;
       }
-      if (pruned) {
-        ++metrics_->row_groups_pruned;
-        continue;
-      }
-
-      bool all_rows_match = true;
-      if (plan_.sort_key_range) {
-        internal::NanosecondTimer timer(&metrics_->pruning_nanoseconds);
-        ARROW_ASSIGN_OR_RAISE(
-            all_rows_match, SortRangeMatchesEntireRowGroup(footer_, index, *plan_.sort_key_range));
-      }
-      if (all_rows_match) {
-        internal::NanosecondTimer timer(&metrics_->pruning_nanoseconds);
-        for (const auto& predicate : plan_.conjunctive_predicates) {
-          ARROW_ASSIGN_OR_RAISE(const bool matches,
-                                PredicateMatchesEntireRowGroup(row_group, index, predicate));
-          if (!matches) {
-            all_rows_match = false;
-            break;
-          }
-        }
-      }
-
-      std::vector<std::shared_ptr<arrow::Array>> filter_columns(resolved_plan_.filter_column_count);
-      // A whole-group proof needs no predicate payload. Projected predicate
-      // fields are decoded below; unprojected ones remain unread.
-      if (!all_rows_match) {
-        for (const size_t field_index : resolved_plan_.predicate_field_indices) {
-          auto& column = filter_columns[resolved_plan_.filter_slots_by_field_index[field_index]];
-          if (!column) {
-            ARROW_ASSIGN_OR_RAISE(column, DecodePredicateChunk(row_group, field_index));
-          }
-        }
-      }
-      if (plan_.sort_key_range && !all_rows_match) {
-        for (const size_t field_index : resolved_plan_.sort_key_field_indices) {
-          auto& column = filter_columns[resolved_plan_.filter_slots_by_field_index[field_index]];
-          if (!column) {
-            ARROW_ASSIGN_OR_RAISE(column, DecodePredicateChunk(row_group, field_index));
-          }
-        }
-      }
-      std::vector<const arrow::Array*> predicate_columns;
-      predicate_columns.reserve(resolved_plan_.predicate_field_indices.size());
-      for (const size_t field_index : resolved_plan_.predicate_field_indices) {
-        predicate_columns.push_back(
-            filter_columns[resolved_plan_.filter_slots_by_field_index[field_index]].get());
-      }
-      std::vector<const arrow::Array*> sort_key_columns;
-      sort_key_columns.reserve(resolved_plan_.sort_key_field_indices.size());
-      for (const size_t field_index : resolved_plan_.sort_key_field_indices) {
-        sort_key_columns.push_back(
-            filter_columns[resolved_plan_.filter_slots_by_field_index[field_index]].get());
-      }
-
-      const bool full_row_group = all_rows_match && remaining_limit >= row_group.row_count;
-      bool all_rows_selected = full_row_group;
-      std::vector<uint64_t> selection;
-      if (!full_row_group) {
-        internal::NanosecondTimer timer(&metrics_->predicate_nanoseconds);
-        const size_t capacity =
-            static_cast<size_t>(std::min<uint64_t>(row_group.row_count, remaining_limit));
-        if (all_rows_match) {
-          selection.resize(capacity);
-          std::iota(selection.begin(), selection.end(), uint64_t{0});
-        } else {
-          const bool reorder_predicates = plan_.conjunctive_predicates.size() > 1;
-          const auto row_matches = [&](uint64_t row) {
-            return reorder_predicates
-                       ? RowMatchesReordered(row, predicate_columns, sort_key_columns)
-                       : RowMatches(row, predicate_columns, sort_key_columns);
-          };
-          uint64_t matched_rows = 0;
-          uint64_t row = 0;
-          bool first_miss = false;
-          for (; row < row_group.row_count && matched_rows < remaining_limit; ++row) {
-            ARROW_ASSIGN_OR_RAISE(const bool matches, row_matches(row));
-            if (!matches) {
-              first_miss = true;
-              ++row;  // The first miss was already evaluated; resume after it.
-              break;
-            }
-            ++matched_rows;
-          }
-          if (!first_miss) {
-            if (matched_rows == row_group.row_count) {
-              all_rows_selected = true;
-            } else {
-              selection.resize(static_cast<size_t>(matched_rows));
-              std::iota(selection.begin(), selection.end(), uint64_t{0});
-            }
-          } else {
-            selection.reserve(capacity);
-            selection.resize(static_cast<size_t>(matched_rows));
-            std::iota(selection.begin(), selection.end(), uint64_t{0});
-            for (; row < row_group.row_count &&
-                   static_cast<uint64_t>(selection.size()) < remaining_limit;
-                 ++row) {
-              ARROW_ASSIGN_OR_RAISE(const bool matches, row_matches(row));
-              if (matches) {
-                selection.push_back(row);
-              }
-            }
-          }
-          metrics_->selection_rows_examined += row;
-        }
-        metrics_->selection_indices_materialized += static_cast<uint64_t>(selection.size());
-      }
-      const uint64_t selected_rows =
-          all_rows_selected ? row_group.row_count : static_cast<uint64_t>(selection.size());
-      if (selected_rows == 0) {
-        continue;
-      }
-      if (selected_rows > static_cast<uint64_t>(std::numeric_limits<int64_t>::max())) {
-        return arrow::Status::Invalid("[sniffer.format.limit] row group exceeds Arrow row limit");
-      }
-
-      std::vector<std::shared_ptr<arrow::Array>> projected_columns;
-      projected_columns.reserve(resolved_plan_.projection_field_indices.size());
-      for (const size_t field_index : resolved_plan_.projection_field_indices) {
-        const size_t filter_slot = resolved_plan_.filter_slots_by_field_index[field_index];
-        if (filter_slot != ResolvedScanPlan::kNoFilterSlot && filter_columns[filter_slot]) {
-          const auto& decoded = filter_columns[filter_slot];
-          if (all_rows_selected) {
-            projected_columns.push_back(decoded);
-          } else {
-            std::shared_ptr<arrow::Array> selected;
-            {
-              internal::NanosecondTimer timer(&metrics_->projection_nanoseconds);
-              ARROW_ASSIGN_OR_RAISE(selected, SelectArray(decoded, selection));
-            }
-            projected_columns.push_back(std::move(selected));
-          }
-        } else {
-          ARROW_ASSIGN_OR_RAISE(auto selected,
-                                DecodeProjectionChunk(row_group, field_index,
-                                                      all_rows_selected ? nullptr : &selection));
-          projected_columns.push_back(std::move(selected));
-        }
-        metrics_->projection_rows_materialized += selected_rows;
-      }
-      std::shared_ptr<arrow::RecordBatch> batch;
-      {
-        internal::NanosecondTimer timer(&metrics_->batch_materialization_nanoseconds);
-        batch = arrow::RecordBatch::Make(output_schema_, static_cast<int64_t>(selected_rows),
-                                         std::move(projected_columns));
-        // Each decoded/selected array passed ValidateFull(); only the batch's
-        // schema and column lengths remain to check here.
-        ARROW_RETURN_NOT_OK(batch->Validate());
-      }
-      return batch;
     }
     return std::shared_ptr<arrow::RecordBatch>();
   }
+
+ public:
+  // One physical Row Group is the scheduling unit for bounded parallel scans.
+  arrow::Result<std::shared_ptr<arrow::RecordBatch>> ReadRowGroupAt(size_t row_group_index,
+                                                                    uint64_t remaining_limit) {
+    if (row_group_index >= footer_.row_groups.size()) {
+      return arrow::Status::IndexError("Row Group index out of bounds");
+    }
+    if (remaining_limit == 0) {
+      return std::shared_ptr<arrow::RecordBatch>();
+    }
+    const auto& row_group = footer_.row_groups[row_group_index];
+    const auto& index = indexes_[row_group_index];
+    ++metrics_->row_groups_considered;
+    bool pruned = false;
+    {
+      internal::NanosecondTimer timer(&metrics_->pruning_nanoseconds);
+      ARROW_ASSIGN_OR_RAISE(pruned, IsPruned(row_group, index));
+    }
+    if (pruned) {
+      ++metrics_->row_groups_pruned;
+      return std::shared_ptr<arrow::RecordBatch>();
+    }
+
+    bool all_rows_match = true;
+    if (plan_.sort_key_range) {
+      internal::NanosecondTimer timer(&metrics_->pruning_nanoseconds);
+      ARROW_ASSIGN_OR_RAISE(all_rows_match,
+                            SortRangeMatchesEntireRowGroup(footer_, index, *plan_.sort_key_range));
+    }
+    if (all_rows_match) {
+      internal::NanosecondTimer timer(&metrics_->pruning_nanoseconds);
+      for (const auto& predicate : plan_.conjunctive_predicates) {
+        ARROW_ASSIGN_OR_RAISE(const bool matches,
+                              PredicateMatchesEntireRowGroup(row_group, index, predicate));
+        if (!matches) {
+          all_rows_match = false;
+          break;
+        }
+      }
+    }
+
+    std::vector<std::shared_ptr<arrow::Array>> filter_columns(resolved_plan_.filter_column_count);
+    // A whole-group proof needs no predicate payload. Projected predicate
+    // fields are decoded below; unprojected ones remain unread.
+    if (!all_rows_match) {
+      for (const size_t field_index : resolved_plan_.predicate_field_indices) {
+        auto& column = filter_columns[resolved_plan_.filter_slots_by_field_index[field_index]];
+        if (!column) {
+          ARROW_ASSIGN_OR_RAISE(column, DecodePredicateChunk(row_group, field_index));
+        }
+      }
+    }
+    if (plan_.sort_key_range && !all_rows_match) {
+      for (const size_t field_index : resolved_plan_.sort_key_field_indices) {
+        auto& column = filter_columns[resolved_plan_.filter_slots_by_field_index[field_index]];
+        if (!column) {
+          ARROW_ASSIGN_OR_RAISE(column, DecodePredicateChunk(row_group, field_index));
+        }
+      }
+    }
+    std::vector<const arrow::Array*> predicate_columns;
+    predicate_columns.reserve(resolved_plan_.predicate_field_indices.size());
+    for (const size_t field_index : resolved_plan_.predicate_field_indices) {
+      predicate_columns.push_back(
+          filter_columns[resolved_plan_.filter_slots_by_field_index[field_index]].get());
+    }
+    std::vector<const arrow::Array*> sort_key_columns;
+    sort_key_columns.reserve(resolved_plan_.sort_key_field_indices.size());
+    for (const size_t field_index : resolved_plan_.sort_key_field_indices) {
+      sort_key_columns.push_back(
+          filter_columns[resolved_plan_.filter_slots_by_field_index[field_index]].get());
+    }
+
+    const bool full_row_group = all_rows_match && remaining_limit >= row_group.row_count;
+    bool all_rows_selected = full_row_group;
+    std::vector<uint64_t> selection;
+    if (!full_row_group) {
+      internal::NanosecondTimer timer(&metrics_->predicate_nanoseconds);
+      const size_t capacity =
+          static_cast<size_t>(std::min<uint64_t>(row_group.row_count, remaining_limit));
+      if (all_rows_match) {
+        selection.resize(capacity);
+        std::iota(selection.begin(), selection.end(), uint64_t{0});
+      } else {
+        const bool reorder_predicates = plan_.conjunctive_predicates.size() > 1;
+        const auto row_matches = [&](uint64_t row) {
+          return reorder_predicates ? RowMatchesReordered(row, predicate_columns, sort_key_columns)
+                                    : RowMatches(row, predicate_columns, sort_key_columns);
+        };
+        uint64_t matched_rows = 0;
+        uint64_t row = 0;
+        bool first_miss = false;
+        for (; row < row_group.row_count && matched_rows < remaining_limit; ++row) {
+          ARROW_ASSIGN_OR_RAISE(const bool matches, row_matches(row));
+          if (!matches) {
+            first_miss = true;
+            ++row;  // The first miss was already evaluated; resume after it.
+            break;
+          }
+          ++matched_rows;
+        }
+        if (!first_miss) {
+          if (matched_rows == row_group.row_count) {
+            all_rows_selected = true;
+          } else {
+            selection.resize(static_cast<size_t>(matched_rows));
+            std::iota(selection.begin(), selection.end(), uint64_t{0});
+          }
+        } else {
+          selection.reserve(capacity);
+          selection.resize(static_cast<size_t>(matched_rows));
+          std::iota(selection.begin(), selection.end(), uint64_t{0});
+          for (; row < row_group.row_count &&
+                 static_cast<uint64_t>(selection.size()) < remaining_limit;
+               ++row) {
+            ARROW_ASSIGN_OR_RAISE(const bool matches, row_matches(row));
+            if (matches) {
+              selection.push_back(row);
+            }
+          }
+        }
+        metrics_->selection_rows_examined += row;
+      }
+      metrics_->selection_indices_materialized += static_cast<uint64_t>(selection.size());
+    }
+    const uint64_t selected_rows =
+        all_rows_selected ? row_group.row_count : static_cast<uint64_t>(selection.size());
+    if (selected_rows == 0) {
+      return std::shared_ptr<arrow::RecordBatch>();
+    }
+    if (selected_rows > static_cast<uint64_t>(std::numeric_limits<int64_t>::max())) {
+      return arrow::Status::Invalid("[sniffer.format.limit] row group exceeds Arrow row limit");
+    }
+
+    std::vector<std::shared_ptr<arrow::Array>> projected_columns;
+    projected_columns.reserve(resolved_plan_.projection_field_indices.size());
+    for (const size_t field_index : resolved_plan_.projection_field_indices) {
+      const size_t filter_slot = resolved_plan_.filter_slots_by_field_index[field_index];
+      if (filter_slot != ResolvedScanPlan::kNoFilterSlot && filter_columns[filter_slot]) {
+        const auto& decoded = filter_columns[filter_slot];
+        if (all_rows_selected) {
+          projected_columns.push_back(decoded);
+        } else {
+          std::shared_ptr<arrow::Array> selected;
+          {
+            internal::NanosecondTimer timer(&metrics_->projection_nanoseconds);
+            ARROW_ASSIGN_OR_RAISE(selected, SelectArray(decoded, selection));
+          }
+          projected_columns.push_back(std::move(selected));
+        }
+      } else {
+        ARROW_ASSIGN_OR_RAISE(auto selected,
+                              DecodeProjectionChunk(row_group, field_index,
+                                                    all_rows_selected ? nullptr : &selection));
+        projected_columns.push_back(std::move(selected));
+      }
+      metrics_->projection_rows_materialized += selected_rows;
+    }
+    std::shared_ptr<arrow::RecordBatch> batch;
+    {
+      internal::NanosecondTimer timer(&metrics_->batch_materialization_nanoseconds);
+      batch = arrow::RecordBatch::Make(output_schema_, static_cast<int64_t>(selected_rows),
+                                       std::move(projected_columns));
+      // Each decoded/selected array passed ValidateFull(); only the batch's
+      // schema and column lengths remain to check here.
+      ARROW_RETURN_NOT_OK(batch->Validate());
+    }
+    return batch;
+  }
+
+ private:
   arrow::Result<std::vector<uint8_t>> ReadChunk(const internal::ColumnChunkMeta& chunk) {
     std::vector<uint8_t> payload;
     {
