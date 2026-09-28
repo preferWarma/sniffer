@@ -204,6 +204,14 @@ if(SNIFFER_BUILD_BENCHMARK)
     sniffer_core_concurrency_benchmark
     PRIVATE sniffer_core sniffer_parquet benchmark::benchmark Threads::Threads
   )
+  add_executable(sniffer_core_reader_memory_benchmark bench/reader_memory_benchmark.cc)
+  target_compile_features(sniffer_core_reader_memory_benchmark PRIVATE cxx_std_20)
+  target_include_directories(
+    sniffer_core_reader_memory_benchmark PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/generated"
+  )
+  target_link_libraries(
+    sniffer_core_reader_memory_benchmark PRIVATE sniffer_core benchmark::benchmark
+  )
   if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
     target_compile_options(
       sniffer_core_performance_benchmark
@@ -225,8 +233,19 @@ if(SNIFFER_BUILD_BENCHMARK)
       sniffer_core_concurrency_benchmark
       PRIVATE -Wall -Wextra -Wpedantic -Wconversion
     )
+    target_compile_options(
+      sniffer_core_reader_memory_benchmark
+      PRIVATE -Wall -Wextra -Wpedantic -Wconversion
+    )
   endif()
   if(SNIFFER_BUILD_TESTS)
+    add_test(
+      NAME sniffer_core_reader_memory_smoke
+      COMMAND "${CMAKE_COMMAND}"
+        "-DREADER_MEMORY_EXE=$<TARGET_FILE:sniffer_core_reader_memory_benchmark>"
+        "-DREADER_MEMORY_TEST_DIR=${CMAKE_CURRENT_BINARY_DIR}"
+        -P "${CMAKE_CURRENT_SOURCE_DIR}/bench/reader_memory_smoke.cmake"
+    )
     add_test(
       NAME sniffer_core_performance_benchmark_smoke
       COMMAND sniffer_core_performance_benchmark --benchmark_dry_run

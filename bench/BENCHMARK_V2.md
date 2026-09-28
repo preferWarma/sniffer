@@ -1,9 +1,9 @@
-# Sniffer Core v0.2：Parquet 对照初版
+# Sniffer Core v0.2：基准与 Parquet 对照（进行中）
 
 本记录从 2026-09-23 起使用 Parquet 作为文件格式对照。v1 的 Arrow IPC 数字保留在
 [`BENCHMARK_V1.md`](BENCHMARK_V1.md)，两版的 Row Group、代码和测量口径不同，不能直接以表中
-绝对值推导版本间提速。本报告已补 16 列宽表，但尚未覆盖超过页缓存的数据集和 cold-cache，因此不是 v0.2
-最终验收报告。
+绝对值推导版本间提速。本报告已补 16 列宽表、同机旧版对照和完整 warm-cache
+参数矩阵；尚未覆盖超过页缓存的数据集和可信 cold-cache，因此不是 v0.2 最终验收报告。
 
 ## 环境与口径
 
@@ -53,7 +53,8 @@
 
 `SnifferThreePredicates`、`SnifferSortKeyRange` 与对应的 Parquet/Parquet + ZSTD case 均已注册；
 三谓词输出 1,470 行，范围查询输出 50,000 行。性能矩阵还提供三种格式各自的 1K/8K/64K/256K
-Row Group、1%/10%/50%/100% 选择率及 1/2/3 列投影 case；本初版尚未发布完整矩阵统计。
+Row Group、1%/10%/50%/100% 选择率及 1/2/3 列投影 case；完整 warm-cache
+矩阵见文末和 [`V0.2_MATRIX_2026-09-28.tsv`](V0.2_MATRIX_2026-09-28.tsv)。
 
 ## 压缩专项
 
@@ -86,9 +87,10 @@ Plain 回退与 offset 开销。
 
 ## 待补齐
 
-- 宽表的多列相关性与宽投影、超页缓存数据、cold-cache 对照与完整矩阵汇总。
-- 各格式更细的读取量和峰值内存定义；当前 RSS 是进程高水位，不是每个 case 的独立峰值。
-- 使用相同源码状态与明确 v0.1 构建的回归复测，给出可信的相对 v1 数字。
+- 宽表的多列相关性与宽投影、超页缓存数据和 cold-cache 对照。
+- 各格式可比的物理读取字节；下文旧场景的 RSS 是写入＋扫描同进程的
+  high-water，文末新增 Reader-only 双进程基准，但仍只覆盖 warm-cache。
+- 更广的旧版→当前矩阵复测；下文仅给出相同输入/Row Group 的固定场景与六种压缩分布。
 
 ## 后续增量测量
 
@@ -727,3 +729,149 @@ chunk 字节，文件仍为 1,958,476 字节。单线程端到端约降 13%；�
   --benchmark_repetitions=11 --benchmark_min_time=0.05s \
   --benchmark_report_aggregates_only=true --benchmark_format=csv
 ```
+
+## 2026-09-28：同机旧版回归、完整 warm-cache 矩阵与独立进程内存
+
+以下复测均为 Apple M4 / macOS arm64 / AppleClang 21 / Arrow C++ 23.0.1 /
+Release / 系统临时目录 / warm-cache。旧版取 v0.2 规划之前的提交
+`aeb6a17857927f79227ad552a53287bd3cc6c376`，当前取 `de2741a`。
+旧版在隔离目录构建；新旧都在同机运行。旧版使用自建 runner 的 11 次
+median，当前使用 Google Benchmark 的 11 次 P50、每次至少 0.05 秒；
+两代 runner 的分组、计时框架和迭代策略不同，因此以下倍数是工作负载级
+回归参考，不是严格的同一 runner kernel A/B。
+
+固定性能场景的输入、`id >= 50000`、`id,value` 投影、输出 batch
+上限和 Row Group 8,192 一致。旧版与当前文件均为 675,943 字节，
+都剪枝 6/13 个 Row Group、读取 14 个 ColumnChunk / 184,036 字节，
+输出 50,000 行。
+
+| 源码 | 写入 P50 ms | 扫描 P50 ms | 端到端 P50 ms |
+| --- | ---: | ---: | ---: |
+| v0.2 前 `aeb6a17` | 65.732 | 17.007 | 82.696 |
+| 当前 `de2741a` | 3.584 | 0.438 | 4.042 |
+
+当前重复测量的写入/扫描/端到端 CV 为 1.82%/3.08%/1.86%。
+旧版 runner 只保留中位数、未报告 CV，不应将表中差异全部归因于某一个
+优化。新版本文件布局及该查询读取量与旧版完全一致，支持“没有通过多读
+数据换取速度”的判断。
+
+六种 v1 压缩分布也用 100,000 行、Row Group 4,096 重新运行：旧版
+7 次 median，当前 Google Benchmark 7 次 P50、每次至少 0.05 秒。
+下表为 Sniffer 的文件字节和编码写入/解码读取耗时；输入构造与结果验证
+均不计时，两边数据生成函数相同。
+
+| 分布 | 旧/当前文件字节 | 旧写/读 ms | 当前写/读 ms |
+| --- | ---: | ---: | ---: |
+| 递增 int64 | 153,882 / 153,882 | 11.293 / 11.780 | 1.347 / 0.197 |
+| 窄值域 int64 | 91,594 / 91,594 | 9.232 / 11.757 | 0.845 / 0.177 |
+| 长 RLE int64 | 7,166 / 7,166 | 17.324 / 1.640 | 0.450 / 0.248 |
+| nullable 偏斜 int64 | 54,094 / 54,094 | 7.328 / 9.578 | 0.623 / 0.268 |
+| 低基数字符串 | 117,044 / 117,044 | 17.037 / 3.135 | 1.295 / 1.330 |
+| 高基数字符串 | 3,203,894 / 2,803,815 | 30.990 / 13.686 | 3.962 / 2.176 |
+
+六场景逻辑字节合计 7,181,258。以各场景 P50 耗时相加估算，旧版
+编码/解码 73.48/132.79 MiB/s，当前约 803.69/1,558.17 MiB/s；
+这不是一次合并计时。前五个场景压缩比不变；高基数字符串通过独立
+CompactPlain 编码将文件缩小约 12.5%，压缩比 0.874x → 0.999x。
+旧 Reader 不要求读取新 ID 4，新 Reader 的实际旧版 Segment 兼容性
+另由 `V01ArtifactRemainsReadable` 固定样本测试覆盖。
+
+完整 warm-cache 矩阵覆盖 Sniffer、Parquet 无压缩、Parquet ZSTD 各
+4 个 Row Group 尺寸 × 4 个选择率 × 3 个投影宽度，共 144 个 case，
+每个 7 次重复、至少 0.01 秒。逐 case 的写入、扫描、端到端 P50、
+scan CV、文件大小与剪枝/读块指标保存在
+[`V0.2_MATRIX_2026-09-28.tsv`](V0.2_MATRIX_2026-09-28.tsv)。
+例如 Row Group 8,192、投影 `id,value` 时，scan P50（ms）：
+
+| 选择率 | Sniffer | Parquet | Parquet ZSTD | Sniffer 块字节 |
+| --- | ---: | ---: | ---: | ---: |
+| 1% | 0.190 | 0.387 | 0.206 | 5,380 |
+| 10% | 0.262 | 0.568 | 0.602 | 64,932 |
+| 50% | 0.435 | 0.949 | 1.372 | 184,036 |
+| 100% | 0.636 | 1.523 | 2.541 | 362,692 |
+
+矩阵在一个进程中连续运行，其 RSS/Arrow pool high-water 不可按 case
+比较。7/144 个 case 的 scan CV 超过 5%；其中 Sniffer 的
+RG 1,024 / 1% / 2 列与 Parquet 的 RG 1,024 / 1% / 3 列受明显
+异常值影响，另用独立进程 11 次、至少 0.05 秒复测，scan P50/CV
+分别为 0.296 ms / 1.94% 与 0.590 ms / 5.06%。原始 TSV 保留
+首轮结果，不以不稳定 case 声称格式优劣。
+
+代表性内存 case 分别启动全新 benchmark 进程，7 次重复、每次至少
+0.05 秒。`process_peak_rss_bytes` 是整个进程生命周期高水位，含输入
+Arrow batch、Writer、Reader 和库初始化；`arrow_pool_peak_bytes`
+也是进程级峰值，`arrow_total_allocated_bytes` 是每轮累计申请量，
+三者不能混为 Reader 峰值或单次常驻内存。
+
+| 独立进程 case | 进程 RSS 峰值 B | Arrow pool 峰值 B | Arrow 每轮申请 B |
+| --- | ---: | ---: | ---: |
+| 固定 3 列 / Sniffer | 12,959,744 | 3,086,272 | 1,211,712 |
+| 固定 3 列 / Parquet | 16,728,064 | 3,907,840 | 38,647,892 |
+| 固定 3 列 / Parquet ZSTD | 16,334,848 | 3,751,424 | 38,125,972 |
+| 16 列窄投影 / Sniffer | 22,052,864 | 13,346,688 | 1,211,712 |
+
+Sniffer 的两个极端矩阵 case 另测：RG 1,024 / 1% / 1 列的
+RSS/pool 峰值为 12,140,544/3,086,272 B、仅读 2,200 B；
+RG 262,144 / 100% / 3 列为 14,647,296/5,562,752 B、
+读取 563,138 B。它们展示投影、选择率和当前 Row Group 对资源的影响，
+但由于同进程写入和输入 batch 常驻，尚不能证明 Reader 峰值不随
+整个文件大小增长。
+
+新增独立 Reader-only Google Benchmark：生成器逐个 8,192 行 Row Group
+构造两列递增 int64 文件；测量进程只执行 Open 与 `key >= rows/2`、
+仅投影 `value` 的流式扫描，输出 batch 上限 4,096 行，不持有输入
+batch 或 Writer。不同规模各起一个扫描进程，7 次重复、每次至少
+0.05 秒，取 P50（扫描计时不含 Open）：
+
+| 输入行数 | 文件字节 | Row Group | 扫描 P50 ms | 进程 RSS 峰值 B | Arrow pool 峰值 B |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 100,000 | 328,793 | 13 | 0.140 | 5,324,800 | 163,840 |
+| 10,000,000 | 32,915,361 | 1,221 | 9.298 | 6,537,216 | 163,840 |
+
+文件扩大约 100 倍，扫描进程 RSS 高水位增加约 1.21 MiB，Arrow pool
+峰值不变；大文件 RSS 远低于 32.9 MB 文件本身，证明此数据路径没有
+整文件驻留。RSS 包括库启动和目录，索引/目录内存仍随 Row Group 数
+增长；本实验不能证明严格 O(1) 元数据内存，也不是 cold-cache 结果。
+
+复现 Reader-only 基准（每个 `--segment` 命令都应在新进程中执行）：
+
+```sh
+sniffer_mem_dir=$(mktemp -d)
+./build-release/sniffer_core_reader_memory_benchmark \
+  "--generate=$sniffer_mem_dir/100k.seg" --rows=100000
+./build-release/sniffer_core_reader_memory_benchmark \
+  "--generate=$sniffer_mem_dir/10m.seg" --rows=10000000
+./build-release/sniffer_core_reader_memory_benchmark \
+  "--segment=$sniffer_mem_dir/100k.seg" --rows=100000 \
+  --benchmark_repetitions=7 --benchmark_min_time=0.05s \
+  --benchmark_report_aggregates_only=true --benchmark_format=json
+./build-release/sniffer_core_reader_memory_benchmark \
+  "--segment=$sniffer_mem_dir/10m.seg" --rows=10000000 \
+  --benchmark_repetitions=7 --benchmark_min_time=0.05s \
+  --benchmark_report_aggregates_only=true --benchmark_format=json
+```
+
+复现命令（矩阵 TSV 从 Google Benchmark JSON 的 `median` 与 `cv`
+行抽取；内存必须每个 `--benchmark_filter` 单独启动进程）：
+
+```sh
+sniffer_legacy_dir=$(mktemp -d)
+git archive aeb6a17 | tar -x -C "$sniffer_legacy_dir"
+cmake -S "$sniffer_legacy_dir" -B "$sniffer_legacy_dir/build" \
+  -DCMAKE_BUILD_TYPE=Release -DSNIFFER_BUILD_TESTS=OFF -DSNIFFER_BUILD_BENCHMARK=ON
+cmake --build "$sniffer_legacy_dir/build" -j 8
+"$sniffer_legacy_dir/build/sniffer_core_performance_benchmark" \
+  --rows=100000 --iterations=11 --row-group=8192
+./build-release/sniffer_core_performance_benchmark \
+  '--benchmark_filter=^PerformanceMatrix/Sniffer/rows:100000/row_group_rows:8192/selectivity_percent:50/projection_columns:2/manual_time$' \
+  --benchmark_repetitions=11 --benchmark_min_time=0.05s \
+  --benchmark_report_aggregates_only=true --benchmark_format=json
+./build-release/sniffer_core_performance_benchmark \
+  '--benchmark_filter=^PerformanceMatrix/(Sniffer|Parquet|Parquet_ZSTD)/' \
+  --benchmark_repetitions=7 --benchmark_min_time=0.01s \
+  --benchmark_report_aggregates_only=true --benchmark_format=json
+```
+
+旧版临时目录不是仓库依赖。所有数据仍为 warm-cache 合成场景。
+Parquet 与 Sniffer 的 checksum、压缩和真实
+物理 I/O 口径不同，不应将这里的扫描时间外推为生产格式优劣。

@@ -179,7 +179,7 @@ ARROW_ASSIGN_OR_RAISE(auto batches, reader->Scan(std::move(plan), metrics));
   --benchmark_report_aggregates_only=true
 ```
 
-三个 benchmark 均使用 Google Benchmark 的标准 CLI。可用 `--benchmark_filter` 选择 case，使用
+各性能 benchmark 均使用 Google Benchmark 的标准 CLI。可用 `--benchmark_filter` 选择 case，使用
 `--benchmark_repetitions` 重复测量，并追加 `--benchmark_format=json` 输出机器可读结果。JSON 的
 `context` 包含源码 revision、编译器、Arrow 版本与构建模式；`benchmarks` 包含标准时间、重复聚合
 和 Sniffer 自定义 counters。
@@ -219,6 +219,23 @@ Parquet 口径见 [`bench/BENCHMARK_V2.md`](bench/BENCHMARK_V2.md)；
 
 每个 codec 的 Encode 与 Decode 都是独立 case，报告 payload 大小、压缩比、吞吐和标准重复聚合；
 round-trip 比较在计时区间外执行。
+
+Reader-only 内存基准把文件生成和扫描拆为两个进程，避免将输入 batch 与 Writer
+的高水位误算为 Reader 开销；`--generate` 默认拒绝覆盖已有文件：
+
+```bash
+sniffer_mem_dir=$(mktemp -d)
+./build/sniffer_core_reader_memory_benchmark \
+  "--generate=$sniffer_mem_dir/100k.seg" --rows=100000
+./build/sniffer_core_reader_memory_benchmark \
+  "--segment=$sniffer_mem_dir/100k.seg" --rows=100000 \
+  --benchmark_repetitions=7 --benchmark_min_time=0.05s \
+  --benchmark_report_aggregates_only=true --benchmark_format=json
+```
+
+更大文件应另起生成进程，再以新的扫描进程复测；进程 RSS 包含 Reader
+及库初始化，Arrow pool 峰值不包含非 Arrow 分配。方法与结果见
+[`bench/BENCHMARK_V2.md`](bench/BENCHMARK_V2.md)。
 
 性能 benchmark 的 Sniffer 结果还包含 phase counters：writer 的索引、编码选择、编码、checksum
 与文件写入，以及 reader 的元数据、chunk I/O/checksum、解码、谓词、投影和 batch materialization。
