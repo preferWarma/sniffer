@@ -843,10 +843,12 @@ sniffer_mem_dir=$(mktemp -d)
   "--generate=$sniffer_mem_dir/10m.seg" --rows=10000000
 ./build-release/sniffer_core_reader_memory_benchmark \
   "--segment=$sniffer_mem_dir/100k.seg" --rows=100000 \
+  '--benchmark_filter=^ReaderOnlyScan/real_time$' \
   --benchmark_repetitions=7 --benchmark_min_time=0.05s \
   --benchmark_report_aggregates_only=true --benchmark_format=json
 ./build-release/sniffer_core_reader_memory_benchmark \
   "--segment=$sniffer_mem_dir/10m.seg" --rows=10000000 \
+  '--benchmark_filter=^ReaderOnlyScan/real_time$' \
   --benchmark_repetitions=7 --benchmark_min_time=0.05s \
   --benchmark_report_aggregates_only=true --benchmark_format=json
 ```
@@ -875,3 +877,56 @@ cmake --build "$sniffer_legacy_dir/build" -j 8
 旧版临时目录不是仓库依赖。所有数据仍为 warm-cache 合成场景。
 Parquet 与 Sniffer 的 checksum、压缩和真实
 物理 I/O 口径不同，不应将这里的扫描时间外推为生产格式优劣。
+
+## 2026-09-28：SortKey 整组命中证明与单请求分片可行性
+
+在上述 Reader-only 基准上补充 `ScanMetrics` 分阶段指标。Apple M4 / Release /
+Arrow 23.0.1 / warm-cache，10,000,000 行、Row Group 8,192、谓词
+`key >= rows/2`、仅投影 `value`，7 次 P50 扫描约 9.41 ms；其中
+`decode_ns` 约 6.62 ms（约 70%），checksum 0.75 ms、chunk I/O
+0.60 ms、batch materialization 0.66 ms。阶段计时是嵌套/独立
+累计指标，不能简单相加推导总时间；它表明此大请求值得评估解码并行。
+
+为检验上界，新增实验性的 `ShardedSortRangeScan/{1,2,4,8}`：一个逻辑
+`[rows/2, rows)` 查询按排序键分为不重叠范围，每个 worker 通过同一
+Reader 创建独立 Scan，线程数固定上限 8。每个分片在计时前逐值校验
+行序与结果；线程创建、`Scan`、读取及合并行数均在计时区间内。各 case
+在独立进程运行 7 次，每次至少 0.05 秒，取 real-time P50。它只是一种
+公开 API 组合的可行性实验，不是 Reader 内部并行；不支持通用非排序
+谓词、`limit` 的跨分片早停，也没有生产级在途 Row Group/内存预算或取消。
+
+初版范围路径即使索引证明整个 Row Group 命中，仍读取并解码排序键列。
+Reader 现增加“首尾排序键均在范围内”的整组证明：这种组不读取未投影
+的排序键 ColumnChunk，边界组仍逐行过滤。测试覆盖半开/开区间、limit、
+复合排序键、损坏但未读取的 key 块，结果与原执行一致。以下 before/after
+只改变这个生产扫描热点；Segment 文件、查询、分片基准和计时参数不变。
+
+| 10M 行分片 worker | 修改前 P50 ms | 修改后 P50 ms | 修改前/后读取 MB（约） | 修改后进程 RSS 峰值 MB（约） |
+| ---: | ---: | ---: | ---: | ---: |
+| 1 | 44.196 | 9.518 | 16.308 / 8.167 | 6.83 |
+| 2 | 23.213 | 5.339 | 16.335 / 8.208 | 7.98 |
+| 4 | 12.893 | 3.310 | 16.388 / 8.288 | 12.75 |
+| 8 | 11.210 | 2.998 | 16.495 / 8.448 | 20.89 |
+
+修改后 1/2/4/8 worker 的 real-time CV 分别约 0.63%/0.79%/0.94%/1.71%。
+RSS 为进程生命周期高水位，含计时前逐值校验和线程栈，不等同于单次扫描
+的净峰值。相对修改后同机的普通单线程谓词扫描（约 9.4–9.5 ms、
+8,167,472 B），8 worker 分片约 3.0 ms，但增加了边界读取及内存成本。
+100,000 行时，普通单线程谓词扫描约 0.140 ms，修改后的 1/2/4/8
+worker 分片 P50 为 0.182/0.208/0.206/0.323 ms；短查询不应自动开线程。
+
+复现时需为每个 worker 数单独启动 benchmark 进程；`--generate`
+生成相同两列递增数据，见上一节。示例：
+
+```sh
+for sniffer_workers in 1 2 4 8; do
+  ./build-release/sniffer_core_reader_memory_benchmark \
+    "--segment=$sniffer_mem_dir/10m.seg" --rows=10000000 \
+    "--benchmark_filter=^ShardedSortRangeScan/${sniffer_workers}/real_time$" \
+    --benchmark_repetitions=7 --benchmark_min_time=0.05s \
+    --benchmark_report_aggregates_only=true --benchmark_format=csv
+done
+```
+
+该实验不能替代真正的有界 Row Group 调度 A/B；单线程默认路径、非排序
+谓词、Parquet 同条件单请求对照、cold-cache 与资源预算仍是 v0.2 待办。

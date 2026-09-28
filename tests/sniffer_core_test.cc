@@ -3162,6 +3162,105 @@ TEST(SnifferCoreTest, SortKeyRangeAndEmptyProjection) {
       << "empty projection retains filtered row counts and batching";
 }
 
+TEST(SnifferCoreTest, WholeSortKeyRangeSkipsUnprojectedKeyChunk) {
+  const auto data = MakeScanBatch();
+  TempFile file("scan_whole_sort_range.seg");
+  WriteSegmentWithPolicy(file.path(), data.table_schema, {data.batch}, ScanLayout());
+  auto reader = ValueOrThrow(sniffer::SegmentReader::Open(file.path().string()),
+                             "open whole sort-range segment");
+
+  sniffer::IOPlan plan;
+  plan.projection_field_ids = {4};
+  sniffer::SortKeyRange range;
+  range.lower =
+      std::vector<std::shared_ptr<arrow::Scalar>>{std::make_shared<arrow::Int64Scalar>(10)};
+  range.upper =
+      std::vector<std::shared_ptr<arrow::Scalar>>{std::make_shared<arrow::Int64Scalar>(20)};
+  plan.sort_key_range = range;
+  plan.output_batch_rows = 3;
+  auto metrics = std::make_shared<sniffer::ScanMetrics>();
+  const auto batches =
+      CollectScan(ValueOrThrow(reader->Scan(plan, metrics), "scan whole sort-key range"));
+  std::vector<std::string> actual;
+  for (const auto& batch : batches) {
+    const auto& payload = static_cast<const arrow::BinaryArray&>(*batch->column(0));
+    for (int64_t row = 0; row < batch->num_rows(); ++row) {
+      actual.emplace_back(payload.GetView(row));
+    }
+  }
+  std::vector<std::string> expected;
+  for (int64_t row = 10; row < 20; ++row) {
+    expected.push_back("p" + std::to_string(row));
+  }
+  EXPECT_EQ(actual, expected);
+  EXPECT_EQ(metrics->row_groups_pruned, 4U);
+  EXPECT_EQ(metrics->predicate_chunks_decoded, 0U);
+  EXPECT_EQ(metrics->projection_chunks_decoded, 2U);
+  EXPECT_EQ(metrics->column_chunks_read, 2U);
+
+  plan.limit = 3;
+  metrics = std::make_shared<sniffer::ScanMetrics>();
+  const auto limited =
+      CollectScan(ValueOrThrow(reader->Scan(plan, metrics), "scan limited whole sort-key range"));
+  ASSERT_EQ(limited.size(), 1U);
+  const auto& limited_payload = static_cast<const arrow::BinaryArray&>(*limited[0]->column(0));
+  EXPECT_EQ(limited[0]->num_rows(), 3);
+  EXPECT_EQ(limited_payload.GetView(0), "p10");
+  EXPECT_EQ(limited_payload.GetView(2), "p12");
+  EXPECT_EQ(metrics->predicate_chunks_decoded, 0U);
+  EXPECT_EQ(metrics->projection_chunks_decoded, 1U);
+
+  plan.limit.reset();
+  plan.sort_key_range->lower_inclusive = false;
+  metrics = std::make_shared<sniffer::ScanMetrics>();
+  const auto exclusive =
+      CollectScan(ValueOrThrow(reader->Scan(plan, metrics), "scan exclusive whole sort-key range"));
+  actual.clear();
+  for (const auto& batch : exclusive) {
+    const auto& payload = static_cast<const arrow::BinaryArray&>(*batch->column(0));
+    for (int64_t row = 0; row < batch->num_rows(); ++row) {
+      actual.emplace_back(payload.GetView(row));
+    }
+  }
+  expected.erase(expected.begin());
+  EXPECT_EQ(actual, expected);
+  EXPECT_EQ(metrics->predicate_chunks_decoded, 1U)
+      << "only the boundary Row Group needs its sort-key column";
+  EXPECT_EQ(metrics->projection_chunks_decoded, 2U);
+  EXPECT_EQ(metrics->column_chunks_read, 3U);
+
+  auto bytes = ReadFile(file.path());
+  const size_t trailer_offset = bytes.size() - 40;
+  const size_t footer_offset = static_cast<size_t>(ReadU64(bytes, trailer_offset + 8));
+  const size_t footer_length = static_cast<size_t>(ReadU64(bytes, trailer_offset + 16));
+  const auto footer = ValueOrThrow(sniffer::internal::ParseFooter(std::span<const uint8_t>(
+                                       bytes.data() + footer_offset, footer_length)),
+                                   "parse whole sort-range footer");
+  const auto& damaged = footer.row_groups[3].chunks[0];
+  ASSERT_LT(damaged.offset + 24U, bytes.size());
+  bytes[static_cast<size_t>(damaged.offset + 24U)] ^= 1U;
+  RefreshFooterChecksums(&bytes);
+  WriteFile(file.path(), bytes);
+  auto damaged_reader = ValueOrThrow(sniffer::SegmentReader::Open(file.path().string()),
+                                     "open damaged whole sort-range segment");
+  plan.sort_key_range->lower_inclusive = true;
+  metrics = std::make_shared<sniffer::ScanMetrics>();
+  const auto skipped = CollectScan(
+      ValueOrThrow(damaged_reader->Scan(plan, metrics), "scan without damaged sort-key chunk"));
+  actual.clear();
+  for (const auto& batch : skipped) {
+    const auto& payload = static_cast<const arrow::BinaryArray&>(*batch->column(0));
+    for (int64_t row = 0; row < batch->num_rows(); ++row) {
+      actual.emplace_back(payload.GetView(row));
+    }
+  }
+  expected.insert(expected.begin(), "p10");
+  EXPECT_EQ(actual, expected);
+  EXPECT_EQ(metrics->predicate_chunks_decoded, 0U);
+  EXPECT_EQ(metrics->column_chunks_read, 2U);
+  EXPECT_FALSE(damaged_reader->ReadAll().ok());
+}
+
 TEST(SnifferCoreTest, AllPredicateOperationsAndNulls) {
   const auto data = MakeScanBatch();
   TempFile file("scan_operators.seg");
@@ -3585,6 +3684,19 @@ TEST(SnifferCoreTest, CompositeSortKeyRange) {
   auto batches = CollectScan(ValueOrThrow(reader->Scan(plan), "scan composite range"));
   EXPECT_TRUE(CollectInt64Column(batches, 0) == std::vector<int64_t>({11, 12}))
       << "composite sort-key range uses lexicographic half-open semantics";
+
+  sniffer::SortKeyRange whole_range;
+  whole_range.lower = std::vector<std::shared_ptr<arrow::Scalar>>{
+      std::make_shared<arrow::Int32Scalar>(2), std::make_shared<arrow::StringScalar>("a")};
+  whole_range.upper = std::vector<std::shared_ptr<arrow::Scalar>>{
+      std::make_shared<arrow::Int32Scalar>(3), std::make_shared<arrow::StringScalar>("a")};
+  plan.sort_key_range = std::move(whole_range);
+  auto metrics = std::make_shared<sniffer::ScanMetrics>();
+  batches = CollectScan(ValueOrThrow(reader->Scan(plan, metrics), "scan composite whole range"));
+  EXPECT_EQ(CollectInt64Column(batches, 0), (std::vector<int64_t>{12, 13}));
+  EXPECT_EQ(metrics->predicate_chunks_decoded, 0U);
+  EXPECT_EQ(metrics->projection_chunks_decoded, 1U);
+  EXPECT_EQ(metrics->column_chunks_read, 1U);
 }
 
 TEST(SnifferCoreTest, TypedSortKeyRangesMatchScalarReference) {

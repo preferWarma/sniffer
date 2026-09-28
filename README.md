@@ -229,6 +229,7 @@ sniffer_mem_dir=$(mktemp -d)
   "--generate=$sniffer_mem_dir/100k.seg" --rows=100000
 ./build/sniffer_core_reader_memory_benchmark \
   "--segment=$sniffer_mem_dir/100k.seg" --rows=100000 \
+  '--benchmark_filter=^ReaderOnlyScan/real_time$' \
   --benchmark_repetitions=7 --benchmark_min_time=0.05s \
   --benchmark_report_aggregates_only=true --benchmark_format=json
 ```
@@ -236,6 +237,8 @@ sniffer_mem_dir=$(mktemp -d)
 更大文件应另起生成进程，再以新的扫描进程复测；进程 RSS 包含 Reader
 及库初始化，Arrow pool 峰值不包含非 Arrow 分配。方法与结果见
 [`bench/BENCHMARK_V2.md`](bench/BENCHMARK_V2.md)。
+同一可执行文件还提供实验性的 `ShardedSortRangeScan/{1,2,4,8}`：以多个独立
+Scan 分片一个逻辑范围查询，只用于估算并行潜力，不代表 Reader 已实现内部并行。
 
 性能 benchmark 的 Sniffer 结果还包含 phase counters：writer 的索引、编码选择、编码、checksum
 与文件写入，以及 reader 的元数据、chunk I/O/checksum、解码、谓词、投影和 batch materialization。

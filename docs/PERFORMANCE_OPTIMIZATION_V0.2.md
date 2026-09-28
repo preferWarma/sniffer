@@ -228,6 +228,9 @@ SIMD、多级编码链和新压缩算法只有在标量路径完成剖析和优�
       Row Group 顺序写入；同一输入及配置的 Segment 字节、checksum 和索引必须与单线程一致。
 - [ ] 评估候选 Row Group 的可选并行读取、解码与过滤；输出行序、`limit` 早停、谓词列/投影列
       分离解码和剪枝结果必须与单线程一致，不得为未命中列块发起额外读取。
+  - [x] 先以同一 Reader 的独立排序范围 Scan 做 1/2/4/8 worker 可行性 A/B：10M 行
+        在整组 SortKey 证明优化后，单 worker 9.518 ms、8 worker 2.998 ms；100K 行则
+        多 worker 均慢于普通单线程。此实验不是正式内部并行，不能勾选父项。
 - [ ] 线程数、任务粒度、在途 Row Group 数和内存预算由显式配置限制；提供单线程 fallback、
       错误/取消传播，不创建无上限异步任务。若需要新公共配置，先确定向后兼容的 API 语义。
 - [ ] 增加 1/2/4/8 线程吞吐、单请求延迟、峰值 RSS 和分配量 benchmark；并发多查询与单查询
@@ -279,7 +282,7 @@ SIMD、多级编码链和新压缩算法只有在标量路径完成剖析和优�
 
 | 验收项 | 当前证据 | 状态 |
 | --- | --- | --- |
-| 正确性与竞态 | 当前工作树 Release 89/89、TSan 71/71；ASan/UBSan 87/87 全量在提交 `57354a4` 上通过，新增旧版样本用例另在 ASan/UBSan 下通过；含 fuzz/benchmark smoke | 本轮通过 |
+| 正确性与竞态 | 当前工作树 Release 90/90、ASan/UBSan 90/90、TSan 72/72；含 fuzz/benchmark smoke，新 SortKey 整组证明覆盖损坏块跳过与复合键边界 | 本轮通过 |
 | 固定性能场景 | Apple M4、Arrow 23.0.1、Release、100,000 行、RG 4,096、50% 选择率、投影 2 列、warm-cache；7 次 P50：写入 4.215 ms、scan 0.450 ms、端到端 4.668 ms；12/25 组剪枝、26 块/172,228 字节读取 | 仅此场景达第 2 节对应吞吐门槛 |
 | 高基数字符串空间 | 100,000 行、24 字节高基数字符串，同环境 7 次复测：2,803,815 文件字节，0.999x 压缩比 | 达 0.98x 门槛 |
 | 缓存/规模 | 三格式各 48 case 的完整 RG × 选择率 × 投影 warm-cache 矩阵已跑 7 次并保留逐 case P50/CV；尚无超页缓存数据和可信 cold-cache 结果 | warm-cache 完成；cold-cache 未完成 |
@@ -303,8 +306,11 @@ SIMD、多级编码链和新压缩算法只有在标量路径完成剖析和优�
 旧版与当前同机回归、完整 warm-cache 矩阵、逐进程内存定义和逐 case 汇总指标见
 [`bench/BENCHMARK_V2.md`](../bench/BENCHMARK_V2.md) 及
 [`bench/V0.2_MATRIX_2026-09-28.tsv`](../bench/V0.2_MATRIX_2026-09-28.tsv)。
-下一步优先补超页缓存/cold-cache 实验，并评估索引/目录的元数据预算；
-单请求内部并行仍需有界任务预算及 A/B，不能靠勾选 TODO 代替实测。
+SortKey 范围整组证明与 1/2/4/8 worker 分片可行性实验见
+[`bench/BENCHMARK_V2.md`](../bench/BENCHMARK_V2.md)；默认单线程、文件格式和
+公共 API 保持不变。下一步优先补超页缓存/cold-cache 实验，并评估索引/目录
+的元数据预算；正式单请求内部并行仍需有界任务预算、`limit`/取消语义、
+非排序谓词及 Parquet 同条件 A/B，不能靠勾选 TODO 代替实测。
 Reader-only 基准只增加 benchmark 可执行文件，不改变 Segment 格式、
 生产 Reader 或公共 API；与 `DESIGN.md` 无偏离。
 

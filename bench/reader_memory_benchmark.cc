@@ -10,6 +10,7 @@
 #include <memory>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -103,7 +104,7 @@ void ReaderOnlyScan(benchmark::State& state) {
       {1, sniffer::Predicate::Op::kGe, std::make_shared<arrow::Int64Scalar>(options.rows / 2)}};
   plan.output_batch_rows = kOutputBatchRows;
   const uint64_t expected_rows = static_cast<uint64_t>(options.rows - options.rows / 2);
-  uint64_t chunk_bytes_read = 0;
+  sniffer::ScanMetrics totals;
   for (auto _ : state) {
     auto metrics = std::make_shared<sniffer::ScanMetrics>();
     auto maybe_iterator = reader->Scan(plan, metrics);
@@ -129,7 +130,16 @@ void ReaderOnlyScan(benchmark::State& state) {
       state.SkipWithError("reader-only scan row count mismatch");
       return;
     }
-    chunk_bytes_read = metrics->chunk_bytes_read;
+    totals.row_groups_pruned += metrics->row_groups_pruned;
+    totals.column_chunks_read += metrics->column_chunks_read;
+    totals.chunk_bytes_read += metrics->chunk_bytes_read;
+    totals.pruning_nanoseconds += metrics->pruning_nanoseconds;
+    totals.chunk_io_nanoseconds += metrics->chunk_io_nanoseconds;
+    totals.chunk_checksum_nanoseconds += metrics->chunk_checksum_nanoseconds;
+    totals.decode_nanoseconds += metrics->decode_nanoseconds;
+    totals.predicate_nanoseconds += metrics->predicate_nanoseconds;
+    totals.projection_nanoseconds += metrics->projection_nanoseconds;
+    totals.batch_materialization_nanoseconds += metrics->batch_materialization_nanoseconds;
   }
   std::error_code file_error;
   const uint64_t file_bytes = std::filesystem::file_size(options.segment_path, file_error);
@@ -141,7 +151,19 @@ void ReaderOnlyScan(benchmark::State& state) {
   state.counters["output_rows"] = static_cast<double>(expected_rows);
   state.counters["file_bytes"] = static_cast<double>(file_bytes);
   state.counters["row_groups"] = static_cast<double>(reader->num_row_groups());
-  state.counters["chunk_bytes_read"] = static_cast<double>(chunk_bytes_read);
+  const auto per_scan = [&state](const char* name, uint64_t count) {
+    state.counters[name] = static_cast<double>(count) / static_cast<double>(state.iterations());
+  };
+  per_scan("row_groups_pruned", totals.row_groups_pruned);
+  per_scan("column_chunks_read", totals.column_chunks_read);
+  per_scan("chunk_bytes_read", totals.chunk_bytes_read);
+  per_scan("pruning_ns", totals.pruning_nanoseconds);
+  per_scan("chunk_io_ns", totals.chunk_io_nanoseconds);
+  per_scan("chunk_checksum_ns", totals.chunk_checksum_nanoseconds);
+  per_scan("decode_ns", totals.decode_nanoseconds);
+  per_scan("predicate_ns", totals.predicate_nanoseconds);
+  per_scan("projection_ns", totals.projection_nanoseconds);
+  per_scan("batch_materialization_ns", totals.batch_materialization_nanoseconds);
   state.counters["process_peak_rss_bytes"] = static_cast<double>(ProcessPeakRssBytes());
   state.counters["arrow_pool_peak_bytes"] =
       static_cast<double>(arrow::default_memory_pool()->max_memory());
@@ -149,6 +171,128 @@ void ReaderOnlyScan(benchmark::State& state) {
 }
 
 BENCHMARK(ReaderOnlyScan)->UseRealTime()->Unit(benchmark::kMillisecond);
+
+sniffer::IOPlan ShardPlan(int64_t lower, int64_t upper) {
+  sniffer::IOPlan plan;
+  plan.projection_field_ids = {2};
+  sniffer::SortKeyRange range;
+  range.lower =
+      std::vector<std::shared_ptr<arrow::Scalar>>{std::make_shared<arrow::Int64Scalar>(lower)};
+  range.upper =
+      std::vector<std::shared_ptr<arrow::Scalar>>{std::make_shared<arrow::Int64Scalar>(upper)};
+  plan.sort_key_range = std::move(range);
+  plan.output_batch_rows = kOutputBatchRows;
+  return plan;
+}
+
+arrow::Result<uint64_t> ScanShard(sniffer::SegmentReader& reader, const sniffer::IOPlan& plan,
+                                  int64_t lower, int64_t upper, bool validate_values,
+                                  std::shared_ptr<sniffer::ScanMetrics> metrics) {
+  ARROW_ASSIGN_OR_RAISE(auto iterator, reader.Scan(plan, std::move(metrics)));
+  uint64_t output_rows = 0;
+  while (true) {
+    ARROW_ASSIGN_OR_RAISE(auto batch, iterator.Next());
+    if (!batch) {
+      break;
+    }
+    if (validate_values) {
+      if (batch->num_columns() != 1 || batch->column(0)->type_id() != arrow::Type::INT64) {
+        return arrow::Status::TypeError("sharded scan expects one int64 projection column");
+      }
+      const auto& values = static_cast<const arrow::Int64Array&>(*batch->column(0));
+      for (int64_t row = 0; row < batch->num_rows(); ++row) {
+        if (values.IsNull(row) ||
+            values.Value(row) != lower + static_cast<int64_t>(output_rows) + row) {
+          return arrow::Status::Invalid("sharded scan value or row-order mismatch");
+        }
+      }
+    }
+    output_rows += static_cast<uint64_t>(batch->num_rows());
+    benchmark::DoNotOptimize(batch->column(0)->data().get());
+  }
+  if (output_rows != static_cast<uint64_t>(upper - lower)) {
+    return arrow::Status::Invalid("sharded scan row count mismatch");
+  }
+  return output_rows;
+}
+
+void ShardedSortRangeScan(benchmark::State& state) {
+  auto maybe_reader = sniffer::SegmentReader::Open(options.segment_path);
+  if (!maybe_reader.ok()) {
+    state.SkipWithError(maybe_reader.status().ToString());
+    return;
+  }
+  auto reader = std::move(*maybe_reader);
+  const int64_t workers = state.range(0);
+  const int64_t first = options.rows / 2;
+  const int64_t matching_rows = options.rows - first;
+  if (workers > matching_rows) {
+    state.SkipWithError("worker count exceeds matching row count");
+    return;
+  }
+  std::vector<sniffer::IOPlan> plans;
+  std::vector<std::pair<int64_t, int64_t>> bounds;
+  plans.reserve(static_cast<size_t>(workers));
+  bounds.reserve(static_cast<size_t>(workers));
+  for (int64_t worker = 0; worker < workers; ++worker) {
+    const int64_t lower = first + matching_rows * worker / workers;
+    const int64_t upper = first + matching_rows * (worker + 1) / workers;
+    bounds.emplace_back(lower, upper);
+    plans.push_back(ShardPlan(lower, upper));
+    const auto check = ScanShard(*reader, plans.back(), lower, upper, true, nullptr);
+    if (!check.ok()) {
+      state.SkipWithError(check.status().ToString());
+      return;
+    }
+  }
+  uint64_t chunk_bytes_read = 0;
+  for (auto _ : state) {
+    std::vector<std::jthread> threads;
+    std::vector<arrow::Status> statuses(static_cast<size_t>(workers), arrow::Status::OK());
+    std::vector<std::shared_ptr<sniffer::ScanMetrics>> metrics(static_cast<size_t>(workers));
+    threads.reserve(static_cast<size_t>(workers));
+    for (int64_t worker = 0; worker < workers; ++worker) {
+      const size_t slot = static_cast<size_t>(worker);
+      metrics[slot] = std::make_shared<sniffer::ScanMetrics>();
+      threads.emplace_back([&, slot] {
+        const auto [lower, upper] = bounds[slot];
+        const auto result = ScanShard(*reader, plans[slot], lower, upper, false, metrics[slot]);
+        if (!result.ok()) {
+          statuses[slot] = result.status();
+        }
+      });
+    }
+    for (auto& thread : threads) {
+      thread.join();
+    }
+    chunk_bytes_read = 0;
+    for (size_t slot = 0; slot < static_cast<size_t>(workers); ++slot) {
+      if (!statuses[slot].ok()) {
+        state.SkipWithError(statuses[slot].ToString());
+        return;
+      }
+      chunk_bytes_read += metrics[slot]->chunk_bytes_read;
+    }
+  }
+  state.counters["workers"] = static_cast<double>(workers);
+  state.counters["input_rows"] = static_cast<double>(options.rows);
+  state.counters["output_rows"] = static_cast<double>(matching_rows);
+  state.counters["chunk_bytes_read"] = static_cast<double>(chunk_bytes_read);
+  state.counters["process_peak_rss_bytes"] = static_cast<double>(ProcessPeakRssBytes());
+  state.counters["arrow_pool_peak_bytes"] =
+      static_cast<double>(arrow::default_memory_pool()->max_memory());
+  state.SetItemsProcessed(state.iterations() * matching_rows);
+}
+
+// This shards one logical range query through independent public Scan iterators.
+// It is an experimental scheduling bound, not production in-Reader parallelism.
+BENCHMARK(ShardedSortRangeScan)
+    ->Arg(1)
+    ->Arg(2)
+    ->Arg(4)
+    ->Arg(8)
+    ->UseRealTime()
+    ->Unit(benchmark::kMillisecond);
 
 }  // namespace
 
@@ -192,7 +336,10 @@ int main(int argc, char** argv) {
   benchmark::AddCustomContext("scope", "fresh_process_reader_only_no_writer_or_input_batch");
   benchmark::AddCustomContext("row_group_rows", std::to_string(kRowGroupRows));
   benchmark::AddCustomContext("output_batch_rows", std::to_string(kOutputBatchRows));
-  benchmark::AddCustomContext("query", "key >= rows/2; project value");
+  benchmark::AddCustomContext(
+      "query",
+      "ReaderOnlyScan: key >= rows/2; ShardedSortRangeScan: partition sort-key range "
+      "[rows/2,rows); project value");
   int benchmark_argc = static_cast<int>(benchmark_args.size());
   benchmark::Initialize(&benchmark_argc, benchmark_args.data());
   if (benchmark::ReportUnrecognizedArguments(benchmark_argc, benchmark_args.data())) {

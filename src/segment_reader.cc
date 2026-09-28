@@ -1378,6 +1378,40 @@ arrow::Result<bool> SortRangePrunes(const internal::FooterData& footer,
   return false;
 }
 
+// The validated sort index stores the lexicographic first and last keys of a
+// sorted Row Group. If both endpoints satisfy the range, every key does.
+arrow::Result<bool> SortRangeMatchesEntireRowGroup(const internal::FooterData& footer,
+                                                   const internal::RowGroupIndex& index,
+                                                   const SortKeyRange& range) {
+  if (index.sort_keys.size() != footer.layout_policy.sort_key_field_ids.size()) {
+    return false;
+  }
+  std::vector<std::shared_ptr<arrow::Scalar>> first;
+  std::vector<std::shared_ptr<arrow::Scalar>> last;
+  first.reserve(index.sort_keys.size());
+  last.reserve(index.sort_keys.size());
+  for (size_t position = 0; position < index.sort_keys.size(); ++position) {
+    if (index.sort_keys[position].field_id != footer.layout_policy.sort_key_field_ids[position]) {
+      return false;
+    }
+    first.push_back(index.sort_keys[position].first);
+    last.push_back(index.sort_keys[position].last);
+  }
+  if (range.lower) {
+    ARROW_ASSIGN_OR_RAISE(const int order, CompareKeyVectors(first, *range.lower));
+    if (order < 0 || (order == 0 && !range.lower_inclusive)) {
+      return false;
+    }
+  }
+  if (range.upper) {
+    ARROW_ASSIGN_OR_RAISE(const int order, CompareKeyVectors(last, *range.upper));
+    if (order > 0 || (order == 0 && !range.upper_inclusive)) {
+      return false;
+    }
+  }
+  return true;
+}
+
 }  // namespace
 
 namespace internal {
@@ -1502,14 +1536,19 @@ class ScanState {
         continue;
       }
 
-      bool predicates_guaranteed_true = !plan_.sort_key_range;
-      if (predicates_guaranteed_true) {
+      bool all_rows_match = true;
+      if (plan_.sort_key_range) {
+        internal::NanosecondTimer timer(&metrics_->pruning_nanoseconds);
+        ARROW_ASSIGN_OR_RAISE(
+            all_rows_match, SortRangeMatchesEntireRowGroup(footer_, index, *plan_.sort_key_range));
+      }
+      if (all_rows_match) {
         internal::NanosecondTimer timer(&metrics_->pruning_nanoseconds);
         for (const auto& predicate : plan_.conjunctive_predicates) {
           ARROW_ASSIGN_OR_RAISE(const bool matches,
                                 PredicateMatchesEntireRowGroup(row_group, index, predicate));
           if (!matches) {
-            predicates_guaranteed_true = false;
+            all_rows_match = false;
             break;
           }
         }
@@ -1518,7 +1557,7 @@ class ScanState {
       std::vector<std::shared_ptr<arrow::Array>> filter_columns(resolved_plan_.filter_column_count);
       // A whole-group proof needs no predicate payload. Projected predicate
       // fields are decoded below; unprojected ones remain unread.
-      if (!predicates_guaranteed_true) {
+      if (!all_rows_match) {
         for (const size_t field_index : resolved_plan_.predicate_field_indices) {
           auto& column = filter_columns[resolved_plan_.filter_slots_by_field_index[field_index]];
           if (!column) {
@@ -1526,7 +1565,7 @@ class ScanState {
           }
         }
       }
-      if (plan_.sort_key_range) {
+      if (plan_.sort_key_range && !all_rows_match) {
         for (const size_t field_index : resolved_plan_.sort_key_field_indices) {
           auto& column = filter_columns[resolved_plan_.filter_slots_by_field_index[field_index]];
           if (!column) {
@@ -1547,15 +1586,14 @@ class ScanState {
             filter_columns[resolved_plan_.filter_slots_by_field_index[field_index]].get());
       }
 
-      const bool full_row_group =
-          predicates_guaranteed_true && remaining_limit >= row_group.row_count;
+      const bool full_row_group = all_rows_match && remaining_limit >= row_group.row_count;
       bool all_rows_selected = full_row_group;
       std::vector<uint64_t> selection;
       if (!full_row_group) {
         internal::NanosecondTimer timer(&metrics_->predicate_nanoseconds);
         const size_t capacity =
             static_cast<size_t>(std::min<uint64_t>(row_group.row_count, remaining_limit));
-        if (predicates_guaranteed_true) {
+        if (all_rows_match) {
           selection.resize(capacity);
           std::iota(selection.begin(), selection.end(), uint64_t{0});
         } else {
