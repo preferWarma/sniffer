@@ -41,6 +41,7 @@ struct Options {
   int64_t rows = 0;
   uint32_t unprojected_binary_bytes = 0;
   uint32_t projected_binary_bytes = 0;
+  uint32_t projected_columns = 1;
   uint64_t buffered_budget_bytes = 64U * 1024U * 1024U;
 };
 
@@ -115,9 +116,37 @@ arrow::Status VerifyGeneratedValues(const arrow::Array& values, int64_t* expecte
   return arrow::Status::OK();
 }
 
+int64_t ExtraValue(int64_t row, uint32_t projection_index) {
+  return row * static_cast<int64_t>(projection_index + 1U) + projection_index;
+}
+
+arrow::Status VerifyGeneratedProjection(const arrow::RecordBatch& batch, int64_t skip,
+                                        int first_column, int64_t* expected_row) {
+  if (batch.num_columns() != first_column + static_cast<int>(options.projected_columns)) {
+    return arrow::Status::Invalid("generated benchmark projection column count mismatch");
+  }
+  const int64_t first_row = *expected_row;
+  ARROW_RETURN_NOT_OK(VerifyGeneratedValues(*batch.column(first_column)->Slice(skip), expected_row,
+                                            options.projected_binary_bytes));
+  for (uint32_t projection = 1; projection < options.projected_columns; ++projection) {
+    const auto values = batch.column(first_column + static_cast<int>(projection))->Slice(skip);
+    if (values->type_id() != arrow::Type::INT64) {
+      return arrow::Status::Invalid("generated benchmark expected int64 extra column");
+    }
+    const auto& typed = static_cast<const arrow::Int64Array&>(*values);
+    for (int64_t row = 0; row < typed.length(); ++row) {
+      if (typed.IsNull(row) || typed.Value(row) != ExtraValue(first_row + row, projection)) {
+        return arrow::Status::Invalid("generated benchmark extra column value mismatch");
+      }
+    }
+  }
+  return arrow::Status::OK();
+}
+
 arrow::Result<std::shared_ptr<arrow::RecordBatch>> MakeGeneratedBatch(
     const std::shared_ptr<arrow::Schema>& arrow_schema, int64_t offset, int64_t count,
-    uint32_t unprojected_binary_bytes, uint32_t projected_binary_bytes) {
+    uint32_t unprojected_binary_bytes, uint32_t projected_binary_bytes,
+    uint32_t projected_columns) {
   arrow::Int64Builder key_builder;
   ARROW_RETURN_NOT_OK(key_builder.Reserve(count));
   for (int64_t row = 0; row < count; ++row) {
@@ -146,6 +175,16 @@ arrow::Result<std::shared_ptr<arrow::RecordBatch>> MakeGeneratedBatch(
     ARROW_RETURN_NOT_OK(value_builder.Finish(&value));
   }
   std::vector<std::shared_ptr<arrow::Array>> columns = {std::move(key), std::move(value)};
+  for (uint32_t projection = 1; projection < projected_columns; ++projection) {
+    arrow::Int64Builder extra_builder;
+    ARROW_RETURN_NOT_OK(extra_builder.Reserve(count));
+    for (int64_t row = 0; row < count; ++row) {
+      ARROW_RETURN_NOT_OK(extra_builder.Append(ExtraValue(offset + row, projection)));
+    }
+    std::shared_ptr<arrow::Array> extra;
+    ARROW_RETURN_NOT_OK(extra_builder.Finish(&extra));
+    columns.push_back(std::move(extra));
+  }
   if (unprojected_binary_bytes > 0) {
     arrow::BinaryBuilder unused_builder;
     for (int64_t row = 0; row < count; ++row) {
@@ -179,6 +218,10 @@ arrow::Status GenerateSegment(const Options& config) {
        {2, "value", config.projected_binary_bytes > 0 ? arrow::binary() : arrow::int64(),
         config.projected_binary_bytes > 0, nullptr}},
   };
+  for (uint32_t projection = 1; projection < config.projected_columns; ++projection) {
+    schema.fields.push_back(
+        {projection + 2U, "value_" + std::to_string(projection), arrow::int64(), false, nullptr});
+  }
   if (config.unprojected_binary_bytes > 0) {
     schema.fields.push_back({3, "unused_payload", arrow::binary(), false, nullptr});
   }
@@ -193,7 +236,7 @@ arrow::Status GenerateSegment(const Options& config) {
     const int64_t count = std::min<int64_t>(kRowGroupRows, config.rows - offset);
     ARROW_ASSIGN_OR_RAISE(
         auto batch, MakeGeneratedBatch(arrow_schema, offset, count, config.unprojected_binary_bytes,
-                                       config.projected_binary_bytes));
+                                       config.projected_binary_bytes, config.projected_columns));
     ARROW_RETURN_NOT_OK(writer->Append(std::move(batch)));
   }
   return writer->Finish();
@@ -202,12 +245,16 @@ arrow::Status GenerateSegment(const Options& config) {
 arrow::Status GenerateParquet(const Options& config, const std::string& path,
                               parquet::Compression::type compression) {
   ARROW_RETURN_NOT_OK(CheckNewPath(path));
-  const sniffer::TableSchema schema{
+  sniffer::TableSchema schema{
       1,
       {{1, "key", arrow::int64(), false, nullptr},
        {2, "value", config.projected_binary_bytes > 0 ? arrow::binary() : arrow::int64(),
         config.projected_binary_bytes > 0, nullptr}},
   };
+  for (uint32_t projection = 1; projection < config.projected_columns; ++projection) {
+    schema.fields.push_back(
+        {projection + 2U, "value_" + std::to_string(projection), arrow::int64(), false, nullptr});
+  }
   ARROW_ASSIGN_OR_RAISE(auto arrow_schema, schema.ToArrowSchema());
   ARROW_ASSIGN_OR_RAISE(auto output, arrow::io::FileOutputStream::Open(path));
   parquet::WriterProperties::Builder properties;
@@ -221,8 +268,9 @@ arrow::Status GenerateParquet(const Options& config, const std::string& path,
                                          properties.build(), arrow_properties.build()));
   for (int64_t offset = 0; offset < config.rows; offset += kRowGroupRows) {
     const int64_t count = std::min<int64_t>(kRowGroupRows, config.rows - offset);
-    ARROW_ASSIGN_OR_RAISE(auto batch, MakeGeneratedBatch(arrow_schema, offset, count, 0,
-                                                         config.projected_binary_bytes));
+    ARROW_ASSIGN_OR_RAISE(
+        auto batch, MakeGeneratedBatch(arrow_schema, offset, count, 0,
+                                       config.projected_binary_bytes, config.projected_columns));
     ARROW_RETURN_NOT_OK(writer->NewBufferedRowGroup());
     ARROW_RETURN_NOT_OK(writer->WriteRecordBatch(*batch));
   }
@@ -238,7 +286,9 @@ void ReaderOnlyScanImpl(benchmark::State& state, uint32_t workers) {
   }
   auto reader = std::move(*maybe_reader);
   sniffer::IOPlan plan;
-  plan.projection_field_ids = {2};
+  for (uint32_t projection = 0; projection < options.projected_columns; ++projection) {
+    plan.projection_field_ids.push_back(projection + 2U);
+  }
   plan.conjunctive_predicates = {
       {1, sniffer::Predicate::Op::kGe, std::make_shared<arrow::Int64Scalar>(options.rows / 2)}};
   plan.output_batch_rows = kOutputBatchRows;
@@ -265,8 +315,7 @@ void ReaderOnlyScanImpl(benchmark::State& state, uint32_t workers) {
       if (!batch) {
         break;
       }
-      const auto status =
-          VerifyGeneratedValues(*batch->column(0), &expected_value, options.projected_binary_bytes);
+      const auto status = VerifyGeneratedProjection(*batch, 0, 0, &expected_value);
       if (!status.ok()) {
         state.SkipWithError(status.ToString());
         return;
@@ -304,7 +353,9 @@ void ReaderOnlyScanImpl(benchmark::State& state, uint32_t workers) {
         break;
       }
       output_rows += static_cast<uint64_t>((*maybe_batch)->num_rows());
-      benchmark::DoNotOptimize((*maybe_batch)->column(0)->data().get());
+      for (const auto& column : (*maybe_batch)->columns()) {
+        benchmark::DoNotOptimize(column->data().get());
+      }
     }
     if (output_rows != expected_rows) {
       state.SkipWithError("reader-only scan row count mismatch");
@@ -398,12 +449,15 @@ arrow::Result<ParquetMeasurement> ScanParquetOnce(parquet::arrow::FileReader* re
       ++measured.row_groups_pruned;
       continue;
     }
-    const int64_t value_bytes = row_group->ColumnChunk(1)->total_compressed_size();
-    if (value_bytes < 0) {
-      return arrow::Status::Invalid("Parquet benchmark has invalid column byte length");
+    for (uint32_t projection = 0; projection < options.projected_columns; ++projection) {
+      const int64_t value_bytes =
+          row_group->ColumnChunk(static_cast<int>(projection + 1U))->total_compressed_size();
+      if (value_bytes < 0) {
+        return arrow::Status::Invalid("Parquet benchmark has invalid column byte length");
+      }
+      measured.candidate_column_bytes += static_cast<uint64_t>(value_bytes);
+      ++measured.candidate_column_chunks;
     }
-    measured.candidate_column_bytes += static_cast<uint64_t>(value_bytes);
-    ++measured.candidate_column_chunks;
     if (key_stats.min() >= lower) {
       full_groups.push_back(group);
     } else {
@@ -420,6 +474,12 @@ arrow::Result<ParquetMeasurement> ScanParquetOnce(parquet::arrow::FileReader* re
     }
   }
 
+  std::vector<int> full_columns;
+  std::vector<int> boundary_columns = {0};
+  for (uint32_t projection = 0; projection < options.projected_columns; ++projection) {
+    full_columns.push_back(static_cast<int>(projection + 1U));
+    boundary_columns.push_back(static_cast<int>(projection + 1U));
+  }
   int64_t expected_value = lower;
   const auto consume = [&](const std::vector<int>& groups, const std::vector<int>& columns,
                            bool filter_boundary) -> arrow::Status {
@@ -438,20 +498,21 @@ arrow::Result<ParquetMeasurement> ScanParquetOnce(parquet::arrow::FileReader* re
         skip = std::lower_bound(keys.raw_values(), keys.raw_values() + keys.length(), lower) -
                keys.raw_values();
       }
-      const auto values = batch->column(filter_boundary ? 1 : 0)->Slice(skip);
       if (verify_values) {
         ARROW_RETURN_NOT_OK(
-            VerifyGeneratedValues(*values, &expected_value, options.projected_binary_bytes));
+            VerifyGeneratedProjection(*batch, skip, filter_boundary ? 1 : 0, &expected_value));
       }
-      measured.output_rows += static_cast<uint64_t>(values->length());
-      benchmark::DoNotOptimize(values->data().get());
+      measured.output_rows += static_cast<uint64_t>(batch->num_rows() - skip);
+      for (int column = filter_boundary ? 1 : 0; column < batch->num_columns(); ++column) {
+        benchmark::DoNotOptimize(batch->column(column)->data().get());
+      }
     }
     return arrow::Status::OK();
   };
   if (boundary_group) {
-    ARROW_RETURN_NOT_OK(consume({*boundary_group}, {0, 1}, true));
+    ARROW_RETURN_NOT_OK(consume({*boundary_group}, boundary_columns, true));
   }
-  ARROW_RETURN_NOT_OK(consume(full_groups, {1}, false));
+  ARROW_RETURN_NOT_OK(consume(full_groups, full_columns, false));
   if (measured.output_rows != static_cast<uint64_t>(rows - lower) ||
       (verify_values && expected_value != rows)) {
     return arrow::Status::Invalid("Parquet benchmark output row count mismatch");
@@ -672,6 +733,14 @@ int main(int argc, char** argv) {
         std::cerr << "invalid --projected-binary-bytes value\n";
         return 1;
       }
+    } else if (argument.starts_with("--projected-columns=")) {
+      const auto digits = argument.substr(std::string_view("--projected-columns=").size());
+      const auto [end, error] =
+          std::from_chars(digits.data(), digits.data() + digits.size(), options.projected_columns);
+      if (error != std::errc{} || end != digits.data() + digits.size()) {
+        std::cerr << "invalid --projected-columns value\n";
+        return 1;
+      }
     } else if (argument.starts_with("--buffer-budget-bytes=")) {
       const auto digits = argument.substr(std::string_view("--buffer-budget-bytes=").size());
       const auto [end, error] = std::from_chars(digits.data(), digits.data() + digits.size(),
@@ -694,13 +763,17 @@ int main(int argc, char** argv) {
       options.projected_binary_bytes > 4096 ||
       (options.projected_binary_bytes > 0 && options.projected_binary_bytes < 20) ||
       (options.unprojected_binary_bytes > 0 && options.projected_binary_bytes > 0) ||
+      options.projected_columns == 0 || options.projected_columns > 15 ||
+      (options.projected_columns > 1 &&
+       (options.projected_binary_bytes > 0 || options.unprojected_binary_bytes > 0)) ||
       options.buffered_budget_bytes == 0 ||
       (options.unprojected_binary_bytes > 0 && options.generate_path.empty())) {
     std::cerr << "use 1 <= --rows=N <= 100000000 with exactly one of "
                  "--generate=PATH, --generate-parquet=PATH, "
                  "--generate-parquet-zstd=PATH or --segment=PATH; optional Segment-only "
                  "--unprojected-binary-bytes=20..4096 (Segment generator only) or "
-                 "--projected-binary-bytes=20..4096; positive --buffer-budget-bytes=N\n";
+                 "--projected-binary-bytes=20..4096; or --projected-columns=1..15; "
+                 "positive --buffer-budget-bytes=N\n";
     return 1;
   }
   if (!options.generate_path.empty()) {
@@ -740,10 +813,11 @@ int main(int argc, char** argv) {
                               std::to_string(options.buffered_budget_bytes));
   benchmark::AddCustomContext("projected_binary_bytes",
                               std::to_string(options.projected_binary_bytes));
+  benchmark::AddCustomContext("projected_columns", std::to_string(options.projected_columns));
   benchmark::AddCustomContext(
       "query",
       "ReaderOnlyScan, BoundedParallelReaderScan and ParquetReaderOnlyScan: "
-      "key >= rows/2, project value; "
+      "key >= rows/2, project value and optional extra columns; "
       "ShardedSortRangeScan: partition sort-key range "
       "[rows/2,rows); project value");
   int benchmark_argc = static_cast<int>(benchmark_args.size());

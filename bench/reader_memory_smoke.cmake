@@ -149,3 +149,45 @@ if(NOT binary_scan_result EQUAL 0 OR
    "${binary_scan_output}${binary_scan_error}" MATCHES "ERROR OCCURRED")
   message(FATAL_ERROR "binary projection scan failed: ${binary_scan_output}${binary_scan_error}")
 endif()
+
+set(projected_segment_path "${READER_MEMORY_TEST_DIR}/reader_memory_${memory_suffix}.projected.seg")
+set(projected_parquet_path "${READER_MEMORY_TEST_DIR}/reader_memory_${memory_suffix}.projected.parquet")
+set(projected_zstd_path "${READER_MEMORY_TEST_DIR}/reader_memory_${memory_suffix}.projected.zstd.parquet")
+foreach(projected_case IN ITEMS segment parquet zstd)
+  if(projected_case STREQUAL "segment")
+    set(projected_generate "--generate=${projected_segment_path}")
+  elseif(projected_case STREQUAL "parquet")
+    set(projected_generate "--generate-parquet=${projected_parquet_path}")
+  else()
+    set(projected_generate "--generate-parquet-zstd=${projected_zstd_path}")
+  endif()
+  execute_process(
+    COMMAND "${READER_MEMORY_EXE}" "${projected_generate}" --rows=16384
+            --projected-columns=15
+    RESULT_VARIABLE projected_generate_result
+    OUTPUT_VARIABLE projected_generate_output
+    ERROR_VARIABLE projected_generate_error
+  )
+  if(NOT projected_generate_result EQUAL 0)
+    file(REMOVE "${projected_segment_path}" "${projected_parquet_path}" "${projected_zstd_path}")
+    message(FATAL_ERROR "wide projection ${projected_case} generation failed: ${projected_generate_output}${projected_generate_error}")
+  endif()
+endforeach()
+
+execute_process(
+  COMMAND "${READER_MEMORY_EXE}" "--segment=${projected_segment_path}"
+          "--parquet=${projected_parquet_path}" "--parquet-zstd=${projected_zstd_path}"
+          --rows=16384 --projected-columns=15
+          "--benchmark_filter=^(ReaderOnlyScan|BoundedParallelReaderScan/4|ParquetReaderOnlyScan/Uncompressed|ParquetReaderOnlyScan/ZSTD)/real_time$"
+          --benchmark_dry_run
+  RESULT_VARIABLE projected_scan_result
+  OUTPUT_VARIABLE projected_scan_output
+  ERROR_VARIABLE projected_scan_error
+)
+file(REMOVE "${projected_segment_path}" "${projected_parquet_path}" "${projected_zstd_path}")
+if(NOT projected_scan_result EQUAL 0 OR
+   NOT "${projected_scan_output}${projected_scan_error}" MATCHES "parallel_workers_started=2" OR
+   NOT "${projected_scan_output}${projected_scan_error}" MATCHES "ParquetReaderOnlyScan/ZSTD" OR
+   "${projected_scan_output}${projected_scan_error}" MATCHES "ERROR OCCURRED")
+  message(FATAL_ERROR "wide projection scan failed: ${projected_scan_output}${projected_scan_error}")
+endif()

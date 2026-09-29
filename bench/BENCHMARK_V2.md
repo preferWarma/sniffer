@@ -1140,3 +1140,59 @@ sniffer_binary_dir=$(mktemp -d)
   '--benchmark_filter=^BoundedParallelReaderScan/4/real_time$' \
   --benchmark_repetitions=20 --benchmark_min_time=0.05s --benchmark_format=csv
 ```
+
+## 2026-09-29：15 列宽投影的同计划 Reader-only 对照
+
+为避免将“文件含宽列但查询不读取”误作宽投影，生成相同的 16 列文件：
+第一列 key 为递增 int64，后 15 列均为非 null int64；value 为行号，
+第 `p` 个额外投影列的值为 `row * (p + 1) + p`。同一查询
+`key >= rows/2` 投影全部 15 个 value 列，输出 batch 上限 4,096。
+这组相关递增整数刻意构成可压缩宽表，不代表随机或变长宽表。
+Sniffer 与 Parquet 未压缩/ZSTD 使用同一生成函数和 8,192 行 Row Group，
+计时前分别逐列逐值验证实际执行路径，含边界组的排序过滤。
+Apple M4（10 逻辑核）、AppleClang 21、Arrow C++ 23.0.1、Release `-O3`、
+系统临时目录、warm-cache。每 case 独立进程，20 次重复、每次至少
+0.05 秒；P95 为排序后第 19 个样本。RSS/Arrow pool 为另外 7 次重复的
+median counter，含 Reader 打开和计时前校验高水位，不是每轮增量。
+
+| 行数 | 执行路径 | 文件 B | P50 / P95 ms | 候选列块 / 字节 | RSS / Arrow pool 峰值 MB |
+| ---: | --- | ---: | ---: | ---: | ---: |
+| 100,000 | Sniffer 串行 | 3,177,944 | 1.543 / 1.579 | 106 / ≈1.536 MB（实际列块读取） | 11.68 / 2.46 |
+| 100,000 | Sniffer 4-worker | 3,177,944 | 0.706 / 0.724 | 106 / ≈1.536 MB（实际列块读取） | 17.50 / 5.57 |
+| 100,000 | Parquet 未压缩 | 15,443,727 | 1.854 / 1.879 | 106 / ≈7.420 MB（元数据候选量） | 16.92 / 7.62 |
+| 100,000 | Parquet ZSTD | 4,261,187 | 7.058 / 7.133 | 106 / ≈2.033 MB（元数据候选量） | 13.78 / 4.15 |
+| 1,000,000 | Sniffer 串行 | 31,828,504 | 14.815 / 15.151 | 931 / ≈15.055 MB（实际列块读取） | 12.57 / 2.46 |
+| 1,000,000 | Sniffer 4-worker | 31,828,504 | 4.689 / 5.041 | 931 / ≈15.055 MB（实际列块读取） | 20.20 / 5.54 |
+| 1,000,000 | Parquet 未压缩 | 154,457,173 | 20.574 / 21.018 | 931 / ≈72.361 MB（元数据候选量） | 106.66 / 72.58 |
+| 1,000,000 | Parquet ZSTD | 42,599,665 | 69.397 / 70.134 | 931 / ≈19.850 MB（元数据候选量） | 32.90 / 21.96 |
+
+100K 剪枝 6/13 组，1M 剪枝 61/123 组。Sniffer 4-worker 的在途峰值
+4 组，估算预留峰值约 8.93 MB（配置预算 64 MiB），其 RSS 高于串行。
+Parquet 候选字节来自列元数据 `total_compressed_size`，**不是物理 I/O**，
+不能与 Sniffer 实际列块读取字节直接比较。Parquet batch reader 与
+Sniffer 流式扫描的分配策略不同，内存差异不能归因于文件格式本身。
+当前相关整数值使 Sniffer 的整数编码非常有效；不可外推到高熵宽列、
+宽变长列或 cold-cache。尤其 Parquet ZSTD 的空间/解码取舍应按实际
+生产数据分布重新测量。
+
+复现 1M 行的生成和一个测量 case，其他 case 仅替换 filter，均新起进程：
+
+```sh
+sniffer_wide_projection_dir=$(mktemp -d)
+./build-release/sniffer_core_reader_memory_benchmark \
+  "--generate=$sniffer_wide_projection_dir/data.seg" --rows=1000000 \
+  --projected-columns=15
+./build-release/sniffer_core_reader_memory_benchmark \
+  "--generate-parquet=$sniffer_wide_projection_dir/data.parquet" --rows=1000000 \
+  --projected-columns=15
+./build-release/sniffer_core_reader_memory_benchmark \
+  "--generate-parquet-zstd=$sniffer_wide_projection_dir/data.zstd.parquet" --rows=1000000 \
+  --projected-columns=15
+./build-release/sniffer_core_reader_memory_benchmark \
+  "--segment=$sniffer_wide_projection_dir/data.seg" \
+  "--parquet=$sniffer_wide_projection_dir/data.parquet" \
+  "--parquet-zstd=$sniffer_wide_projection_dir/data.zstd.parquet" \
+  --rows=1000000 --projected-columns=15 \
+  '--benchmark_filter=^BoundedParallelReaderScan/4/real_time$' \
+  --benchmark_repetitions=20 --benchmark_min_time=0.05s --benchmark_format=csv
+```
