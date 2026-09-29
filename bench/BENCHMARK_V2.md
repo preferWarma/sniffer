@@ -1250,3 +1250,55 @@ sniffer_binary_wide_dir=$(mktemp -d)
   '--benchmark_filter=^BoundedParallelReaderScan/4/real_time$' \
   --benchmark_repetitions=20 --benchmark_min_time=0.05s --benchmark_format=csv
 ```
+
+## 2026-09-29：同文件 1% / 10% / 50% / 100% 选择率
+
+上述 1M 行、4 列 nullable 高熵 binary 文件不变（Sniffer 138,666,963 B，
+Parquet 未压缩 152,410,904 B，Parquet ZSTD 138,299,872 B）。只改变
+`key >= floor(rows * (100 - selectivity_percent) / 100)`；三种格式均用
+同一阈值、相同投影、8,192 行 Row Group 和 4,096 行输出 batch。
+计时前按每条实际路径逐列验证字节、null 和行序。
+Apple M4（10 逻辑核）、AppleClang 21、Arrow C++ 23.0.1、Release `-O3`、
+系统临时目录、warm-cache；每个 case 独立进程，20 次重复、每次至少
+0.05 秒。P95 为排序后第 19 个样本。
+
+| 选择率 | Sniffer 串行 P50/P95 ms | Sniffer 4-worker P50/P95 ms | Parquet 未压缩 P50/P95 ms | Parquet ZSTD P50/P95 ms |
+| ---: | ---: | ---: | ---: | ---: |
+| 1% | 0.879 / 0.890 | 0.871 / 0.882 | 1.166 / 1.216 | 2.496 / 2.555 |
+| 10% | 6.581 / 6.669 | 2.451 / 2.478 | 7.473 / 7.577 | 16.143 / 16.862 |
+| 50% | 32.791 / 33.183 | 9.776 / 9.917 | 34.833 / 35.443 | 76.804 / 78.228 |
+| 100% | 63.800 / 65.340 | 17.755 / 18.960 | 70.619 / 71.416 | 152.574 / 155.561 |
+
+| 选择率 | 剪枝 Row Group | 候选列块 | Sniffer 实际列块读取 MB | Parquet 未压缩候选列 MB | Parquet ZSTD 候选列 MB |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 1% | 120/123 | 13 | ≈2.337 | ≈2.497 | ≈2.302 |
+| 10% | 109/123 | 57 | ≈14.681 | ≈15.349 | ≈14.521 |
+| 50% | 61/123 | 249 | ≈68.545 | ≈71.430 | ≈67.840 |
+| 100% | 0/123 | 492 | ≈136.984 | ≈142.620 | ≈135.514 |
+
+Parquet 候选字节仍是列元数据 `total_compressed_size` 之和，**非物理 I/O**；
+不能直接和 Sniffer 实际列块读取量比较。另以 7 次重复的 median counter
+记录进程 RSS 高水位：1% 时 Sniffer 串行/4-worker 约 10.94/14.02 MB，
+Parquet 未压缩/ZSTD 约 14.91/15.71 MB；100% 时依次约
+8.73/26.17 MB 和 160.50/161.99 MB。这些值包含 Reader 打开和计时前
+校验，Parquet 当前 batch reader 的分配策略也会影响峰值。
+
+1% 只有末尾 3 个候选组，4-worker 与串行 P50 差约 0.008 ms，
+不能据此认为并行值得开启；10% 及以上在这组高熵 binary 数据上收益
+明显，但 RSS 增加。这里不能推导通用的自动开启阈值，默认仍为串行，
+并行需显式 opt-in。这个矩阵仍是 warm-cache、单一 Row Group 大小与
+一种数据分布；cold-cache 等 v0.2 项继续未完成。
+
+复现时复用上一节生成的三个 1M 行文件，对每个选择率与格式 case
+分别启动新进程，例如：
+
+```sh
+./build-release/sniffer_core_reader_memory_benchmark \
+  "--segment=$sniffer_binary_wide_dir/data.seg" \
+  "--parquet=$sniffer_binary_wide_dir/data.parquet" \
+  "--parquet-zstd=$sniffer_binary_wide_dir/data.zstd.parquet" \
+  --rows=1000000 --projected-binary-bytes=32 --projected-columns=4 \
+  --selectivity-percent=1 \
+  '--benchmark_filter=^BoundedParallelReaderScan/4/real_time$' \
+  --benchmark_repetitions=20 --benchmark_min_time=0.05s --benchmark_format=csv
+```

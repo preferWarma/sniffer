@@ -226,6 +226,25 @@ execute_process(
   OUTPUT_VARIABLE binary_wide_scan_output
   ERROR_VARIABLE binary_wide_scan_error
 )
+foreach(selectivity IN ITEMS 1 100)
+  execute_process(
+    COMMAND "${READER_MEMORY_EXE}" "--segment=${binary_wide_segment_path}"
+            "--parquet=${binary_wide_parquet_path}" "--parquet-zstd=${binary_wide_zstd_path}"
+            --rows=16384 --projected-binary-bytes=32 --projected-columns=4
+            "--selectivity-percent=${selectivity}"
+            "--benchmark_filter=^(ReaderOnlyScan|BoundedParallelReaderScan/4|ParquetReaderOnlyScan/Uncompressed|ParquetReaderOnlyScan/ZSTD)/real_time$"
+            --benchmark_dry_run
+    RESULT_VARIABLE selectivity_result
+    OUTPUT_VARIABLE selectivity_output
+    ERROR_VARIABLE selectivity_error
+  )
+  if(NOT selectivity_result EQUAL 0 OR
+     NOT "${selectivity_output}${selectivity_error}" MATCHES "ParquetReaderOnlyScan/ZSTD" OR
+     "${selectivity_output}${selectivity_error}" MATCHES "ERROR OCCURRED")
+    file(REMOVE "${binary_wide_segment_path}" "${binary_wide_parquet_path}" "${binary_wide_zstd_path}")
+    message(FATAL_ERROR "${selectivity}% selectivity scan failed: ${selectivity_output}${selectivity_error}")
+  endif()
+endforeach()
 file(REMOVE "${binary_wide_segment_path}" "${binary_wide_parquet_path}" "${binary_wide_zstd_path}")
 if(NOT binary_wide_scan_result EQUAL 0 OR
    NOT "${binary_wide_scan_output}${binary_wide_scan_error}" MATCHES "parallel_workers_started=2" OR

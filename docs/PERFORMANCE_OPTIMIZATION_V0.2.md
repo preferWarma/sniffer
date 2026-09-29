@@ -252,7 +252,8 @@ SIMD、多级编码链和新压缩算法只有在标量路径完成剖析和优�
         同条件 Parquet 未压缩/ZSTD 单请求已测。另补含 null 的高熵 binary
         窄投影同计划对照；另补 15 列相关递增整数的宽投影对照。
         再补 4 列 nullable 高熵 binary 宽投影同计划对照；cold-cache、
-        其他宽度/变长分布及完整选择率矩阵仍未测。
+        同文件 1/10/50/100% 选择率也已测。cold-cache、其他宽度/变长分布、
+        Row Group × 投影 × 选择率的完整交叉矩阵仍未测。
 
 ### 8.3 可选向量化（P3）
 
@@ -289,6 +290,19 @@ SIMD、多级编码链和新压缩算法只有在标量路径完成剖析和优�
 - [x] 更新 README 的性能状态，不把合成 benchmark 结果表述为通用生产性能。
 
 ## 11. 执行记录
+
+### 2026-09-29：4 列 binary 投影的选择率矩阵
+
+Reader-only 扫描新增 `--selectivity-percent=1..100`（默认 50），阈值是
+`floor(rows * (100 - percent) / 100)`；三种格式复用同一 1M 行文件，
+不把不同文件的压缩率差异混入选择率对照。Apple M4、Release、warm-cache，
+各路径独立进程 20 次重复：1% 时 Sniffer 串行/4-worker P50 为
+0.879/0.871 ms，差异微小；10% 时为 6.581/2.451 ms，50% 时为
+32.791/9.776 ms，100% 时为 63.800/17.755 ms。Parquet 未压缩/ZSTD
+及 P95、剪枝、候选列块与 RSS 详见
+[`bench/BENCHMARK_V2.md`](../bench/BENCHMARK_V2.md)。
+并行仍为显式 opt-in，不能根据单一合成矩阵硬编码自动开启阈值；
+cold-cache 与 Row Group/投影交叉维度仍未验收。
 
 ### 2026-09-29：4 列高熵 nullable binary 宽投影
 

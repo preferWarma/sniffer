@@ -42,10 +42,15 @@ struct Options {
   uint32_t unprojected_binary_bytes = 0;
   uint32_t projected_binary_bytes = 0;
   uint32_t projected_columns = 1;
+  uint32_t selectivity_percent = 50;
   uint64_t buffered_budget_bytes = 64U * 1024U * 1024U;
 };
 
 Options options;
+
+int64_t QueryLowerBound() {
+  return options.rows * static_cast<int64_t>(100U - options.selectivity_percent) / 100;
+}
 
 uint64_t ProcessPeakRssBytes() {
 #if defined(__APPLE__) || defined(__linux__)
@@ -315,9 +320,9 @@ void ReaderOnlyScanImpl(benchmark::State& state, uint32_t workers) {
     plan.projection_field_ids.push_back(projection + 2U);
   }
   plan.conjunctive_predicates = {
-      {1, sniffer::Predicate::Op::kGe, std::make_shared<arrow::Int64Scalar>(options.rows / 2)}};
+      {1, sniffer::Predicate::Op::kGe, std::make_shared<arrow::Int64Scalar>(QueryLowerBound())}};
   plan.output_batch_rows = kOutputBatchRows;
-  const uint64_t expected_rows = static_cast<uint64_t>(options.rows - options.rows / 2);
+  const uint64_t expected_rows = static_cast<uint64_t>(options.rows - QueryLowerBound());
   {
     sniffer::ScanExecutionOptions checked_execution;
     checked_execution.worker_count = workers;
@@ -329,7 +334,7 @@ void ReaderOnlyScanImpl(benchmark::State& state, uint32_t workers) {
       return;
     }
     auto iterator = std::move(checked).ValueUnsafe();
-    int64_t expected_value = options.rows / 2;
+    int64_t expected_value = QueryLowerBound();
     for (;;) {
       auto next = iterator.Next();
       if (!next.ok()) {
@@ -408,6 +413,7 @@ void ReaderOnlyScanImpl(benchmark::State& state, uint32_t workers) {
   }
   state.counters["input_rows"] = static_cast<double>(options.rows);
   state.counters["output_rows"] = static_cast<double>(expected_rows);
+  state.counters["selectivity_percent"] = static_cast<double>(options.selectivity_percent);
   state.counters["file_bytes"] = static_cast<double>(file_bytes);
   state.counters["row_groups"] = static_cast<double>(reader->num_row_groups());
   state.counters["workers"] = static_cast<double>(workers);
@@ -457,7 +463,7 @@ struct ParquetMeasurement {
 
 arrow::Result<ParquetMeasurement> ScanParquetOnce(parquet::arrow::FileReader* reader, int64_t rows,
                                                   bool verify_values) {
-  const int64_t lower = rows / 2;
+  const int64_t lower = QueryLowerBound();
   const auto metadata = reader->parquet_reader()->metadata();
   std::vector<int> full_groups;
   std::optional<int> boundary_group;
@@ -580,6 +586,7 @@ void ParquetReaderOnlyScan(benchmark::State& state, bool zstd) {
   }
   state.counters["input_rows"] = static_cast<double>(options.rows);
   state.counters["output_rows"] = static_cast<double>(last.output_rows);
+  state.counters["selectivity_percent"] = static_cast<double>(options.selectivity_percent);
   state.counters["file_bytes"] = static_cast<double>(file_bytes);
   state.counters["row_groups"] = static_cast<double>(reader->num_row_groups());
   state.counters["row_groups_pruned"] = static_cast<double>(last.row_groups_pruned);
@@ -588,7 +595,7 @@ void ParquetReaderOnlyScan(benchmark::State& state, bool zstd) {
   state.counters["process_peak_rss_bytes"] = static_cast<double>(ProcessPeakRssBytes());
   state.counters["arrow_pool_peak_bytes"] =
       static_cast<double>(arrow::default_memory_pool()->max_memory());
-  state.SetItemsProcessed(state.iterations() * (options.rows - options.rows / 2));
+  state.SetItemsProcessed(state.iterations() * (options.rows - QueryLowerBound()));
 }
 
 BENCHMARK_CAPTURE(ParquetReaderOnlyScan, Uncompressed, false)
@@ -644,7 +651,7 @@ void ShardedSortRangeScan(benchmark::State& state) {
   }
   auto reader = std::move(*maybe_reader);
   const int64_t workers = state.range(0);
-  const int64_t first = options.rows / 2;
+  const int64_t first = QueryLowerBound();
   const int64_t matching_rows = options.rows - first;
   if (workers > matching_rows) {
     state.SkipWithError("worker count exceeds matching row count");
@@ -766,6 +773,14 @@ int main(int argc, char** argv) {
         std::cerr << "invalid --projected-columns value\n";
         return 1;
       }
+    } else if (argument.starts_with("--selectivity-percent=")) {
+      const auto digits = argument.substr(std::string_view("--selectivity-percent=").size());
+      const auto [end, error] = std::from_chars(digits.data(), digits.data() + digits.size(),
+                                                options.selectivity_percent);
+      if (error != std::errc{} || end != digits.data() + digits.size()) {
+        std::cerr << "invalid --selectivity-percent value\n";
+        return 1;
+      }
     } else if (argument.starts_with("--buffer-budget-bytes=")) {
       const auto digits = argument.substr(std::string_view("--buffer-budget-bytes=").size());
       const auto [end, error] = std::from_chars(digits.data(), digits.data() + digits.size(),
@@ -789,6 +804,7 @@ int main(int argc, char** argv) {
       (options.projected_binary_bytes > 0 && options.projected_binary_bytes < 20) ||
       (options.unprojected_binary_bytes > 0 && options.projected_binary_bytes > 0) ||
       options.projected_columns == 0 || options.projected_columns > 15 ||
+      options.selectivity_percent == 0 || options.selectivity_percent > 100 ||
       (options.projected_columns > 1 && options.unprojected_binary_bytes > 0) ||
       options.buffered_budget_bytes == 0 ||
       (options.unprojected_binary_bytes > 0 && options.generate_path.empty())) {
@@ -797,7 +813,7 @@ int main(int argc, char** argv) {
                  "--generate-parquet-zstd=PATH or --segment=PATH; optional Segment-only "
                  "--unprojected-binary-bytes=20..4096 (Segment generator only), "
                  "--projected-binary-bytes=20..4096, --projected-columns=1..15; "
-                 "positive --buffer-budget-bytes=N\n";
+                 "--selectivity-percent=1..100 and positive --buffer-budget-bytes=N\n";
     return 1;
   }
   if (!options.generate_path.empty()) {
@@ -838,12 +854,13 @@ int main(int argc, char** argv) {
   benchmark::AddCustomContext("projected_binary_bytes",
                               std::to_string(options.projected_binary_bytes));
   benchmark::AddCustomContext("projected_columns", std::to_string(options.projected_columns));
+  benchmark::AddCustomContext("selectivity_percent", std::to_string(options.selectivity_percent));
   benchmark::AddCustomContext(
       "query",
       "ReaderOnlyScan, BoundedParallelReaderScan and ParquetReaderOnlyScan: "
-      "key >= rows/2, project value and optional extra columns; "
+      "key >= rows * (100 - selectivity_percent) / 100, project value and optional extra columns; "
       "ShardedSortRangeScan: partition sort-key range "
-      "[rows/2,rows); project value");
+      "[lower,rows); project value");
   int benchmark_argc = static_cast<int>(benchmark_args.size());
   benchmark::Initialize(&benchmark_argc, benchmark_args.data());
   if (benchmark::ReportUnrecognizedArguments(benchmark_argc, benchmark_args.data())) {
