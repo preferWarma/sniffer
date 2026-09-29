@@ -2178,7 +2178,8 @@ TEST(SnifferCoreTest, BoundedParallelScanMatchesSerialAndPreservesBatching) {
     plans[3].projection_field_ids = {3};
     plans[3].conjunctive_predicates = {{3, sniffer::Predicate::Op::kIsNull, nullptr}};
     plans[3].output_batch_rows = 4;
-    for (const auto& plan : plans) {
+    for (size_t plan_index = 0; plan_index < plans.size(); ++plan_index) {
+      const auto& plan = plans[plan_index];
       const auto reference = CollectScan(ValueOrThrow(reader->Scan(plan), "serial parity scan"));
       for (const uint32_t workers : {1U, 2U, 4U, 8U}) {
         sniffer::ScanExecutionOptions options;
@@ -2194,13 +2195,46 @@ TEST(SnifferCoreTest, BoundedParallelScanMatchesSerialAndPreservesBatching) {
           EXPECT_TRUE(actual[index]->Equals(*reference[index]))
               << "sorted=" << sorted << " workers=" << workers << " batch=" << index;
         }
-        EXPECT_EQ(metrics->parallel_workers_started, workers == 1 ? 0U : std::min(workers, 6U));
+        const bool all_groups_pruned = sorted && plan_index == 2;
+        EXPECT_EQ(metrics->parallel_workers_started,
+                  workers == 1 || all_groups_pruned ? 0U : std::min(workers, 6U));
         EXPECT_EQ(metrics->parallel_row_groups_completed, workers == 1 ? 0U : 6U);
         EXPECT_LE(metrics->parallel_peak_in_flight_row_groups, 3U);
         EXPECT_LE(metrics->parallel_peak_reserved_bytes, options.max_buffered_bytes);
       }
     }
   }
+}
+
+TEST(SnifferCoreTest, ParallelPrunedRowGroupsDoNotOccupyWorkerSlots) {
+  const auto data = MakeScanBatch();
+  TempFile file("parallel_candidate_only.seg");
+  WriteSegmentWithPolicy(file.path(), data.table_schema, {data.batch}, ScanLayout());
+  auto reader = ValueOrThrow(sniffer::SegmentReader::Open(file.path().string()),
+                             "open candidate-only segment");
+  sniffer::IOPlan plan;
+  plan.projection_field_ids = {4};
+  plan.conjunctive_predicates = {
+      {1, sniffer::Predicate::Op::kGe, std::make_shared<arrow::Int64Scalar>(25)}};
+  plan.output_batch_rows = 5;
+  const auto reference = CollectScan(ValueOrThrow(reader->Scan(plan), "serial candidate scan"));
+  sniffer::ScanExecutionOptions options;
+  options.worker_count = 4;
+  options.max_in_flight_row_groups = 3;
+  options.max_buffered_bytes = 1U << 20U;
+  auto metrics = std::make_shared<sniffer::ScanMetrics>();
+  const auto actual =
+      CollectScan(ValueOrThrow(reader->Scan(plan, options, metrics), "parallel candidate scan"));
+  ASSERT_EQ(actual.size(), reference.size());
+  for (size_t index = 0; index < actual.size(); ++index) {
+    EXPECT_TRUE(actual[index]->Equals(*reference[index]));
+  }
+  EXPECT_EQ(metrics->row_groups_considered, 6U);
+  EXPECT_EQ(metrics->row_groups_pruned, 5U);
+  EXPECT_EQ(metrics->column_chunks_read, 1U);
+  EXPECT_EQ(metrics->parallel_workers_started, 4U);
+  EXPECT_EQ(metrics->parallel_row_groups_completed, 6U);
+  EXPECT_EQ(metrics->parallel_peak_in_flight_row_groups, 1U);
 }
 
 TEST(SnifferCoreTest, ParallelScanValidatesBudgetsAndLimitStaysSerial) {

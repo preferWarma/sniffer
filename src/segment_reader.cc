@@ -1383,6 +1383,25 @@ arrow::Result<bool> SortRangePrunes(const internal::FooterData& footer,
   return false;
 }
 
+arrow::Result<bool> RowGroupPrunes(const internal::FooterData& footer,
+                                   const internal::RowGroupMeta& row_group,
+                                   const internal::RowGroupIndex& index, const IOPlan& plan,
+                                   const ResolvedScanPlan& resolved_plan) {
+  for (size_t position = 0; position < plan.conjunctive_predicates.size(); ++position) {
+    ARROW_ASSIGN_OR_RAISE(
+        const bool prunes,
+        PredicatePrunes(footer.schema, row_group, index, plan.conjunctive_predicates[position],
+                        resolved_plan.predicate_field_indices[position]));
+    if (prunes) {
+      return true;
+    }
+  }
+  if (plan.sort_key_range) {
+    return SortRangePrunes(footer, index, *plan.sort_key_range);
+  }
+  return false;
+}
+
 // The validated sort index stores the lexicographic first and last keys of a
 // sorted Row Group. If both endpoints satisfy the range, every key does.
 arrow::Result<bool> SortRangeMatchesEntireRowGroup(const internal::FooterData& footer,
@@ -1541,8 +1560,10 @@ class ScanState {
 
  public:
   // One physical Row Group is the scheduling unit for bounded parallel scans.
+  // The coordinator alone may skip pruning after checking this group's index.
   arrow::Result<std::shared_ptr<arrow::RecordBatch>> ReadRowGroupAt(size_t row_group_index,
-                                                                    uint64_t remaining_limit) {
+                                                                    uint64_t remaining_limit,
+                                                                    bool already_pruned = false) {
     if (row_group_index >= footer_.row_groups.size()) {
       return arrow::Status::IndexError("Row Group index out of bounds");
     }
@@ -1552,14 +1573,17 @@ class ScanState {
     const auto& row_group = footer_.row_groups[row_group_index];
     const auto& index = indexes_[row_group_index];
     ++metrics_->row_groups_considered;
-    bool pruned = false;
-    {
-      internal::NanosecondTimer timer(&metrics_->pruning_nanoseconds);
-      ARROW_ASSIGN_OR_RAISE(pruned, IsPruned(row_group, index));
-    }
-    if (pruned) {
-      ++metrics_->row_groups_pruned;
-      return std::shared_ptr<arrow::RecordBatch>();
+    if (!already_pruned) {
+      bool pruned = false;
+      {
+        internal::NanosecondTimer timer(&metrics_->pruning_nanoseconds);
+        ARROW_ASSIGN_OR_RAISE(pruned,
+                              RowGroupPrunes(footer_, row_group, index, plan_, resolved_plan_));
+      }
+      if (pruned) {
+        ++metrics_->row_groups_pruned;
+        return std::shared_ptr<arrow::RecordBatch>();
+      }
     }
 
     bool all_rows_match = true;
@@ -1793,23 +1817,6 @@ class ScanState {
     return array;
   }
 
-  arrow::Result<bool> IsPruned(const internal::RowGroupMeta& row_group,
-                               const internal::RowGroupIndex& index) const {
-    for (size_t position = 0; position < plan_.conjunctive_predicates.size(); ++position) {
-      ARROW_ASSIGN_OR_RAISE(
-          const bool prunes,
-          PredicatePrunes(footer_.schema, row_group, index, plan_.conjunctive_predicates[position],
-                          resolved_plan_.predicate_field_indices[position]));
-      if (prunes) {
-        return true;
-      }
-    }
-    if (plan_.sort_key_range) {
-      return SortRangePrunes(footer_, index, *plan_.sort_key_range);
-    }
-    return false;
-  }
-
   arrow::Result<bool> RowMatchesReordered(
       uint64_t row, const std::vector<const arrow::Array*>& predicate_columns,
       const std::vector<const arrow::Array*>& sort_key_columns) const {
@@ -1928,7 +1935,8 @@ class ParallelScanCoordinator {
         schema_(std::move(schema)),
         metrics_(std::move(metrics)),
         options_(options),
-        estimates_(std::move(estimates)) {}
+        estimates_(std::move(estimates)),
+        pruned_(estimates_.size(), 0) {}
 
   ~ParallelScanCoordinator() { StopAndJoin(); }
 
@@ -1936,8 +1944,18 @@ class ParallelScanCoordinator {
     if (terminal_error_) {
       return *terminal_error_;
     }
-    ARROW_RETURN_NOT_OK(Start());
     while (next_to_emit_ < estimates_.size()) {
+      FillQueue();
+      if (pruned_[next_to_emit_]) {
+        ++next_to_emit_;
+        continue;
+      }
+      if (pruning_error_ && pruning_error_->first == next_to_emit_) {
+        terminal_error_ = pruning_error_->second;
+        StopAndJoin();
+        return *terminal_error_;
+      }
+      ARROW_RETURN_NOT_OK(Start());
       std::unique_lock<std::mutex> lock(mutex_);
       cv_.wait(lock, [&] { return completed_.contains(next_to_emit_) || fatal_.has_value(); });
       if (fatal_) {
@@ -1950,9 +1968,9 @@ class ParallelScanCoordinator {
       Completed item = std::move(position->second);
       completed_.erase(position);
       reserved_bytes_ -= estimates_[next_to_emit_];
+      --in_flight_;
       ++next_to_emit_;
       lock.unlock();
-      cv_.notify_all();
       AddScanMetrics(metrics_.get(), item.metrics);
       ++metrics_->parallel_row_groups_completed;
       if (!item.result.ok()) {
@@ -1974,6 +1992,50 @@ class ParallelScanCoordinator {
     arrow::Result<std::shared_ptr<arrow::RecordBatch>> result;
     ScanMetrics metrics;
   };
+
+  void FillQueue() {
+    // Inspect metadata only as far as the bounded candidate window permits.
+    // Pruned groups do not occupy worker slots; defer a pruning error until its
+    // physical Row Group reaches the ordered output cursor.
+    while (next_to_consider_ < estimates_.size() && !pruning_error_ &&
+           in_flight_ < options_.max_in_flight_row_groups &&
+           estimates_[next_to_consider_] <= options_.max_buffered_bytes - reserved_bytes_) {
+      const size_t index = next_to_consider_++;
+      const auto& row_group = footer_.row_groups[index];
+      arrow::Result<bool> prunes = false;
+      {
+        internal::NanosecondTimer timer(&metrics_->pruning_nanoseconds);
+        try {
+          prunes = RowGroupPrunes(footer_, row_group, indexes_[index], plan_, resolved_plan_);
+        } catch (const std::exception& error) {
+          prunes = arrow::Status::IOError("[sniffer.scan.parallel] pruning failed: ", error.what());
+        } catch (...) {
+          prunes = arrow::Status::IOError("[sniffer.scan.parallel] pruning failed");
+        }
+      }
+      if (!prunes.ok()) {
+        ++metrics_->row_groups_considered;
+        pruning_error_ = std::make_pair(index, prunes.status());
+        return;
+      }
+      if (*prunes) {
+        pruned_[index] = 1;
+        ++metrics_->row_groups_considered;
+        ++metrics_->row_groups_pruned;
+        ++metrics_->parallel_row_groups_completed;
+        continue;
+      }
+      ++in_flight_;
+      reserved_bytes_ += estimates_[index];
+      peak_in_flight_ = std::max(peak_in_flight_, in_flight_);
+      peak_reserved_bytes_ = std::max(peak_reserved_bytes_, reserved_bytes_);
+      {
+        std::lock_guard<std::mutex> lock(mutex_);
+        pending_.push_back(index);
+      }
+      cv_.notify_one();
+    }
+  }
 
   arrow::Status Start() {
     if (started_) {
@@ -2035,24 +2097,18 @@ class ParallelScanCoordinator {
       size_t index = 0;
       {
         std::unique_lock<std::mutex> lock(mutex_);
-        cv_.wait(lock, [&] {
-          return stopped_ || next_to_dispatch_ == estimates_.size() ||
-                 (next_to_dispatch_ - next_to_emit_ < options_.max_in_flight_row_groups &&
-                  estimates_[next_to_dispatch_] <= options_.max_buffered_bytes - reserved_bytes_);
-        });
-        if (stopped_ || next_to_dispatch_ == estimates_.size()) {
+        cv_.wait(lock, [&] { return stopped_ || !pending_.empty(); });
+        if (stopped_) {
           return;
         }
-        index = next_to_dispatch_++;
-        reserved_bytes_ += estimates_[index];
-        peak_in_flight_ = std::max(peak_in_flight_, next_to_dispatch_ - next_to_emit_);
-        peak_reserved_bytes_ = std::max(peak_reserved_bytes_, reserved_bytes_);
+        index = pending_.front();
+        pending_.pop_front();
       }
       auto result = arrow::Result<std::shared_ptr<arrow::RecordBatch>>(
           arrow::Status::UnknownError("parallel Row Group was not processed"));
       *worker_metrics = {};
       try {
-        result = state.ReadRowGroupAt(index, std::numeric_limits<uint64_t>::max());
+        result = state.ReadRowGroupAt(index, std::numeric_limits<uint64_t>::max(), true);
       } catch (const std::exception& error) {
         result = arrow::Status::IOError("[sniffer.scan.parallel] worker failed: ", error.what());
       } catch (...) {
@@ -2086,17 +2142,21 @@ class ParallelScanCoordinator {
   std::shared_ptr<ScanMetrics> metrics_;
   ScanExecutionOptions options_;
   std::vector<uint64_t> estimates_;
+  std::vector<uint8_t> pruned_;
   std::mutex mutex_;
   std::condition_variable cv_;
+  std::deque<size_t> pending_;
   std::map<size_t, Completed> completed_;
   std::vector<std::thread> workers_;
-  size_t next_to_dispatch_ = 0;
+  size_t next_to_consider_ = 0;
   size_t next_to_emit_ = 0;
+  size_t in_flight_ = 0;
   uint64_t reserved_bytes_ = 0;
   size_t peak_in_flight_ = 0;
   uint64_t peak_reserved_bytes_ = 0;
   bool started_ = false;
   bool stopped_ = false;
+  std::optional<std::pair<size_t, arrow::Status>> pruning_error_;
   std::optional<arrow::Status> fatal_;
   std::optional<arrow::Status> terminal_error_;
 };

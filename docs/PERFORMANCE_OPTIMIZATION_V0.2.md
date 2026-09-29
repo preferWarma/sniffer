@@ -235,6 +235,9 @@ SIMD、多级编码链和新压缩算法只有在标量路径完成剖析和优�
         opt-in、有界在途、保序输出；排序/无索引、nullable/binary、空结果、过滤与投影
         分离、候选/剪枝损坏块、提前销毁及 `limit` 串行回退有回归。父项仍待
         更宽数据分布和 Parquet/cold-cache 验收。
+  - [x] 并行调度先按物理顺序检查候选组索引；已剪枝组不再占用 worker 任务或在途预算，
+        全部剪枝时不启动线程。保留按 Row Group 顺序传播错误和提前销毁的惰性语义；
+        1K/1% Reader-only A/B 及高选择率取舍见 benchmark 记录。
 - [ ] 线程数、任务粒度、在途 Row Group 数和内存预算由显式配置限制；提供单线程 fallback、
       错误/取消传播，不创建无上限异步任务。若需要新公共配置，先确定向后兼容的 API 语义。
   - [x] [`Decision 0005`](decisions/0005-bounded-parallel-scan.md) 已固定 opt-in 执行选项、
