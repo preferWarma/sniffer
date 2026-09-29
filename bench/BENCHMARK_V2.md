@@ -1043,3 +1043,44 @@ sniffer_reader_dir=$(mktemp -d)
 
 将 filter 分别换成 `ReaderOnlyScan`、`BoundedParallelReaderScan/4`、
 `ParquetReaderOnlyScan/Uncompressed` 可测另外三条路径。
+
+## 2026-09-29：无关变长列不再占用并行调度预算
+
+旧预算将 Row Group 的**所有** ColumnChunk 解码长度翻倍计入，即使计划只
+触及 key/value；存在大而未投影的 binary 列时，1 MiB 预算可能让扫描整体
+退回串行。现在预算只估算谓词、排序键和投影列的并集，仍为每个相关列预留
+两份未压缩长度，加每行 16 B 与每组 4,096 B；这仍只是调度估算，
+不是 RSS 硬上限。测试固定无关宽列下 worker 确实启动、输出与串行逐 batch
+一致，同时在投影宽列时正确退回串行。
+
+Apple M4（10 逻辑核）、AppleClang 21、Arrow C++ 23.0.1、Release `-O3`、
+系统临时目录、warm-cache，Row Group 8,192，`key >= rows/2`，只投影
+int64 value。额外第三列是每行 256 B 的高基数 binary，不参与查询；
+Sniffer 仍只读 100K 的 8 个或 1M 的 63 个候选列块。
+每个 case 独立进程，11 次重复、每次至少 0.05 秒，报告 real-time P50：
+
+| 输入 | 文件 B | 串行 P50 ms | 4-worker P50 ms | 并行 worker / 在途峰值 / 预算预留峰值 | RSS 峰值，串行 / 并行 MB |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 100K | 26,729,967 | 0.145 | 0.194 | 4 / 3 / 880,416 B | 6.44 / 7.41 |
+| 1M | 267,302,463 | 0.985 | 1.135 | 4 / 3 / 826,656 B | 6.72 / 7.85 |
+
+两组输入上并行虽不再错误退回串行，却仍分别慢约 34% 和 15%；默认继续
+串行，不能将“worker 已启动”称为吞吐提升。这里是窄投影加一个无关变长列，
+不是宽投影或变长列解码性能验收；完整矩阵和 cold-cache 仍未完成。
+原 10M 双 int64 Segment 另做 7 次短回归，串行/4-worker P50 为
+9.483/6.654 ms，候选列块仍为 612 个；与上一节的波动范围一致。
+复现示例：
+
+```sh
+sniffer_wide_dir=$(mktemp -d)
+./build-release/sniffer_core_reader_memory_benchmark \
+  "--generate=$sniffer_wide_dir/wide.seg" --rows=1000000 \
+  --unprojected-binary-bytes=256
+./build-release/sniffer_core_reader_memory_benchmark \
+  "--segment=$sniffer_wide_dir/wide.seg" --rows=1000000 \
+  --buffer-budget-bytes=1048576 \
+  '--benchmark_filter=^BoundedParallelReaderScan/4/real_time$' \
+  --benchmark_repetitions=11 --benchmark_min_time=0.05s --benchmark_format=csv
+```
+
+串行对照将 filter 换为 `^ReaderOnlyScan/real_time$`，同样新进程运行。

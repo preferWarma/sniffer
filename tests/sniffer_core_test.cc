@@ -2238,6 +2238,58 @@ TEST(SnifferCoreTest, ParallelScanValidatesBudgetsAndLimitStaysSerial) {
   EXPECT_EQ(metrics->row_groups_considered, 1U);
 }
 
+TEST(SnifferCoreTest, ParallelBudgetIgnoresUnreferencedWideColumn) {
+  auto data = MakeScanBatch();
+  data.table_schema.fields.push_back({5, "unused", arrow::binary(), false, nullptr});
+  auto schema = ValueOrThrow(data.table_schema.ToArrowSchema(), "wide budget schema");
+  arrow::BinaryBuilder builder;
+  for (int64_t row = 0; row < data.batch->num_rows(); ++row) {
+    std::string payload(8192, 'x');
+    payload.replace(0, std::to_string(row).size(), std::to_string(row));
+    RequireOk(builder.Append(payload), "append unreferenced wide payload");
+  }
+  std::shared_ptr<arrow::Array> wide;
+  RequireOk(builder.Finish(&wide), "finish unreferenced wide payload");
+  auto columns = data.batch->columns();
+  columns.push_back(std::move(wide));
+  auto batch = arrow::RecordBatch::Make(schema, data.batch->num_rows(), std::move(columns));
+  TempFile file("parallel_unreferenced_wide.seg");
+  WriteSegmentWithPolicy(file.path(), data.table_schema, {batch}, ScanLayout());
+  auto reader = ValueOrThrow(sniffer::SegmentReader::Open(file.path().string()),
+                             "open parallel unreferenced-wide segment");
+  sniffer::ScanExecutionOptions options;
+  options.worker_count = 4;
+  options.max_in_flight_row_groups = 3;
+  options.max_buffered_bytes = 32768;
+  sniffer::IOPlan plan;
+  plan.projection_field_ids = {4};
+  plan.conjunctive_predicates = {
+      {1, sniffer::Predicate::Op::kGe, std::make_shared<arrow::Int64Scalar>(15)}};
+  plan.output_batch_rows = 4;
+  const auto reference = CollectScan(ValueOrThrow(reader->Scan(plan), "serial narrow projection"));
+  auto metrics = std::make_shared<sniffer::ScanMetrics>();
+  const auto actual =
+      CollectScan(ValueOrThrow(reader->Scan(plan, options, metrics), "parallel narrow projection"));
+  ASSERT_EQ(actual.size(), reference.size());
+  for (size_t index = 0; index < actual.size(); ++index) {
+    EXPECT_TRUE(actual[index]->Equals(*reference[index]));
+  }
+  EXPECT_EQ(metrics->parallel_workers_started, 4U);
+  EXPECT_LE(metrics->parallel_peak_reserved_bytes, options.max_buffered_bytes);
+
+  plan.projection_field_ids = {5};
+  const auto wide_reference =
+      CollectScan(ValueOrThrow(reader->Scan(plan), "serial wide projection"));
+  metrics = std::make_shared<sniffer::ScanMetrics>();
+  const auto wide_actual = CollectScan(
+      ValueOrThrow(reader->Scan(plan, options, metrics), "budget-limited wide projection"));
+  ASSERT_EQ(wide_actual.size(), wide_reference.size());
+  for (size_t index = 0; index < wide_actual.size(); ++index) {
+    EXPECT_TRUE(wide_actual[index]->Equals(*wide_reference[index]));
+  }
+  EXPECT_EQ(metrics->parallel_workers_started, 0U);
+}
+
 TEST(SnifferCoreTest, ParallelScanReportsCandidateCorruptionInRowOrder) {
   const auto data = MakeScanBatch();
   TempFile file("parallel_corrupt_order.seg");

@@ -2289,6 +2289,16 @@ class SegmentReader::Impl {
     if (options.worker_count > 1 && !plan.limit && footer_.row_groups.size() > 1) {
       options.worker_count =
           static_cast<uint32_t>(std::min<size_t>(options.worker_count, footer_.row_groups.size()));
+      std::vector<uint8_t> needed_columns(footer_.schema.fields.size(), 0);
+      for (const size_t index : resolved_plan.projection_field_indices) {
+        needed_columns[index] = 1;
+      }
+      for (const size_t index : resolved_plan.predicate_field_indices) {
+        needed_columns[index] = 1;
+      }
+      for (const size_t index : resolved_plan.sort_key_field_indices) {
+        needed_columns[index] = 1;
+      }
       std::vector<uint64_t> estimates;
       estimates.reserve(footer_.row_groups.size());
       bool within_budget = true;
@@ -2296,8 +2306,13 @@ class SegmentReader::Impl {
         ARROW_ASSIGN_OR_RAISE(auto estimate,
                               internal::CheckedMultiply(row_group.row_count, uint64_t{16}));
         ARROW_ASSIGN_OR_RAISE(estimate, internal::CheckedAdd(estimate, uint64_t{4096}));
-        for (const auto& chunk : row_group.chunks) {
-          // Include both decoded filter inputs and a potentially copied projected output.
+        for (size_t index = 0; index < row_group.chunks.size(); ++index) {
+          if (!needed_columns[index]) {
+            continue;
+          }
+          const auto& chunk = row_group.chunks[index];
+          // Only referenced columns can be decoded. Retain a second copy in
+          // the estimate for selection or output materialization.
           ARROW_ASSIGN_OR_RAISE(auto column_bytes,
                                 internal::CheckedMultiply(chunk.uncompressed_length, uint64_t{2}));
           ARROW_ASSIGN_OR_RAISE(estimate, internal::CheckedAdd(estimate, column_bytes));

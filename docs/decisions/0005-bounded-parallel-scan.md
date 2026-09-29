@@ -58,7 +58,8 @@ to its explicit worker/in-flight budgets. The existing API and file bytes remain
 The optional `Scan(IOPlan, ScanExecutionOptions, metrics)` overload now implements this
 contract for no-limit plans. Oversize Row Groups and plans with `limit` use the serial path;
 the original overload remains serial. The scheduler bounds in-flight Row Groups and reserves
-conservative bytes based on twice the uncompressed chunk lengths plus row overhead; this is
+conservative bytes based on twice the uncompressed lengths of predicate, sort-key, and
+projection chunks (not unrelated columns), plus row overhead; this is
 not an exact Arrow allocation/RSS ceiling. Correctness, corruption, cancellation, and TSan
 tests cover the first implementation. A same-plan Parquet Reader-only warm-cache comparison
 for sorted two-int64 data is recorded in `bench/BENCHMARK_V2.md`; cold-cache and broader

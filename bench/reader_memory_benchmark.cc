@@ -39,6 +39,8 @@ struct Options {
   std::string parquet_path;
   std::string parquet_zstd_path;
   int64_t rows = 0;
+  uint32_t unprojected_binary_bytes = 0;
+  uint64_t buffered_budget_bytes = 64U * 1024U * 1024U;
 };
 
 Options options;
@@ -60,7 +62,8 @@ uint64_t ProcessPeakRssBytes() {
 }
 
 arrow::Result<std::shared_ptr<arrow::RecordBatch>> MakeGeneratedBatch(
-    const std::shared_ptr<arrow::Schema>& arrow_schema, int64_t offset, int64_t count) {
+    const std::shared_ptr<arrow::Schema>& arrow_schema, int64_t offset, int64_t count,
+    uint32_t unprojected_binary_bytes = 0) {
   arrow::Int64Builder key_builder;
   arrow::Int64Builder value_builder;
   ARROW_RETURN_NOT_OK(key_builder.Reserve(count));
@@ -73,7 +76,20 @@ arrow::Result<std::shared_ptr<arrow::RecordBatch>> MakeGeneratedBatch(
   std::shared_ptr<arrow::Array> value;
   ARROW_RETURN_NOT_OK(key_builder.Finish(&key));
   ARROW_RETURN_NOT_OK(value_builder.Finish(&value));
-  return arrow::RecordBatch::Make(arrow_schema, count, {std::move(key), std::move(value)});
+  std::vector<std::shared_ptr<arrow::Array>> columns = {std::move(key), std::move(value)};
+  if (unprojected_binary_bytes > 0) {
+    arrow::BinaryBuilder unused_builder;
+    std::string payload(unprojected_binary_bytes, 'x');
+    for (int64_t row = 0; row < count; ++row) {
+      const auto row_id = std::to_string(offset + row);
+      payload.replace(0, row_id.size(), row_id);
+      ARROW_RETURN_NOT_OK(unused_builder.Append(payload));
+    }
+    std::shared_ptr<arrow::Array> unused;
+    ARROW_RETURN_NOT_OK(unused_builder.Finish(&unused));
+    columns.push_back(std::move(unused));
+  }
+  return arrow::RecordBatch::Make(arrow_schema, count, std::move(columns));
 }
 
 arrow::Status CheckNewPath(const std::string& path) {
@@ -90,10 +106,13 @@ arrow::Status CheckNewPath(const std::string& path) {
 
 arrow::Status GenerateSegment(const Options& config) {
   ARROW_RETURN_NOT_OK(CheckNewPath(config.generate_path));
-  const sniffer::TableSchema schema{
+  sniffer::TableSchema schema{
       1,
       {{1, "key", arrow::int64(), false, nullptr}, {2, "value", arrow::int64(), false, nullptr}},
   };
+  if (config.unprojected_binary_bytes > 0) {
+    schema.fields.push_back({3, "unused_payload", arrow::binary(), false, nullptr});
+  }
   ARROW_ASSIGN_OR_RAISE(auto arrow_schema, schema.ToArrowSchema());
   sniffer::LayoutPolicy layout;
   layout.target_row_group_rows = kRowGroupRows;
@@ -103,7 +122,8 @@ arrow::Status GenerateSegment(const Options& config) {
                         sniffer::SegmentWriter::Open(config.generate_path, schema, layout));
   for (int64_t offset = 0; offset < config.rows; offset += kRowGroupRows) {
     const int64_t count = std::min<int64_t>(kRowGroupRows, config.rows - offset);
-    ARROW_ASSIGN_OR_RAISE(auto batch, MakeGeneratedBatch(arrow_schema, offset, count));
+    ARROW_ASSIGN_OR_RAISE(auto batch, MakeGeneratedBatch(arrow_schema, offset, count,
+                                                         config.unprojected_binary_bytes));
     ARROW_RETURN_NOT_OK(writer->Append(std::move(batch)));
   }
   return writer->Finish();
@@ -184,12 +204,13 @@ void ReaderOnlyScanImpl(benchmark::State& state, uint32_t workers) {
   sniffer::ScanMetrics totals;
   uint64_t peak_in_flight = 0;
   uint64_t peak_reserved_bytes = 0;
+  uint64_t workers_started = 0;
   for (auto _ : state) {
     auto metrics = std::make_shared<sniffer::ScanMetrics>();
     sniffer::ScanExecutionOptions execution;
     execution.worker_count = workers;
     execution.max_in_flight_row_groups = std::max<uint32_t>(workers, 2U);
-    execution.max_buffered_bytes = 64U * 1024U * 1024U;
+    execution.max_buffered_bytes = options.buffered_budget_bytes;
     auto maybe_iterator = reader->Scan(plan, execution, metrics);
     if (!maybe_iterator.ok()) {
       state.SkipWithError(maybe_iterator.status().ToString());
@@ -225,6 +246,7 @@ void ReaderOnlyScanImpl(benchmark::State& state, uint32_t workers) {
     totals.batch_materialization_nanoseconds += metrics->batch_materialization_nanoseconds;
     peak_in_flight = std::max(peak_in_flight, metrics->parallel_peak_in_flight_row_groups);
     peak_reserved_bytes = std::max(peak_reserved_bytes, metrics->parallel_peak_reserved_bytes);
+    workers_started = std::max(workers_started, metrics->parallel_workers_started);
   }
   std::error_code file_error;
   const uint64_t file_bytes = std::filesystem::file_size(options.segment_path, file_error);
@@ -237,6 +259,8 @@ void ReaderOnlyScanImpl(benchmark::State& state, uint32_t workers) {
   state.counters["file_bytes"] = static_cast<double>(file_bytes);
   state.counters["row_groups"] = static_cast<double>(reader->num_row_groups());
   state.counters["workers"] = static_cast<double>(workers);
+  state.counters["parallel_workers_started"] = static_cast<double>(workers_started);
+  state.counters["buffered_budget_bytes"] = static_cast<double>(options.buffered_budget_bytes);
   state.counters["parallel_peak_in_flight"] = static_cast<double>(peak_in_flight);
   state.counters["parallel_peak_reserved_bytes"] = static_cast<double>(peak_reserved_bytes);
   const auto per_scan = [&state](const char* name, uint64_t count) {
@@ -564,6 +588,22 @@ int main(int argc, char** argv) {
         std::cerr << "invalid --rows value\n";
         return 1;
       }
+    } else if (argument.starts_with("--unprojected-binary-bytes=")) {
+      const auto digits = argument.substr(std::string_view("--unprojected-binary-bytes=").size());
+      const auto [end, error] = std::from_chars(digits.data(), digits.data() + digits.size(),
+                                                options.unprojected_binary_bytes);
+      if (error != std::errc{} || end != digits.data() + digits.size()) {
+        std::cerr << "invalid --unprojected-binary-bytes value\n";
+        return 1;
+      }
+    } else if (argument.starts_with("--buffer-budget-bytes=")) {
+      const auto digits = argument.substr(std::string_view("--buffer-budget-bytes=").size());
+      const auto [end, error] = std::from_chars(digits.data(), digits.data() + digits.size(),
+                                                options.buffered_budget_bytes);
+      if (error != std::errc{} || end != digits.data() + digits.size()) {
+        std::cerr << "invalid --buffer-budget-bytes value\n";
+        return 1;
+      }
     } else {
       benchmark_args.push_back(argv[index]);
     }
@@ -572,10 +612,15 @@ int main(int argc, char** argv) {
                          static_cast<int>(!options.generate_parquet_path.empty()) +
                          static_cast<int>(!options.generate_parquet_zstd_path.empty()) +
                          static_cast<int>(!options.segment_path.empty());
-  if (options.rows <= 0 || options.rows > 100000000 || mode_count != 1) {
+  if (options.rows <= 0 || options.rows > 100000000 || mode_count != 1 ||
+      options.unprojected_binary_bytes > 4096 ||
+      (options.unprojected_binary_bytes > 0 && options.unprojected_binary_bytes < 20) ||
+      options.buffered_budget_bytes == 0 ||
+      (options.unprojected_binary_bytes > 0 && options.generate_path.empty())) {
     std::cerr << "use 1 <= --rows=N <= 100000000 with exactly one of "
                  "--generate=PATH, --generate-parquet=PATH, "
-                 "--generate-parquet-zstd=PATH or --segment=PATH\n";
+                 "--generate-parquet-zstd=PATH or --segment=PATH; optional Segment-only "
+                 "--unprojected-binary-bytes=20..4096 and positive --buffer-budget-bytes=N\n";
     return 1;
   }
   if (!options.generate_path.empty()) {
@@ -611,6 +656,8 @@ int main(int argc, char** argv) {
   benchmark::AddCustomContext("parquet_compression", "UNCOMPRESSED and ZSTD; explicit input paths");
   benchmark::AddCustomContext("row_group_rows", std::to_string(kRowGroupRows));
   benchmark::AddCustomContext("output_batch_rows", std::to_string(kOutputBatchRows));
+  benchmark::AddCustomContext("buffered_budget_bytes",
+                              std::to_string(options.buffered_budget_bytes));
   benchmark::AddCustomContext(
       "query",
       "ReaderOnlyScan, BoundedParallelReaderScan and ParquetReaderOnlyScan: "
