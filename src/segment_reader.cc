@@ -55,7 +55,13 @@ arrow::Status InvalidFormat(const std::string& detail) {
 class RandomAccessFile {
  public:
   static arrow::Result<std::shared_ptr<RandomAccessFile>> Open(
-      std::string path, const std::shared_ptr<ReaderMetrics>& metrics) {
+      std::string path, const std::shared_ptr<ReaderMetrics>& metrics, ReaderOpenOptions options) {
+    if (options.bypass_os_cache) {
+#if !defined(__APPLE__) || !defined(SNIFFER_USE_PREAD)
+      return arrow::Status::NotImplemented(
+          "[sniffer.io] OS file-cache bypass is unavailable on this platform");
+#endif
+    }
     auto file = std::shared_ptr<RandomAccessFile>(new RandomAccessFile(std::move(path)));
 #if defined(SNIFFER_USE_PREAD)
     int flags = O_RDONLY;
@@ -66,6 +72,11 @@ class RandomAccessFile {
     if (file->fd_ < 0) {
       return IoError("cannot open segment for reading", file->path_);
     }
+#if defined(__APPLE__)
+    if (options.bypass_os_cache && ::fcntl(file->fd_, F_NOCACHE, 1) != 0) {
+      return IoError("cannot disable file cache for segment", file->path_);
+    }
+#endif
     struct stat file_stat{};
     if (::fstat(file->fd_, &file_stat) != 0 || file_stat.st_size < 0) {
       return IoError("cannot determine segment size", file->path_);
@@ -2466,13 +2477,18 @@ class SegmentReader::Impl {
 
 arrow::Result<std::unique_ptr<SegmentReader>> SegmentReader::Open(
     std::string path, std::shared_ptr<ReaderMetrics> metrics) {
+  return OpenWithOptions(std::move(path), ReaderOpenOptions{}, std::move(metrics));
+}
+
+arrow::Result<std::unique_ptr<SegmentReader>> SegmentReader::OpenWithOptions(
+    std::string path, ReaderOpenOptions options, std::shared_ptr<ReaderMetrics> metrics) {
   if (metrics) {
     *metrics = {};
   }
   std::shared_ptr<RandomAccessFile> file;
   {
     internal::NanosecondTimer timer(metrics ? &metrics->envelope_io_nanoseconds : nullptr);
-    ARROW_ASSIGN_OR_RAISE(file, RandomAccessFile::Open(std::move(path), metrics));
+    ARROW_ASSIGN_OR_RAISE(file, RandomAccessFile::Open(std::move(path), metrics, options));
   }
   const uint64_t file_size = file->size();
   if (file_size < internal::kHeaderSize + internal::kTrailerSize) {

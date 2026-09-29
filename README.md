@@ -265,6 +265,12 @@ sniffer_mem_dir=$(mktemp -d)
 同一个生成文件可复用来比较不同选择率。
 生成与扫描均可指定 `--row-group-rows=1..262144`（默认 8192）；扫描时必须传入
 与文件生成时相同的分组大小。该参数仅用于此 benchmark，不改变库的格式或默认扫描策略。
+macOS 可在扫描进程加 `--cache-bypass`，让 Sniffer 与 Parquet 的 Reader 文件描述符
+使用 `F_NOCACHE`；对应的 `SegmentReader::OpenWithOptions(path, ReaderOpenOptions{...})`
+默认关闭。
+这是缓存旁路对照，**不是**清空缓存后的 cold-cache 测量；其他平台及强制 stream-I/O
+构建会明确返回 `NotImplemented`。方法与限制见
+[Decision 0006](docs/decisions/0006-macos-cache-bypass-measurement.md)。
 
 性能 benchmark 的 Sniffer 结果还包含 phase counters：writer 的索引、编码选择、编码、checksum
 与文件写入，以及 reader 的元数据、chunk I/O/checksum、解码、谓词、投影和 batch materialization。

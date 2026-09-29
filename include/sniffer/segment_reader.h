@@ -20,6 +20,12 @@ struct ScanExecutionOptions {
   uint64_t max_buffered_bytes = 64U * 1024U * 1024U;
 };
 
+struct ReaderOpenOptions {
+  // macOS only: bypass the OS file cache for this Reader's descriptor.
+  // This is not a guarantee of cold storage or a process RSS limit.
+  bool bypass_os_cache = false;
+};
+
 struct ReaderMetrics {
   uint64_t file_handles_opened = 0;
   uint64_t envelope_io_nanoseconds = 0;
@@ -35,6 +41,9 @@ class SegmentReader {
  public:
   [[nodiscard]] static arrow::Result<std::unique_ptr<SegmentReader>> Open(
       std::string path, std::shared_ptr<ReaderMetrics> metrics = nullptr);
+  [[nodiscard]] static arrow::Result<std::unique_ptr<SegmentReader>> OpenWithOptions(
+      std::string path, ReaderOpenOptions options,
+      std::shared_ptr<ReaderMetrics> metrics = nullptr);
 
   SegmentReader(const SegmentReader&) = delete;
   SegmentReader& operator=(const SegmentReader&) = delete;

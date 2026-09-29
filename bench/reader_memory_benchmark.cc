@@ -45,6 +45,7 @@ struct Options {
   uint32_t selectivity_percent = 50;
   uint32_t row_group_rows = kDefaultRowGroupRows;
   uint64_t buffered_budget_bytes = 64U * 1024U * 1024U;
+  bool cache_bypass = false;
 };
 
 Options options;
@@ -315,7 +316,8 @@ arrow::Status GenerateParquet(const Options& config, const std::string& path,
 }
 
 void ReaderOnlyScanImpl(benchmark::State& state, uint32_t workers) {
-  auto maybe_reader = sniffer::SegmentReader::Open(options.segment_path);
+  auto maybe_reader = sniffer::SegmentReader::OpenWithOptions(
+      options.segment_path, sniffer::ReaderOpenOptions{.bypass_os_cache = options.cache_bypass});
   if (!maybe_reader.ok()) {
     state.SkipWithError(maybe_reader.status().ToString());
     return;
@@ -567,7 +569,7 @@ void ParquetReaderOnlyScan(benchmark::State& state, bool zstd) {
     state.SkipWithError(zstd ? "--parquet-zstd=PATH is required" : "--parquet=PATH is required");
     return;
   }
-  auto opened = sniffer_bench::OpenParquet(path, kOutputBatchRows);
+  auto opened = sniffer_bench::OpenParquet(path, kOutputBatchRows, options.cache_bypass);
   if (!opened.ok()) {
     state.SkipWithError(opened.status().ToString());
     return;
@@ -658,7 +660,8 @@ arrow::Result<uint64_t> ScanShard(sniffer::SegmentReader& reader, const sniffer:
 }
 
 void ShardedSortRangeScan(benchmark::State& state) {
-  auto maybe_reader = sniffer::SegmentReader::Open(options.segment_path);
+  auto maybe_reader = sniffer::SegmentReader::OpenWithOptions(
+      options.segment_path, sniffer::ReaderOpenOptions{.bypass_os_cache = options.cache_bypass});
   if (!maybe_reader.ok()) {
     state.SkipWithError(maybe_reader.status().ToString());
     return;
@@ -815,6 +818,8 @@ int main(int argc, char** argv) {
         std::cerr << "invalid --buffer-budget-bytes value\n";
         return 1;
       }
+    } else if (argument == "--cache-bypass") {
+      options.cache_bypass = true;
     } else {
       benchmark_args.push_back(argv[index]);
     }
@@ -834,6 +839,7 @@ int main(int argc, char** argv) {
       options.row_group_rows == 0 || options.row_group_rows > 262144 ||
       (options.projected_columns > 1 && options.unprojected_binary_bytes > 0) ||
       options.buffered_budget_bytes == 0 ||
+      (options.cache_bypass && options.segment_path.empty()) ||
       (options.unprojected_binary_bytes > 0 && options.generate_path.empty())) {
     std::cerr << "use 1 <= --rows=N <= 100000000 with exactly one of "
                  "--generate=PATH, --generate-parquet=PATH, "
@@ -841,7 +847,7 @@ int main(int argc, char** argv) {
                  "--unprojected-binary-bytes=20..4096 (Segment generator only), "
                  "--projected-binary-bytes=20..4096, --projected-columns=1..15; "
                  "--selectivity-percent=1..100, --row-group-rows=1..262144 "
-                 "and positive --buffer-budget-bytes=N\n";
+                 "positive --buffer-budget-bytes=N; scan-only --cache-bypass on macOS\n";
     return 1;
   }
   if (!options.generate_path.empty()) {
@@ -876,6 +882,7 @@ int main(int argc, char** argv) {
   benchmark::AddCustomContext("scope", "fresh_process_reader_only_no_writer_or_input_batch");
   benchmark::AddCustomContext("parquet_compression", "UNCOMPRESSED and ZSTD; explicit input paths");
   benchmark::AddCustomContext("row_group_rows", std::to_string(options.row_group_rows));
+  benchmark::AddCustomContext("cache_mode", options.cache_bypass ? "macOS_F_NOCACHE" : "default");
   benchmark::AddCustomContext("output_batch_rows", std::to_string(kOutputBatchRows));
   benchmark::AddCustomContext("buffered_budget_bytes",
                               std::to_string(options.buffered_budget_bytes));

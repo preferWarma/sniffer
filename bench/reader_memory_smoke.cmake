@@ -295,6 +295,43 @@ execute_process(
   OUTPUT_VARIABLE mismatched_rg_output
   ERROR_VARIABLE mismatched_rg_error
 )
+if(APPLE)
+  execute_process(
+    COMMAND "${READER_MEMORY_EXE}" "--segment=${small_rg_segment}"
+            "--parquet=${small_rg_parquet}" "--parquet-zstd=${small_rg_zstd}"
+            --rows=2048 --row-group-rows=1024 --projected-binary-bytes=32
+            --projected-columns=4 --cache-bypass
+            "--benchmark_filter=^ReaderOnlyScan/real_time$"
+            --benchmark_dry_run
+    RESULT_VARIABLE cache_probe_result
+    OUTPUT_VARIABLE cache_probe_output
+    ERROR_VARIABLE cache_probe_error
+  )
+  if(NOT cache_probe_result EQUAL 0 OR
+     ("${cache_probe_output}${cache_probe_error}" MATCHES "ERROR OCCURRED" AND
+      NOT "${cache_probe_output}${cache_probe_error}" MATCHES "NotImplemented"))
+    file(REMOVE "${small_rg_segment}" "${small_rg_parquet}" "${small_rg_zstd}")
+    message(FATAL_ERROR "cache-bypass probe failed: ${cache_probe_output}${cache_probe_error}")
+  endif()
+  if(NOT "${cache_probe_output}${cache_probe_error}" MATCHES "NotImplemented")
+    execute_process(
+      COMMAND "${READER_MEMORY_EXE}" "--segment=${small_rg_segment}"
+            "--parquet=${small_rg_parquet}" "--parquet-zstd=${small_rg_zstd}"
+            --rows=2048 --row-group-rows=1024 --projected-binary-bytes=32
+            --projected-columns=4 --cache-bypass
+            "--benchmark_filter=^(ReaderOnlyScan|BoundedParallelReaderScan/4|ParquetReaderOnlyScan/Uncompressed|ParquetReaderOnlyScan/ZSTD)/real_time$"
+            --benchmark_dry_run
+      RESULT_VARIABLE cache_bypass_result
+      OUTPUT_VARIABLE cache_bypass_output
+      ERROR_VARIABLE cache_bypass_error
+    )
+    if(NOT cache_bypass_result EQUAL 0 OR
+       "${cache_bypass_output}${cache_bypass_error}" MATCHES "ERROR OCCURRED")
+      file(REMOVE "${small_rg_segment}" "${small_rg_parquet}" "${small_rg_zstd}")
+      message(FATAL_ERROR "cache-bypass Reader-only smoke failed: ${cache_bypass_output}${cache_bypass_error}")
+    endif()
+  endif()
+endif()
 file(REMOVE "${small_rg_segment}" "${small_rg_parquet}" "${small_rg_zstd}")
 if(NOT small_rg_result EQUAL 0 OR
    NOT "${small_rg_output}${small_rg_error}" MATCHES "parallel_workers_started=2" OR

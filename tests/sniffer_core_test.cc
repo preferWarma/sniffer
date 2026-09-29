@@ -2237,6 +2237,76 @@ TEST(SnifferCoreTest, ParallelPrunedRowGroupsDoNotOccupyWorkerSlots) {
   EXPECT_EQ(metrics->parallel_peak_in_flight_row_groups, 1U);
 }
 
+TEST(SnifferCoreTest, ParallelDenseCandidatesKeepPrunedChunksUnread) {
+  const auto data = MakeScanBatch();
+  TempFile file("parallel_dense_candidates.seg");
+  WriteSegmentWithPolicy(file.path(), data.table_schema, {data.batch}, ScanLayout());
+  auto bytes = ReadFile(file.path());
+  const size_t trailer_offset = bytes.size() - 40;
+  const size_t footer_offset = static_cast<size_t>(ReadU64(bytes, trailer_offset + 8));
+  const size_t footer_length = static_cast<size_t>(ReadU64(bytes, trailer_offset + 16));
+  const auto footer = ValueOrThrow(sniffer::internal::ParseFooter(std::span<const uint8_t>(
+                                       bytes.data() + footer_offset, footer_length)),
+                                   "parse dense-candidate footer");
+  const auto& pruned_chunk = footer.row_groups[0].chunks[3];
+  ASSERT_LT(pruned_chunk.offset + 24U, bytes.size());
+  bytes[static_cast<size_t>(pruned_chunk.offset + 24U)] ^= 1U;
+  RefreshFooterChecksums(&bytes);
+  WriteFile(file.path(), bytes);
+
+  auto reader = ValueOrThrow(sniffer::SegmentReader::Open(file.path().string()),
+                             "open dense-candidate segment");
+  sniffer::IOPlan plan;
+  plan.projection_field_ids = {4};
+  plan.conjunctive_predicates = {
+      {1, sniffer::Predicate::Op::kGe, std::make_shared<arrow::Int64Scalar>(10)}};
+  plan.output_batch_rows = 5;
+  const auto reference = CollectScan(ValueOrThrow(reader->Scan(plan), "serial dense scan"));
+  sniffer::ScanExecutionOptions options;
+  options.worker_count = 4;
+  options.max_in_flight_row_groups = 3;
+  auto metrics = std::make_shared<sniffer::ScanMetrics>();
+  const auto actual =
+      CollectScan(ValueOrThrow(reader->Scan(plan, options, metrics), "parallel dense scan"));
+  ASSERT_EQ(actual.size(), reference.size());
+  for (size_t index = 0; index < actual.size(); ++index) {
+    EXPECT_TRUE(actual[index]->Equals(*reference[index]));
+  }
+  EXPECT_EQ(metrics->row_groups_pruned, 2U);
+  EXPECT_EQ(metrics->column_chunks_read, 4U);
+  EXPECT_EQ(metrics->parallel_workers_started, 4U);
+  EXPECT_LE(metrics->parallel_peak_in_flight_row_groups, 3U);
+}
+
+TEST(SnifferCoreTest, ReaderCacheBypassIsExplicitAndPreservesScanResults) {
+  const auto data = MakeScanBatch();
+  TempFile file("reader_cache_bypass.seg");
+  WriteSegmentWithPolicy(file.path(), data.table_schema, {data.batch}, ScanLayout());
+  sniffer::IOPlan plan;
+  plan.projection_field_ids = {4};
+  plan.conjunctive_predicates = {
+      {1, sniffer::Predicate::Op::kGe, std::make_shared<arrow::Int64Scalar>(10)}};
+  plan.output_batch_rows = 7;
+  auto default_reader = ValueOrThrow(sniffer::SegmentReader::Open(file.path().string()),
+                                     "open default-cache segment");
+  const auto expected = CollectScan(ValueOrThrow(default_reader->Scan(plan), "default-cache scan"));
+  sniffer::ReaderOpenOptions options;
+  options.bypass_os_cache = true;
+  auto bypass_reader = sniffer::SegmentReader::OpenWithOptions(file.path().string(), options);
+#if defined(__APPLE__) && !defined(SNIFFER_FORCE_STREAM_IO)
+  ASSERT_TRUE(bypass_reader.ok()) << bypass_reader.status().ToString();
+  RequireOk((*bypass_reader)->VerifyFileChecksum(), "bypass-cache file checksum");
+  const auto actual = CollectScan(ValueOrThrow((*bypass_reader)->Scan(plan), "bypass-cache scan"));
+  ASSERT_EQ(actual.size(), expected.size());
+  for (size_t index = 0; index < actual.size(); ++index) {
+    EXPECT_TRUE(actual[index]->Equals(*expected[index]));
+  }
+#else
+  ASSERT_FALSE(bypass_reader.ok());
+  EXPECT_TRUE(bypass_reader.status().IsNotImplemented());
+#endif
+}
+
 TEST(SnifferCoreTest, ParallelScanValidatesBudgetsAndLimitStaysSerial) {
   const auto data = MakeScanBatch();
   TempFile file("parallel_limit.seg");

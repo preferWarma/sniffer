@@ -12,6 +12,10 @@
 #include <filesystem>
 #include <memory>
 
+#if defined(__APPLE__)
+#include <fcntl.h>
+#endif
+
 namespace sniffer_bench {
 
 inline arrow::Status WriteParquet(const std::filesystem::path& path,
@@ -38,9 +42,22 @@ inline arrow::Status WriteParquet(const std::filesystem::path& path,
 }
 
 inline arrow::Result<std::unique_ptr<parquet::arrow::FileReader>> OpenParquet(
-    const std::filesystem::path& path, int64_t batch_rows) {
+    const std::filesystem::path& path, int64_t batch_rows, bool bypass_os_cache = false) {
   parquet::arrow::FileReaderBuilder builder;
-  ARROW_RETURN_NOT_OK(builder.OpenFile(path.string(), false));
+  if (bypass_os_cache) {
+#if defined(__APPLE__)
+    ARROW_ASSIGN_OR_RAISE(auto input, arrow::io::ReadableFile::Open(path.string()));
+    if (::fcntl(input->file_descriptor(), F_NOCACHE, 1) != 0) {
+      return arrow::Status::IOError("[sniffer.bench.io] cannot disable Parquet file cache");
+    }
+    ARROW_RETURN_NOT_OK(builder.Open(input));
+#else
+    return arrow::Status::NotImplemented(
+        "[sniffer.bench.io] OS file-cache bypass is unavailable on this platform");
+#endif
+  } else {
+    ARROW_RETURN_NOT_OK(builder.OpenFile(path.string(), false));
+  }
   parquet::ArrowReaderProperties properties(false);
   properties.set_batch_size(batch_rows);
   builder.properties(properties);

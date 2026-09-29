@@ -62,6 +62,8 @@ SIMD、多级编码链和新压缩算法只有在标量路径完成剖析和优�
 - [x] 扩展固定矩阵：Row Group 1K/8K/64K/256K，选择率 1%/10%/50%/100%，单列/多列/全列投影。
 - [x] 增加 16 列宽表的 Sniffer/Parquet 对照，报告 warm-cache 写入、扫描、文件大小和内存指标。
 - [ ] 增加超过页缓存容量的数据集，并分别报告 warm-cache 与 cold-cache 结果。
+  - [x] macOS 为 Sniffer/Parquet Reader-only 增加显式、默认关闭的 `F_NOCACHE`
+        缓存旁路对照；这既未驱逐已有缓存，也不等于真正 cold-cache，父项保持未完成。
 
 ## 4. P0：消除已知重复工作和逐值对象开销
 
@@ -220,7 +222,8 @@ SIMD、多级编码链和新压缩算法只有在标量路径完成剖析和优�
       错误传播与取消时的生命周期语义。
   - [x] 4 线程 × 40 轮不同计划、损坏块与剪枝隔离、Reader 销毁后继续消费 iterator、
         同时 `ReadAll()`/checksum；ThreadSanitizer 全量单测 66/66 通过。
-        内部并行任务的取消/预算语义仍待设计。
+        后续候选组调度版本的 TSan 全量单测 79/79 通过；内部并行任务的取消/预算
+        验收矩阵仍待扩展。
 
 ### 8.2 受控的内部并行（P2）
 
@@ -294,6 +297,41 @@ SIMD、多级编码链和新压缩算法只有在标量路径完成剖析和优�
 - [x] 更新 README 的性能状态，不把合成 benchmark 结果表述为通用生产性能。
 
 ## 11. 执行记录
+
+### 2026-09-30：默认缓存与 macOS 缓存旁路对照
+
+[`Decision 0006`](decisions/0006-macos-cache-bypass-measurement.md) 固定显式
+`OpenWithOptions(..., ReaderOpenOptions::bypass_os_cache)`：仅 macOS pread Reader
+启用 `F_NOCACHE`；
+其他平台与强制 stream-I/O 返回 `NotImplemented`。Parquet benchmark 也对其
+Arrow `ReadableFile` 使用同一描述符选项。默认 API、Segment 文件字节和
+谓词/投影/校验语义不变；新增逐值/校验和测试及三格式 smoke。
+
+Apple M4 / Release、1M 行、8K Row Group、4 列 nullable 高熵 32 B binary、
+50% 选择率、7 次重复：Sniffer 串行默认/旁路 P50 为 31.295/32.391 ms，
+4-worker 为 9.393/9.454 ms，Parquet 未压缩为 34.627/35.303 ms，
+ZSTD 为 75.239/75.817 ms。原始样本及限制见
+[`bench/BENCHMARK_V2.md`](../bench/BENCHMARK_V2.md)。此实验**不是 cold-cache**；
+超页缓存数据集及真实冷启动验收仍未完成。Release CTest 98/98、
+ASan+UBSan GTest 80/80 与 Reader-only smoke、TSan GTest 80/80 通过；
+强制 stream-I/O 构建的“不支持旁路”测试通过。
+
+### 2026-09-30：高候选密度调度试验撤回与 sanitizer 复核
+
+针对 1K Row Group、50% 选择率的并行扫描回退，试验用固定 16 个分散索引探针
+估计候选密度，再选择由 worker 或调用线程剪枝。Apple M4 / Release `-O3` /
+1M 行、4 列 nullable 高熵 32 B binary、4-worker、warm-cache、每 case 独立进程
+20 次重复且每次至少 0.05 秒：1K/1% 的 P50/P95 为 0.593/0.604 ms，
+但 1K/50% 为 15.711/15.949 ms，比当前候选组调度基准的 14.516/14.757 ms
+更差；8K/1% 为 0.616/0.620 ms，8K/50% 为 9.563/9.694 ms。
+该试验不是交错 A/B，但没有证据表明能修复目标回退，**已撤回**；正式代码
+仍只调度索引候选组，文件与公开 API 未变。
+
+另新增“候选组较密集、已剪枝的投影列块损坏”回归，确认 Sniffer 串行/并行
+逐 batch 相等、剪枝 2/6 组、只读取 4 个候选 ColumnChunk。Release 全套
+CTest 97/97、ASan+UBSan 构建的 GTest 79/79、TSan 构建的 GTest 79/79
+及 ASan+UBSan fuzz smoke 1/1 通过；这补足了本轮扫描代码的 sanitizer 验证，
+但不等于 cold-cache 或第 10 节完整性能矩阵验收。
 
 ### 2026-09-29：4 列 binary 投影的选择率矩阵
 
