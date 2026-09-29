@@ -257,6 +257,8 @@ sniffer_mem_dir=$(mktemp -d)
 `ShardedSortRangeScan/{1,2,4,8}` 应用层范围分片上界；
 内部并行与应用层分片不是同一执行路径，见
 [v0.2 基准记录](bench/BENCHMARK_V2.md)。
+`--projected-binary-bytes=128` 可在三种格式的生成与扫描中启用同一 nullable
+高熵 binary 投影场景；生成文件与扫描参数须一致。
 
 性能 benchmark 的 Sniffer 结果还包含 phase counters：writer 的索引、编码选择、编码、checksum
 与文件写入，以及 reader 的元数据、chunk I/O/checksum、解码、谓词、投影和 batch materialization。

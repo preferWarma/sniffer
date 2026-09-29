@@ -249,8 +249,8 @@ SIMD、多级编码链和新压缩算法只有在标量路径完成剖析和优�
   - [x] 多查询 1/2/4/8 线程的 Sniffer 共享/独立 Reader、Parquet 无 codec 压缩/ZSTD
         对照已测；逐值验证 Parquet 结果。单请求内部并行的 100K/10M 同计划
         Reader-only P50/P95、RSS、Arrow pool 峰值和读取量已测，见 benchmark 记录；
-        同条件 Parquet 未压缩/ZSTD 单请求已测，cold-cache、宽/变长列及完整
-        选择率矩阵仍未测。
+        同条件 Parquet 未压缩/ZSTD 单请求已测。另补含 null 的高熵 binary
+        窄投影同计划对照；cold-cache、宽投影、其他变长分布及完整选择率矩阵仍未测。
 
 ### 8.3 可选向量化（P3）
 
@@ -287,6 +287,18 @@ SIMD、多级编码链和新压缩算法只有在标量路径完成剖析和优�
 - [x] 更新 README 的性能状态，不把合成 benchmark 结果表述为通用生产性能。
 
 ## 11. 执行记录
+
+### 2026-09-29：nullable binary 投影的同计划对照
+
+Reader-only 生成器新增 128 B/值的确定性高熵 binary 与每 17 行一个 null；
+Sniffer 和 Parquet 未压缩/ZSTD 使用相同值、Row Group、50% 选择率和
+仅投影 value 的计划。计时前对每个实际执行路径逐值校验 null、字节和行序。
+Apple M4、Release、warm-cache，独立进程 20 次重复的 1M 行 P50：
+Sniffer 串行 16.476 ms、4-worker 6.428 ms、Parquet 未压缩 13.926 ms、
+ZSTD 15.583 ms。文件大小依次为 130.3、135.7、128.4 MB；4-worker
+RSS 高水位约 41.1 MB，串行约 11.9 MB。具体 P95、读取量、Arrow pool、
+100K 场景与复现参数见 [`bench/BENCHMARK_V2.md`](../bench/BENCHMARK_V2.md)。
+这补齐一个真实变长投影场景，但不能据此勾选宽投影、其他分布或 cold-cache。
 
 ### 2026-09-29：并行预算与无关变长列
 

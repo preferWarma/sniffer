@@ -40,6 +40,7 @@ struct Options {
   std::string parquet_zstd_path;
   int64_t rows = 0;
   uint32_t unprojected_binary_bytes = 0;
+  uint32_t projected_binary_bytes = 0;
   uint64_t buffered_budget_bytes = 64U * 1024U * 1024U;
 };
 
@@ -61,29 +62,95 @@ uint64_t ProcessPeakRssBytes() {
 #endif
 }
 
+std::string BinaryValue(int64_t row, uint32_t width) {
+  std::string value(width, 'x');
+  const auto row_id = std::to_string(row);
+  value.replace(0, row_id.size(), row_id);
+  return value;
+}
+
+std::string ProjectedBinaryValue(int64_t row, uint32_t width) {
+  std::string value(width, '\0');
+  uint64_t state = static_cast<uint64_t>(row);
+  for (uint32_t index = 0; index < width; ++index) {
+    state += 0x9E3779B97F4A7C15ULL;
+    uint64_t sample = state;
+    sample = (sample ^ (sample >> 30U)) * 0xBF58476D1CE4E5B9ULL;
+    sample = (sample ^ (sample >> 27U)) * 0x94D049BB133111EBULL;
+    sample ^= sample >> 31U;
+    value[index] = static_cast<char>(sample & 0xFFU);
+  }
+  return value;
+}
+
+arrow::Status VerifyGeneratedValues(const arrow::Array& values, int64_t* expected_row,
+                                    uint32_t projected_binary_bytes) {
+  if (projected_binary_bytes > 0) {
+    if (values.type_id() != arrow::Type::BINARY) {
+      return arrow::Status::Invalid("generated benchmark expected binary values");
+    }
+    const auto& binary = static_cast<const arrow::BinaryArray&>(values);
+    for (int64_t row = 0; row < binary.length(); ++row, ++*expected_row) {
+      if (*expected_row % 17 == 0) {
+        if (!binary.IsNull(row)) {
+          return arrow::Status::Invalid("generated benchmark expected null binary value");
+        }
+      } else if (binary.IsNull(row) ||
+                 binary.GetView(row) !=
+                     ProjectedBinaryValue(*expected_row, projected_binary_bytes)) {
+        return arrow::Status::Invalid("generated benchmark binary value mismatch");
+      }
+    }
+    return arrow::Status::OK();
+  }
+  if (values.type_id() != arrow::Type::INT64) {
+    return arrow::Status::Invalid("generated benchmark expected int64 values");
+  }
+  const auto& integers = static_cast<const arrow::Int64Array&>(values);
+  for (int64_t row = 0; row < integers.length(); ++row, ++*expected_row) {
+    if (integers.IsNull(row) || integers.Value(row) != *expected_row) {
+      return arrow::Status::Invalid("generated benchmark int64 value mismatch");
+    }
+  }
+  return arrow::Status::OK();
+}
+
 arrow::Result<std::shared_ptr<arrow::RecordBatch>> MakeGeneratedBatch(
     const std::shared_ptr<arrow::Schema>& arrow_schema, int64_t offset, int64_t count,
-    uint32_t unprojected_binary_bytes = 0) {
+    uint32_t unprojected_binary_bytes, uint32_t projected_binary_bytes) {
   arrow::Int64Builder key_builder;
-  arrow::Int64Builder value_builder;
   ARROW_RETURN_NOT_OK(key_builder.Reserve(count));
-  ARROW_RETURN_NOT_OK(value_builder.Reserve(count));
   for (int64_t row = 0; row < count; ++row) {
     ARROW_RETURN_NOT_OK(key_builder.Append(offset + row));
-    ARROW_RETURN_NOT_OK(value_builder.Append(offset + row));
   }
   std::shared_ptr<arrow::Array> key;
   std::shared_ptr<arrow::Array> value;
   ARROW_RETURN_NOT_OK(key_builder.Finish(&key));
-  ARROW_RETURN_NOT_OK(value_builder.Finish(&value));
+  if (projected_binary_bytes > 0) {
+    arrow::BinaryBuilder value_builder;
+    for (int64_t row = 0; row < count; ++row) {
+      const int64_t id = offset + row;
+      if (id % 17 == 0) {
+        ARROW_RETURN_NOT_OK(value_builder.AppendNull());
+      } else {
+        ARROW_RETURN_NOT_OK(value_builder.Append(ProjectedBinaryValue(id, projected_binary_bytes)));
+      }
+    }
+    ARROW_RETURN_NOT_OK(value_builder.Finish(&value));
+  } else {
+    arrow::Int64Builder value_builder;
+    ARROW_RETURN_NOT_OK(value_builder.Reserve(count));
+    for (int64_t row = 0; row < count; ++row) {
+      ARROW_RETURN_NOT_OK(value_builder.Append(offset + row));
+    }
+    ARROW_RETURN_NOT_OK(value_builder.Finish(&value));
+  }
   std::vector<std::shared_ptr<arrow::Array>> columns = {std::move(key), std::move(value)};
   if (unprojected_binary_bytes > 0) {
     arrow::BinaryBuilder unused_builder;
-    std::string payload(unprojected_binary_bytes, 'x');
     for (int64_t row = 0; row < count; ++row) {
-      const auto row_id = std::to_string(offset + row);
-      payload.replace(0, row_id.size(), row_id);
-      ARROW_RETURN_NOT_OK(unused_builder.Append(payload));
+      ARROW_RETURN_NOT_OK(
+          unused_builder.Append(BinaryValue(offset + row, unprojected_binary_bytes)));
     }
     std::shared_ptr<arrow::Array> unused;
     ARROW_RETURN_NOT_OK(unused_builder.Finish(&unused));
@@ -108,7 +175,9 @@ arrow::Status GenerateSegment(const Options& config) {
   ARROW_RETURN_NOT_OK(CheckNewPath(config.generate_path));
   sniffer::TableSchema schema{
       1,
-      {{1, "key", arrow::int64(), false, nullptr}, {2, "value", arrow::int64(), false, nullptr}},
+      {{1, "key", arrow::int64(), false, nullptr},
+       {2, "value", config.projected_binary_bytes > 0 ? arrow::binary() : arrow::int64(),
+        config.projected_binary_bytes > 0, nullptr}},
   };
   if (config.unprojected_binary_bytes > 0) {
     schema.fields.push_back({3, "unused_payload", arrow::binary(), false, nullptr});
@@ -122,8 +191,9 @@ arrow::Status GenerateSegment(const Options& config) {
                         sniffer::SegmentWriter::Open(config.generate_path, schema, layout));
   for (int64_t offset = 0; offset < config.rows; offset += kRowGroupRows) {
     const int64_t count = std::min<int64_t>(kRowGroupRows, config.rows - offset);
-    ARROW_ASSIGN_OR_RAISE(auto batch, MakeGeneratedBatch(arrow_schema, offset, count,
-                                                         config.unprojected_binary_bytes));
+    ARROW_ASSIGN_OR_RAISE(
+        auto batch, MakeGeneratedBatch(arrow_schema, offset, count, config.unprojected_binary_bytes,
+                                       config.projected_binary_bytes));
     ARROW_RETURN_NOT_OK(writer->Append(std::move(batch)));
   }
   return writer->Finish();
@@ -134,7 +204,9 @@ arrow::Status GenerateParquet(const Options& config, const std::string& path,
   ARROW_RETURN_NOT_OK(CheckNewPath(path));
   const sniffer::TableSchema schema{
       1,
-      {{1, "key", arrow::int64(), false, nullptr}, {2, "value", arrow::int64(), false, nullptr}},
+      {{1, "key", arrow::int64(), false, nullptr},
+       {2, "value", config.projected_binary_bytes > 0 ? arrow::binary() : arrow::int64(),
+        config.projected_binary_bytes > 0, nullptr}},
   };
   ARROW_ASSIGN_OR_RAISE(auto arrow_schema, schema.ToArrowSchema());
   ARROW_ASSIGN_OR_RAISE(auto output, arrow::io::FileOutputStream::Open(path));
@@ -149,7 +221,8 @@ arrow::Status GenerateParquet(const Options& config, const std::string& path,
                                          properties.build(), arrow_properties.build()));
   for (int64_t offset = 0; offset < config.rows; offset += kRowGroupRows) {
     const int64_t count = std::min<int64_t>(kRowGroupRows, config.rows - offset);
-    ARROW_ASSIGN_OR_RAISE(auto batch, MakeGeneratedBatch(arrow_schema, offset, count));
+    ARROW_ASSIGN_OR_RAISE(auto batch, MakeGeneratedBatch(arrow_schema, offset, count, 0,
+                                                         config.projected_binary_bytes));
     ARROW_RETURN_NOT_OK(writer->NewBufferedRowGroup());
     ARROW_RETURN_NOT_OK(writer->WriteRecordBatch(*batch));
   }
@@ -171,7 +244,11 @@ void ReaderOnlyScanImpl(benchmark::State& state, uint32_t workers) {
   plan.output_batch_rows = kOutputBatchRows;
   const uint64_t expected_rows = static_cast<uint64_t>(options.rows - options.rows / 2);
   {
-    auto checked = reader->Scan(plan);
+    sniffer::ScanExecutionOptions checked_execution;
+    checked_execution.worker_count = workers;
+    checked_execution.max_in_flight_row_groups = std::max<uint32_t>(workers, 2U);
+    checked_execution.max_buffered_bytes = options.buffered_budget_bytes;
+    auto checked = reader->Scan(plan, checked_execution);
     if (!checked.ok()) {
       state.SkipWithError(checked.status().ToString());
       return;
@@ -188,12 +265,11 @@ void ReaderOnlyScanImpl(benchmark::State& state, uint32_t workers) {
       if (!batch) {
         break;
       }
-      const auto& values = static_cast<const arrow::Int64Array&>(*batch->column(0));
-      for (int64_t row = 0; row < values.length(); ++row) {
-        if (values.IsNull(row) || values.Value(row) != expected_value++) {
-          state.SkipWithError("Sniffer scan differs from generated reference values");
-          return;
-        }
+      const auto status =
+          VerifyGeneratedValues(*batch->column(0), &expected_value, options.projected_binary_bytes);
+      if (!status.ok()) {
+        state.SkipWithError(status.ToString());
+        return;
       }
     }
     if (expected_value != options.rows) {
@@ -364,12 +440,8 @@ arrow::Result<ParquetMeasurement> ScanParquetOnce(parquet::arrow::FileReader* re
       }
       const auto values = batch->column(filter_boundary ? 1 : 0)->Slice(skip);
       if (verify_values) {
-        const auto& typed = static_cast<const arrow::Int64Array&>(*values);
-        for (int64_t row = 0; row < typed.length(); ++row) {
-          if (typed.IsNull(row) || typed.Value(row) != expected_value++) {
-            return arrow::Status::Invalid("Parquet scan differs from generated reference values");
-          }
-        }
+        ARROW_RETURN_NOT_OK(
+            VerifyGeneratedValues(*values, &expected_value, options.projected_binary_bytes));
       }
       measured.output_rows += static_cast<uint64_t>(values->length());
       benchmark::DoNotOptimize(values->data().get());
@@ -462,16 +534,12 @@ arrow::Result<uint64_t> ScanShard(sniffer::SegmentReader& reader, const sniffer:
       break;
     }
     if (validate_values) {
-      if (batch->num_columns() != 1 || batch->column(0)->type_id() != arrow::Type::INT64) {
-        return arrow::Status::TypeError("sharded scan expects one int64 projection column");
+      if (batch->num_columns() != 1) {
+        return arrow::Status::TypeError("sharded scan expects one projection column");
       }
-      const auto& values = static_cast<const arrow::Int64Array&>(*batch->column(0));
-      for (int64_t row = 0; row < batch->num_rows(); ++row) {
-        if (values.IsNull(row) ||
-            values.Value(row) != lower + static_cast<int64_t>(output_rows) + row) {
-          return arrow::Status::Invalid("sharded scan value or row-order mismatch");
-        }
-      }
+      int64_t expected_row = lower + static_cast<int64_t>(output_rows);
+      ARROW_RETURN_NOT_OK(
+          VerifyGeneratedValues(*batch->column(0), &expected_row, options.projected_binary_bytes));
     }
     output_rows += static_cast<uint64_t>(batch->num_rows());
     benchmark::DoNotOptimize(batch->column(0)->data().get());
@@ -596,6 +664,14 @@ int main(int argc, char** argv) {
         std::cerr << "invalid --unprojected-binary-bytes value\n";
         return 1;
       }
+    } else if (argument.starts_with("--projected-binary-bytes=")) {
+      const auto digits = argument.substr(std::string_view("--projected-binary-bytes=").size());
+      const auto [end, error] = std::from_chars(digits.data(), digits.data() + digits.size(),
+                                                options.projected_binary_bytes);
+      if (error != std::errc{} || end != digits.data() + digits.size()) {
+        std::cerr << "invalid --projected-binary-bytes value\n";
+        return 1;
+      }
     } else if (argument.starts_with("--buffer-budget-bytes=")) {
       const auto digits = argument.substr(std::string_view("--buffer-budget-bytes=").size());
       const auto [end, error] = std::from_chars(digits.data(), digits.data() + digits.size(),
@@ -615,12 +691,16 @@ int main(int argc, char** argv) {
   if (options.rows <= 0 || options.rows > 100000000 || mode_count != 1 ||
       options.unprojected_binary_bytes > 4096 ||
       (options.unprojected_binary_bytes > 0 && options.unprojected_binary_bytes < 20) ||
+      options.projected_binary_bytes > 4096 ||
+      (options.projected_binary_bytes > 0 && options.projected_binary_bytes < 20) ||
+      (options.unprojected_binary_bytes > 0 && options.projected_binary_bytes > 0) ||
       options.buffered_budget_bytes == 0 ||
       (options.unprojected_binary_bytes > 0 && options.generate_path.empty())) {
     std::cerr << "use 1 <= --rows=N <= 100000000 with exactly one of "
                  "--generate=PATH, --generate-parquet=PATH, "
                  "--generate-parquet-zstd=PATH or --segment=PATH; optional Segment-only "
-                 "--unprojected-binary-bytes=20..4096 and positive --buffer-budget-bytes=N\n";
+                 "--unprojected-binary-bytes=20..4096 (Segment generator only) or "
+                 "--projected-binary-bytes=20..4096; positive --buffer-budget-bytes=N\n";
     return 1;
   }
   if (!options.generate_path.empty()) {
@@ -658,6 +738,8 @@ int main(int argc, char** argv) {
   benchmark::AddCustomContext("output_batch_rows", std::to_string(kOutputBatchRows));
   benchmark::AddCustomContext("buffered_budget_bytes",
                               std::to_string(options.buffered_budget_bytes));
+  benchmark::AddCustomContext("projected_binary_bytes",
+                              std::to_string(options.projected_binary_bytes));
   benchmark::AddCustomContext(
       "query",
       "ReaderOnlyScan, BoundedParallelReaderScan and ParquetReaderOnlyScan: "

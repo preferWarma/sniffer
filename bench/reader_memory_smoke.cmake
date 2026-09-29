@@ -107,3 +107,45 @@ if(NOT "${scan_output}${scan_error}" MATCHES "ParquetReaderOnlyScan/Uncompressed
    "${scan_output}${scan_error}" MATCHES "ERROR OCCURRED")
   message(FATAL_ERROR "Parquet Reader-only benchmark did not complete: ${scan_output}${scan_error}")
 endif()
+
+set(binary_segment_path "${READER_MEMORY_TEST_DIR}/reader_memory_${memory_suffix}.binary.seg")
+set(binary_parquet_path "${READER_MEMORY_TEST_DIR}/reader_memory_${memory_suffix}.binary.parquet")
+set(binary_zstd_path "${READER_MEMORY_TEST_DIR}/reader_memory_${memory_suffix}.binary.zstd.parquet")
+foreach(binary_case IN ITEMS segment parquet zstd)
+  if(binary_case STREQUAL "segment")
+    set(binary_generate "--generate=${binary_segment_path}")
+  elseif(binary_case STREQUAL "parquet")
+    set(binary_generate "--generate-parquet=${binary_parquet_path}")
+  else()
+    set(binary_generate "--generate-parquet-zstd=${binary_zstd_path}")
+  endif()
+  execute_process(
+    COMMAND "${READER_MEMORY_EXE}" "${binary_generate}" --rows=16384
+            --projected-binary-bytes=128
+    RESULT_VARIABLE binary_generate_result
+    OUTPUT_VARIABLE binary_generate_output
+    ERROR_VARIABLE binary_generate_error
+  )
+  if(NOT binary_generate_result EQUAL 0)
+    file(REMOVE "${binary_segment_path}" "${binary_parquet_path}" "${binary_zstd_path}")
+    message(FATAL_ERROR "binary ${binary_case} generation failed: ${binary_generate_output}${binary_generate_error}")
+  endif()
+endforeach()
+
+execute_process(
+  COMMAND "${READER_MEMORY_EXE}" "--segment=${binary_segment_path}"
+          "--parquet=${binary_parquet_path}" "--parquet-zstd=${binary_zstd_path}"
+          --rows=16384 --projected-binary-bytes=128
+          "--benchmark_filter=^(ReaderOnlyScan|BoundedParallelReaderScan/4|ParquetReaderOnlyScan/Uncompressed|ParquetReaderOnlyScan/ZSTD)/real_time$"
+          --benchmark_dry_run
+  RESULT_VARIABLE binary_scan_result
+  OUTPUT_VARIABLE binary_scan_output
+  ERROR_VARIABLE binary_scan_error
+)
+file(REMOVE "${binary_segment_path}" "${binary_parquet_path}" "${binary_zstd_path}")
+if(NOT binary_scan_result EQUAL 0 OR
+   NOT "${binary_scan_output}${binary_scan_error}" MATCHES "parallel_workers_started=2" OR
+   NOT "${binary_scan_output}${binary_scan_error}" MATCHES "ParquetReaderOnlyScan/ZSTD" OR
+   "${binary_scan_output}${binary_scan_error}" MATCHES "ERROR OCCURRED")
+  message(FATAL_ERROR "binary projection scan failed: ${binary_scan_output}${binary_scan_error}")
+endif()
