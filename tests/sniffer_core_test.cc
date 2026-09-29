@@ -3090,6 +3090,118 @@ TEST(SnifferCoreTest, ConcurrentScansIsolatePrunedCorruptChunks) {
   EXPECT_NE(unpruned_error.find("[sniffer.format.checksum]"), std::string::npos);
 }
 
+TEST(SnifferCoreTest, ConcurrentParallelScansIsolateErrorsAndCancellation) {
+  const auto data = MakeScanBatch();
+  TempFile file("concurrent_parallel_corrupt_chunk.seg");
+  WriteSegmentWithPolicy(file.path(), data.table_schema, {data.batch}, ScanLayout());
+  auto bytes = ReadFile(file.path());
+  const size_t trailer_offset = bytes.size() - 40;
+  const size_t footer_offset = static_cast<size_t>(ReadU64(bytes, trailer_offset + 8));
+  const size_t footer_length = static_cast<size_t>(ReadU64(bytes, trailer_offset + 16));
+  const auto footer = ValueOrThrow(sniffer::internal::ParseFooter(std::span<const uint8_t>(
+                                       bytes.data() + footer_offset, footer_length)),
+                                   "parse concurrent parallel footer");
+  ASSERT_EQ(footer.row_groups.size(), 6U);
+  const auto& damaged = footer.row_groups.back().chunks[3];
+  ASSERT_LT(damaged.offset + 24U, bytes.size());
+  bytes[static_cast<size_t>(damaged.offset + 24U)] ^= 1U;
+  RefreshFooterChecksums(&bytes);
+  WriteFile(file.path(), bytes);
+  auto reader = ValueOrThrow(sniffer::SegmentReader::Open(file.path().string()),
+                             "open concurrent parallel corrupt segment");
+
+  sniffer::IOPlan pruned;
+  pruned.projection_field_ids = {4};
+  pruned.conjunctive_predicates = {
+      {1, sniffer::Predicate::Op::kLt, std::make_shared<arrow::Int64Scalar>(10)}};
+  pruned.output_batch_rows = 5;
+  sniffer::IOPlan unpruned;
+  unpruned.projection_field_ids = {4};
+  unpruned.output_batch_rows = 5;
+  auto limited = unpruned;
+  limited.limit = 5;
+  auto reference_metrics = std::make_shared<sniffer::ScanMetrics>();
+  const auto expected =
+      CollectScan(ValueOrThrow(reader->Scan(pruned, reference_metrics), "serial pruned reference"));
+  const uint64_t expected_chunks = reference_metrics->column_chunks_read;
+  const auto first_batch =
+      CollectScan(ValueOrThrow(reader->Scan(limited), "serial limited reference"));
+  ASSERT_EQ(first_batch.size(), 1U);
+
+  sniffer::ScanExecutionOptions options;
+  options.worker_count = 4;
+  options.max_in_flight_row_groups = 2;
+  options.max_buffered_bytes = 1U << 20U;
+  std::array<std::string, 4> errors;
+  std::barrier start(4);
+  std::vector<std::thread> callers;
+  for (size_t caller = 0; caller < errors.size(); ++caller) {
+    callers.emplace_back([&, caller] {
+      start.arrive_and_wait();
+      for (int repeat = 0; repeat < 16; ++repeat) {
+        const auto& plan = caller == 0 ? pruned : caller == 3 ? limited : unpruned;
+        auto metrics = std::make_shared<sniffer::ScanMetrics>();
+        auto created = reader->Scan(plan, options, metrics);
+        if (!created.ok()) {
+          errors[caller] = created.status().ToString();
+          return;
+        }
+        size_t emitted = 0;
+        bool saw_corruption = false;
+        {
+          auto iterator = std::move(created).ValueUnsafe();
+          while (true) {
+            auto next = iterator.Next();
+            if (!next.ok()) {
+              if (caller != 1 ||
+                  next.status().ToString().find("[sniffer.format.checksum]") == std::string::npos) {
+                errors[caller] = next.status().ToString();
+                return;
+              }
+              saw_corruption = true;
+              break;
+            }
+            auto batch = std::move(next).ValueUnsafe();
+            if (!batch) {
+              break;
+            }
+            if (caller == 0 && (emitted >= expected.size() || !batch->Equals(*expected[emitted]))) {
+              errors[caller] = "pruned parallel scan changed output";
+              return;
+            }
+            if ((caller == 2 || caller == 3) && (emitted != 0 || !batch->Equals(*first_batch[0]))) {
+              errors[caller] = "early parallel scan changed first batch";
+              return;
+            }
+            ++emitted;
+            if (caller == 2) {
+              break;  // Dropping the iterator cancels queued parallel work.
+            }
+          }
+        }
+        if ((caller == 0 && emitted != expected.size()) ||
+            (caller == 1 && (!saw_corruption || emitted != 5)) ||
+            ((caller == 2 || caller == 3) && emitted != 1) ||
+            (caller == 0 && metrics->column_chunks_read != expected_chunks) ||
+            (caller == 2 && metrics->column_chunks_read > 2) ||
+            (caller == 3 && metrics->parallel_workers_started != 0) ||
+            (caller != 3 && metrics->parallel_workers_started != 4) ||
+            (caller != 3 && metrics->parallel_peak_in_flight_row_groups > 2) ||
+            metrics->parallel_peak_reserved_bytes > options.max_buffered_bytes) {
+          errors[caller] = "parallel scan violated output, error, or budget contract";
+          return;
+        }
+      }
+    });
+  }
+  for (auto& caller : callers) {
+    caller.join();
+  }
+  for (const auto& error : errors) {
+    EXPECT_TRUE(error.empty()) << error;
+  }
+}
+
 TEST(SnifferCoreTest, WholeRowGroupScanRejectsOversizedRowCount) {
   const auto data = MakeScanBatch();
   TempFile file("oversized_whole_row_group.seg");
