@@ -947,3 +947,45 @@ Row Group 8,192、`key >= rows/2`、仅投影 `value`、输出 batch 4,096 的
 两次均使用 `--benchmark_min_time=0.05s`；100K 的前/后 scan CV 为
 0.85%/0.78%，10M 为 15.0%/1.67%。这是调度器前的结构准备，不是并行
 速度结论。若正式并行路径不能带来足够收益，需要重新权衡这一步的短请求成本。
+
+## 2026-09-29：单请求有界 Row Group 并行首版
+
+Apple M4（10 逻辑核）、AppleClang 21、Arrow C++ 23.0.1、Release `-O3`、
+warm-cache，使用上述已生成的两列递增 int64 Segment；Row Group 8,192，
+`key >= rows/2`，仅投影 `value`，输出 batch 4,096。`ReaderOnlyScan` 走原串行
+API；`BoundedParallelReaderScan/{2,4,8}` 是同一逻辑计划的单请求内部调度，
+最多 worker 数个在途 Row Group，64 MiB 估算预算。每个 case 独立进程，
+打开 Reader 不计时；创建 Scan、启动线程、读取、解码、拼接均计入 real time。
+本合成数据没有 null 或变长列，不能替代前述正确性矩阵。
+
+10M 行，7 次独立进程 case 的 real-time P50 与资源指标：
+
+| worker | P50 ms | CV | ColumnChunk / bytes | 进程 RSS 峰值 MB | Arrow pool 峰值 MB | 在途组 / 估算预留峰值 B |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 9.707 | 1.39% | 612 / 8,167,472 | 6.57 | 0.164 | 0 / 0 |
+| 2 | 8.346 | 6.02% | 612 / 8,167,472 | 8.40 | 0.295 | 2 / 794,816 |
+| 4 | 6.640 | 2.43% | 612 / 8,167,472 | 9.68 | 0.426 | 4 / 1,589,632 |
+| 8 | 7.891 | 1.50% | 612 / 8,167,472 | 13.03 | 0.688 | 8 / 3,179,264 |
+
+进一步在无其他构建/测试同时运行时，对串行和 4 worker 各取 20 次单次
+benchmark 样本，`--benchmark_min_time=0.05s`；P95 为排序后第 19 个样本：
+
+| 输入行数 | 串行 P50/P95 ms | 4 worker P50/P95 ms | 结论 |
+| ---: | ---: | ---: | --- |
+| 100,000 | 0.144/0.145 | 0.152/0.154 | 并行约慢 5%，短请求不应默认开启 |
+| 10,000,000 | 9.425/9.847 | 6.670/6.956 | 该数据上约 1.41× P50 提升，但 RSS 增加 |
+
+8 worker 比 4 worker 慢，说明解码并行之外已有调度、内存和线程开销；
+不能把 8-worker 应用层排序范围分片的约 3 ms 结果当作同等内部调度收益。
+这些指标是 warm-cache 合成输入；同计划 Parquet 单请求、cold-cache 和
+宽/变长列的 P50/P95/RSS 尚未补齐，不以此宣称通用格式优势。
+
+复现示例（将路径替换为由本 benchmark 的 `--generate=... --rows=...`
+生成、未覆盖的 Segment；每个 case 单独启动进程以测 RSS）：
+
+```sh
+./build-release/sniffer_core_reader_memory_benchmark \
+  --segment=/path/to/rows10m.seg --rows=10000000 \
+  '--benchmark_filter=^BoundedParallelReaderScan/4/real_time$' \
+  --benchmark_repetitions=20 --benchmark_min_time=0.05s --benchmark_format=csv
+```

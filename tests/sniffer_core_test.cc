@@ -2132,12 +2132,169 @@ TEST(SnifferCoreTest, DroppedScanAndLimitDoNotReadFutureCorruptRowGroup) {
   EXPECT_EQ(metrics->row_groups_considered, 1U);
   EXPECT_EQ(metrics->column_chunks_read, 1U);
 
+  sniffer::ScanExecutionOptions parallel_options;
+  parallel_options.worker_count = 4;
+  metrics = std::make_shared<sniffer::ScanMetrics>();
+  const auto limited_parallel = CollectScan(ValueOrThrow(
+      reader->Scan(plan, parallel_options, metrics), "parallel-options limit fallback"));
+  ASSERT_EQ(limited_parallel.size(), 1U);
+  EXPECT_EQ(metrics->parallel_workers_started, 0U);
+  EXPECT_EQ(metrics->row_groups_considered, 1U);
+  EXPECT_EQ(metrics->column_chunks_read, 1U);
+
   plan.limit.reset();
   auto iterator = ValueOrThrow(reader->Scan(plan), "create full scan of damaged segment");
   EXPECT_TRUE(iterator.Next().ok());
   const auto second = iterator.Next();
   EXPECT_FALSE(second.ok());
   EXPECT_NE(second.status().ToString().find("[sniffer.format.checksum]"), std::string::npos);
+}
+
+TEST(SnifferCoreTest, BoundedParallelScanMatchesSerialAndPreservesBatching) {
+  const auto data = MakeScanBatch();
+  for (const bool sorted : {true, false}) {
+    TempFile file(sorted ? "parallel_sorted.seg" : "parallel_unsorted.seg");
+    auto policy = ScanLayout();
+    if (!sorted) {
+      policy.sort_key_field_ids.clear();
+      policy.statistics_field_ids.clear();
+      policy.bloom_field_ids.clear();
+    }
+    WriteSegmentWithPolicy(file.path(), data.table_schema, {data.batch}, policy);
+    auto reader = ValueOrThrow(sniffer::SegmentReader::Open(file.path().string()),
+                               "open parallel parity segment");
+    std::vector<sniffer::IOPlan> plans(4);
+    plans[0].projection_field_ids = {4, 2, 1};
+    plans[0].output_batch_rows = 7;
+    plans[1].projection_field_ids = {4};
+    plans[1].conjunctive_predicates = {
+        {2, sniffer::Predicate::Op::kEq, std::make_shared<arrow::StringScalar>("even")},
+        {3, sniffer::Predicate::Op::kGe, std::make_shared<arrow::Int32Scalar>(100)}};
+    plans[1].output_batch_rows = 3;
+    plans[2].projection_field_ids = {};
+    plans[2].conjunctive_predicates = {
+        {1, sniffer::Predicate::Op::kGt, std::make_shared<arrow::Int64Scalar>(1000)}};
+    plans[2].output_batch_rows = 4;
+    plans[3].projection_field_ids = {3};
+    plans[3].conjunctive_predicates = {{3, sniffer::Predicate::Op::kIsNull, nullptr}};
+    plans[3].output_batch_rows = 4;
+    for (const auto& plan : plans) {
+      const auto reference = CollectScan(ValueOrThrow(reader->Scan(plan), "serial parity scan"));
+      for (const uint32_t workers : {1U, 2U, 4U, 8U}) {
+        sniffer::ScanExecutionOptions options;
+        options.worker_count = workers;
+        options.max_in_flight_row_groups = 3;
+        options.max_buffered_bytes = 1U << 20U;
+        auto metrics = std::make_shared<sniffer::ScanMetrics>();
+        auto iterator = ValueOrThrow(reader->Scan(plan, options, metrics), "parallel parity scan");
+        EXPECT_EQ(metrics->parallel_workers_started, 0U) << "workers start on first Next";
+        const auto actual = CollectScan(std::move(iterator));
+        ASSERT_EQ(actual.size(), reference.size());
+        for (size_t index = 0; index < actual.size(); ++index) {
+          EXPECT_TRUE(actual[index]->Equals(*reference[index]))
+              << "sorted=" << sorted << " workers=" << workers << " batch=" << index;
+        }
+        EXPECT_EQ(metrics->parallel_workers_started, workers == 1 ? 0U : std::min(workers, 6U));
+        EXPECT_EQ(metrics->parallel_row_groups_completed, workers == 1 ? 0U : 6U);
+        EXPECT_LE(metrics->parallel_peak_in_flight_row_groups, 3U);
+        EXPECT_LE(metrics->parallel_peak_reserved_bytes, options.max_buffered_bytes);
+      }
+    }
+  }
+}
+
+TEST(SnifferCoreTest, ParallelScanValidatesBudgetsAndLimitStaysSerial) {
+  const auto data = MakeScanBatch();
+  TempFile file("parallel_limit.seg");
+  WriteSegmentWithPolicy(file.path(), data.table_schema, {data.batch}, ScanLayout());
+  auto reader = ValueOrThrow(sniffer::SegmentReader::Open(file.path().string()),
+                             "open parallel limit segment");
+  sniffer::IOPlan plan;
+  plan.projection_field_ids = {4};
+  plan.output_batch_rows = 5;
+  sniffer::ScanExecutionOptions options;
+  options.worker_count = 0;
+  EXPECT_FALSE(reader->Scan(plan, options).ok());
+  options.worker_count = 2;
+  options.max_in_flight_row_groups = 0;
+  EXPECT_FALSE(reader->Scan(plan, options).ok());
+  options.max_in_flight_row_groups = 2;
+  options.max_buffered_bytes = 0;
+  EXPECT_FALSE(reader->Scan(plan, options).ok());
+  options.max_buffered_bytes = 1;
+  auto metrics = std::make_shared<sniffer::ScanMetrics>();
+  const auto small_budget = CollectScan(
+      ValueOrThrow(reader->Scan(plan, options, metrics), "small-budget serial fallback"));
+  EXPECT_EQ(metrics->parallel_workers_started, 0U);
+  EXPECT_EQ(small_budget.size(), 6U);
+  options.max_buffered_bytes = 1U << 20U;
+  plan.limit = 5;
+  metrics = std::make_shared<sniffer::ScanMetrics>();
+  const auto limited =
+      CollectScan(ValueOrThrow(reader->Scan(plan, options, metrics), "limited parallel fallback"));
+  ASSERT_EQ(limited.size(), 1U);
+  EXPECT_EQ(limited[0]->num_rows(), 5);
+  EXPECT_EQ(metrics->parallel_workers_started, 0U);
+  EXPECT_EQ(metrics->row_groups_considered, 1U);
+}
+
+TEST(SnifferCoreTest, ParallelScanReportsCandidateCorruptionInRowOrder) {
+  const auto data = MakeScanBatch();
+  TempFile file("parallel_corrupt_order.seg");
+  WriteSegmentWithPolicy(file.path(), data.table_schema, {data.batch}, ScanLayout());
+  auto bytes = ReadFile(file.path());
+  const size_t trailer_offset = bytes.size() - 40;
+  const size_t footer_offset = static_cast<size_t>(ReadU64(bytes, trailer_offset + 8));
+  const size_t footer_length = static_cast<size_t>(ReadU64(bytes, trailer_offset + 16));
+  const auto footer = ValueOrThrow(sniffer::internal::ParseFooter(std::span<const uint8_t>(
+                                       bytes.data() + footer_offset, footer_length)),
+                                   "parse parallel corruption footer");
+  for (const size_t index : {1U, 4U}) {
+    const auto& damaged = footer.row_groups[index].chunks[index == 1 ? 3 : 0];
+    ASSERT_LT(damaged.offset + 24U, bytes.size());
+    bytes[static_cast<size_t>(damaged.offset + 24U)] ^= 1U;
+  }
+  RefreshFooterChecksums(&bytes);
+  WriteFile(file.path(), bytes);
+  auto reader = ValueOrThrow(sniffer::SegmentReader::Open(file.path().string()),
+                             "open parallel corruption segment");
+  sniffer::IOPlan plan;
+  plan.projection_field_ids = {4, 1};
+  plan.output_batch_rows = 5;
+  sniffer::ScanExecutionOptions options;
+  options.worker_count = 4;
+  options.max_in_flight_row_groups = 3;
+  options.max_buffered_bytes = 1U << 20U;
+  auto metrics = std::make_shared<sniffer::ScanMetrics>();
+  auto iterator =
+      ValueOrThrow(reader->Scan(plan, options, metrics), "create corrupt parallel scan");
+  const auto first = ValueOrThrow(iterator.Next(), "read first ordered group");
+  ASSERT_NE(first, nullptr);
+  EXPECT_EQ(first->num_rows(), 5);
+  const auto second = iterator.Next();
+  ASSERT_FALSE(second.ok());
+  EXPECT_NE(second.status().ToString().find("[sniffer.format.checksum]"), std::string::npos);
+  EXPECT_NE(second.status().ToString().find("field 4"), std::string::npos)
+      << "the earlier Row Group error must win even if a later worker finishes first";
+  const auto repeated = iterator.Next();
+  ASSERT_FALSE(repeated.ok());
+  EXPECT_EQ(repeated.status().ToString(), second.status().ToString());
+  EXPECT_EQ(metrics->parallel_workers_started, 4U);
+  EXPECT_GE(metrics->parallel_row_groups_completed, 2U);
+  EXPECT_LE(metrics->parallel_row_groups_completed, 5U);
+
+  plan.conjunctive_predicates = {
+      {1, sniffer::Predicate::Op::kLt, std::make_shared<arrow::Int64Scalar>(5)}};
+  metrics = std::make_shared<sniffer::ScanMetrics>();
+  const auto pruned = CollectScan(
+      ValueOrThrow(reader->Scan(plan, options, metrics), "parallel prune corrupt groups"));
+  ASSERT_EQ(pruned.size(), 1U);
+  EXPECT_EQ(pruned[0]->num_rows(), 5);
+  EXPECT_EQ(metrics->row_groups_pruned, 5U);
+  {
+    auto dropped = ValueOrThrow(reader->Scan(plan, options), "drop unfinished parallel iterator");
+    ASSERT_TRUE(dropped.Next().ok());
+  }
 }
 
 TEST(SnifferCoreTest, InvalidChunkOffsetFailsOpen) {

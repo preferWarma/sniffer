@@ -7,9 +7,7 @@ option(SNIFFER_BUILD_BENCHMARK "Build sniffer-core benchmark" ON)
 option(SNIFFER_BUILD_FUZZ_SMOKE "Build standalone fuzz smoke" ON)
 option(SNIFFER_BUILD_EXAMPLES "Build sniffer-core examples" ON)
 
-if(SNIFFER_BUILD_TESTS OR SNIFFER_BUILD_BENCHMARK)
-  find_package(Threads REQUIRED)
-endif()
+find_package(Threads REQUIRED)
 
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(Arrow REQUIRED arrow)
@@ -77,7 +75,7 @@ target_include_directories(sniffer_core
   PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src
 )
-target_link_libraries(sniffer_core PUBLIC sniffer_arrow)
+target_link_libraries(sniffer_core PUBLIC sniffer_arrow Threads::Threads)
 
 if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
   target_compile_options(sniffer_core PRIVATE -Wall -Wextra -Wpedantic -Wconversion)
@@ -94,7 +92,13 @@ if(SNIFFER_BUILD_TESTS)
     target_compile_options(sniffer_core_tests PRIVATE -Wall -Wextra -Wpedantic -Wconversion)
   endif()
   include(GoogleTest)
-  gtest_discover_tests(sniffer_core_tests DISCOVERY_TIMEOUT 60)
+  set(SNIFFER_GTEST_DISCOVERY_ARGS DISCOVERY_TIMEOUT 60)
+  if(CMAKE_CXX_FLAGS MATCHES "fsanitize=thread")
+    # Arrow may use an unsanitized mimalloc backend; system allocations let
+    # ThreadSanitizer track buffer lifetimes across worker threads.
+    list(APPEND SNIFFER_GTEST_DISCOVERY_ARGS PROPERTIES ENVIRONMENT "ARROW_DEFAULT_MEMORY_POOL=system")
+  endif()
+  gtest_discover_tests(sniffer_core_tests ${SNIFFER_GTEST_DISCOVERY_ARGS})
 
   if(SNIFFER_BUILD_FUZZ_SMOKE)
     add_executable(sniffer_core_fuzz tests/sniffer_core_fuzz.cc)

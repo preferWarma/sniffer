@@ -231,15 +231,22 @@ SIMD、多级编码链和新压缩算法只有在标量路径完成剖析和优�
   - [x] 先以同一 Reader 的独立排序范围 Scan 做 1/2/4/8 worker 可行性 A/B：10M 行
         在整组 SortKey 证明优化后，单 worker 9.518 ms、8 worker 2.998 ms；100K 行则
         多 worker 均慢于普通单线程。此实验不是正式内部并行，不能勾选父项。
+  - [x] 新的 `Scan(IOPlan, ScanExecutionOptions, metrics)` 已按物理 Row Group 实现
+        opt-in、有界在途、保序输出；排序/无索引、nullable/binary、空结果、过滤与投影
+        分离、候选/剪枝损坏块、提前销毁及 `limit` 串行回退有回归。父项仍待
+        更宽数据分布和 Parquet/cold-cache 验收。
 - [ ] 线程数、任务粒度、在途 Row Group 数和内存预算由显式配置限制；提供单线程 fallback、
       错误/取消传播，不创建无上限异步任务。若需要新公共配置，先确定向后兼容的 API 语义。
   - [x] [`Decision 0005`](decisions/0005-bounded-parallel-scan.md) 已固定 opt-in 执行选项、
         Row Group 调度、预算、保序、`limit` 串行回退及销毁/错误契约；现有串行路径补了
-        “提前丢弃迭代器或命中 limit 不读后续损坏块”基线测试。调度器与 API 尚未实现。
+        “提前丢弃迭代器或命中 limit 不读后续损坏块”基线测试。调度器与 API
+        现已实现，默认旧接口仍为串行；预算为调度估计，不是 RSS 保证。
 - [ ] 增加 1/2/4/8 线程吞吐、单请求延迟、峰值 RSS 和分配量 benchmark；并发多查询与单查询
       内部并行分别报告，在相同硬件、数据、Row Group、选择率与线程预算下对照 Parquet。
   - [x] 多查询 1/2/4/8 线程的 Sniffer 共享/独立 Reader、Parquet 无 codec 压缩/ZSTD
-        对照已测；逐值验证 Parquet 结果。单请求内部并行、RSS 和分配量仍未测。
+        对照已测；逐值验证 Parquet 结果。单请求内部并行的 100K/10M 同计划
+        Reader-only P50/P95、RSS、Arrow pool 峰值和读取量已测，见 benchmark 记录；
+        同条件 Parquet 单请求和 cold-cache 仍未测。
 
 ### 8.3 可选向量化（P3）
 
@@ -276,6 +283,22 @@ SIMD、多级编码链和新压缩算法只有在标量路径完成剖析和优�
 - [x] 更新 README 的性能状态，不把合成 benchmark 结果表述为通用生产性能。
 
 ## 11. 执行记录
+
+### 2026-09-29：单请求有界并行扫描首版
+
+新增 `ScanExecutionOptions`：默认旧接口仍串行；显式 worker 数大于 1、无
+`limit` 且 Row Group 估算可放入预算时，首次 `Next()` 才启动 worker。按物理
+Row Group 有界调度、保序取回并沿用原 batch 拼接；`limit`、单组和预算过小
+走串行。每个 worker 的 `ScanMetrics` 独立，主线程汇总；提前丢弃或错误后
+停止分派并 join。完成但未输出的预取工作仍计入实际 I/O 指标。新增 in-flight
+组数与预留字节峰值指标；预算是保守调度估计，非进程 RSS 硬上限。
+
+Release 与 ASan+UBSan 全量 94/94 通过。Apple Arrow 23 静态库默认 mimalloc
+未用 TSan 插桩，默认分配池下出现地址回收的 TSan 报警；TSan 构建的 CTest
+改用 Arrow system memory pool，定向用例连续 20 次及全量 76/76 通过。
+详细 100K/10M、1/2/4/8 worker 数据见
+[`bench/BENCHMARK_V2.md`](../bench/BENCHMARK_V2.md)。该路径仍是显式 opt-in，
+Parquet 同计划单请求和 cold-cache 尚未验收，v0.2 未收尾完成。
 
 ### 2026-09-28：按物理 Row Group 的处理单元
 

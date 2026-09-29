@@ -91,7 +91,7 @@ arrow::Status GenerateSegment(const Options& config) {
   return writer->Finish();
 }
 
-void ReaderOnlyScan(benchmark::State& state) {
+void ReaderOnlyScanImpl(benchmark::State& state, uint32_t workers) {
   auto maybe_reader = sniffer::SegmentReader::Open(options.segment_path);
   if (!maybe_reader.ok()) {
     state.SkipWithError(maybe_reader.status().ToString());
@@ -105,9 +105,15 @@ void ReaderOnlyScan(benchmark::State& state) {
   plan.output_batch_rows = kOutputBatchRows;
   const uint64_t expected_rows = static_cast<uint64_t>(options.rows - options.rows / 2);
   sniffer::ScanMetrics totals;
+  uint64_t peak_in_flight = 0;
+  uint64_t peak_reserved_bytes = 0;
   for (auto _ : state) {
     auto metrics = std::make_shared<sniffer::ScanMetrics>();
-    auto maybe_iterator = reader->Scan(plan, metrics);
+    sniffer::ScanExecutionOptions execution;
+    execution.worker_count = workers;
+    execution.max_in_flight_row_groups = std::max<uint32_t>(workers, 2U);
+    execution.max_buffered_bytes = 64U * 1024U * 1024U;
+    auto maybe_iterator = reader->Scan(plan, execution, metrics);
     if (!maybe_iterator.ok()) {
       state.SkipWithError(maybe_iterator.status().ToString());
       return;
@@ -140,6 +146,8 @@ void ReaderOnlyScan(benchmark::State& state) {
     totals.predicate_nanoseconds += metrics->predicate_nanoseconds;
     totals.projection_nanoseconds += metrics->projection_nanoseconds;
     totals.batch_materialization_nanoseconds += metrics->batch_materialization_nanoseconds;
+    peak_in_flight = std::max(peak_in_flight, metrics->parallel_peak_in_flight_row_groups);
+    peak_reserved_bytes = std::max(peak_reserved_bytes, metrics->parallel_peak_reserved_bytes);
   }
   std::error_code file_error;
   const uint64_t file_bytes = std::filesystem::file_size(options.segment_path, file_error);
@@ -151,6 +159,9 @@ void ReaderOnlyScan(benchmark::State& state) {
   state.counters["output_rows"] = static_cast<double>(expected_rows);
   state.counters["file_bytes"] = static_cast<double>(file_bytes);
   state.counters["row_groups"] = static_cast<double>(reader->num_row_groups());
+  state.counters["workers"] = static_cast<double>(workers);
+  state.counters["parallel_peak_in_flight"] = static_cast<double>(peak_in_flight);
+  state.counters["parallel_peak_reserved_bytes"] = static_cast<double>(peak_reserved_bytes);
   const auto per_scan = [&state](const char* name, uint64_t count) {
     state.counters[name] = static_cast<double>(count) / static_cast<double>(state.iterations());
   };
@@ -170,7 +181,19 @@ void ReaderOnlyScan(benchmark::State& state) {
   state.SetItemsProcessed(state.iterations() * static_cast<int64_t>(expected_rows));
 }
 
+void ReaderOnlyScan(benchmark::State& state) { ReaderOnlyScanImpl(state, 1); }
+
+void BoundedParallelReaderScan(benchmark::State& state) {
+  ReaderOnlyScanImpl(state, static_cast<uint32_t>(state.range(0)));
+}
+
 BENCHMARK(ReaderOnlyScan)->UseRealTime()->Unit(benchmark::kMillisecond);
+BENCHMARK(BoundedParallelReaderScan)
+    ->Arg(2)
+    ->Arg(4)
+    ->Arg(8)
+    ->UseRealTime()
+    ->Unit(benchmark::kMillisecond);
 
 sniffer::IOPlan ShardPlan(int64_t lower, int64_t upper) {
   sniffer::IOPlan plan;
@@ -336,10 +359,10 @@ int main(int argc, char** argv) {
   benchmark::AddCustomContext("scope", "fresh_process_reader_only_no_writer_or_input_batch");
   benchmark::AddCustomContext("row_group_rows", std::to_string(kRowGroupRows));
   benchmark::AddCustomContext("output_batch_rows", std::to_string(kOutputBatchRows));
-  benchmark::AddCustomContext(
-      "query",
-      "ReaderOnlyScan: key >= rows/2; ShardedSortRangeScan: partition sort-key range "
-      "[rows/2,rows); project value");
+  benchmark::AddCustomContext("query",
+                              "ReaderOnlyScan and BoundedParallelReaderScan: key >= rows/2; "
+                              "ShardedSortRangeScan: partition sort-key range "
+                              "[rows/2,rows); project value");
   int benchmark_argc = static_cast<int>(benchmark_args.size());
   benchmark::Initialize(&benchmark_argc, benchmark_args.data());
   if (benchmark::ReportUnrecognizedArguments(benchmark_argc, benchmark_args.data())) {

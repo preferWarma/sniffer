@@ -4,11 +4,15 @@
 #include <array>
 #include <bit>
 #include <cmath>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <deque>
+#include <exception>
 #include <fstream>
+#include <functional>
 #include <limits>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <numeric>
@@ -16,6 +20,7 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <type_traits>
 #include <unordered_set>
 #include <utility>
@@ -1470,15 +1475,18 @@ class ScanState {
     if (plan_.limit) {
       target_rows = std::min<uint64_t>(target_rows, *plan_.limit - produced_);
     }
-    while (buffered_rows_ < target_rows && next_row_group_ < footer_.row_groups.size()) {
+    while (buffered_rows_ < target_rows && !exhausted_) {
       uint64_t remaining_limit = std::numeric_limits<uint64_t>::max();
       if (plan_.limit) {
         remaining_limit = *plan_.limit - produced_ - buffered_rows_;
       }
-      ARROW_ASSIGN_OR_RAISE(auto batch, ReadNextMatchingRowGroup(remaining_limit));
+      ARROW_ASSIGN_OR_RAISE(auto batch, next_group_ ? next_group_(remaining_limit)
+                                                    : ReadNextMatchingRowGroup(remaining_limit));
       if (batch) {
         buffered_rows_ += static_cast<uint64_t>(batch->num_rows());
         buffered_.push_back(std::move(batch));
+      } else {
+        exhausted_ = true;
       }
     }
     if (buffered_rows_ == 0) {
@@ -1701,6 +1709,11 @@ class ScanState {
     return batch;
   }
 
+  void SetNextGroup(
+      std::function<arrow::Result<std::shared_ptr<arrow::RecordBatch>>(uint64_t)> fn) {
+    next_group_ = std::move(fn);
+  }
+
  private:
   arrow::Result<std::vector<uint8_t>> ReadChunk(const internal::ColumnChunkMeta& chunk) {
     std::vector<uint8_t> payload;
@@ -1872,6 +1885,220 @@ class ScanState {
   uint64_t buffered_rows_ = 0;
   int64_t buffered_front_offset_ = 0;
   uint64_t produced_ = 0;
+  bool exhausted_ = false;
+  std::function<arrow::Result<std::shared_ptr<arrow::RecordBatch>>(uint64_t)> next_group_;
+};
+
+void AddScanMetrics(ScanMetrics* destination, const ScanMetrics& source) {
+#define SNIFFER_ADD_SCAN_METRIC(name) destination->name += source.name
+  SNIFFER_ADD_SCAN_METRIC(row_groups_considered);
+  SNIFFER_ADD_SCAN_METRIC(row_groups_pruned);
+  SNIFFER_ADD_SCAN_METRIC(column_chunks_read);
+  SNIFFER_ADD_SCAN_METRIC(predicate_chunks_decoded);
+  SNIFFER_ADD_SCAN_METRIC(projection_chunks_decoded);
+  SNIFFER_ADD_SCAN_METRIC(chunk_bytes_read);
+  SNIFFER_ADD_SCAN_METRIC(predicate_chunk_bytes_read);
+  SNIFFER_ADD_SCAN_METRIC(projection_chunk_bytes_read);
+  SNIFFER_ADD_SCAN_METRIC(predicate_rows_decoded);
+  SNIFFER_ADD_SCAN_METRIC(projection_rows_materialized);
+  SNIFFER_ADD_SCAN_METRIC(selection_rows_examined);
+  SNIFFER_ADD_SCAN_METRIC(selection_indices_materialized);
+  SNIFFER_ADD_SCAN_METRIC(pruning_nanoseconds);
+  SNIFFER_ADD_SCAN_METRIC(chunk_io_nanoseconds);
+  SNIFFER_ADD_SCAN_METRIC(chunk_checksum_nanoseconds);
+  SNIFFER_ADD_SCAN_METRIC(decode_nanoseconds);
+  SNIFFER_ADD_SCAN_METRIC(predicate_nanoseconds);
+  SNIFFER_ADD_SCAN_METRIC(projection_nanoseconds);
+  SNIFFER_ADD_SCAN_METRIC(batch_materialization_nanoseconds);
+#undef SNIFFER_ADD_SCAN_METRIC
+}
+
+class ParallelScanCoordinator {
+ public:
+  ParallelScanCoordinator(std::shared_ptr<RandomAccessFile> file, internal::FooterData footer,
+                          std::vector<internal::RowGroupIndex> indexes, IOPlan plan,
+                          ResolvedScanPlan resolved_plan, std::shared_ptr<arrow::Schema> schema,
+                          std::shared_ptr<ScanMetrics> metrics, ScanExecutionOptions options,
+                          std::vector<uint64_t> estimates)
+      : file_(std::move(file)),
+        footer_(std::move(footer)),
+        indexes_(std::move(indexes)),
+        plan_(std::move(plan)),
+        resolved_plan_(std::move(resolved_plan)),
+        schema_(std::move(schema)),
+        metrics_(std::move(metrics)),
+        options_(options),
+        estimates_(std::move(estimates)) {}
+
+  ~ParallelScanCoordinator() { StopAndJoin(); }
+
+  arrow::Result<std::shared_ptr<arrow::RecordBatch>> NextGroup(uint64_t) {
+    if (terminal_error_) {
+      return *terminal_error_;
+    }
+    ARROW_RETURN_NOT_OK(Start());
+    while (next_to_emit_ < estimates_.size()) {
+      std::unique_lock<std::mutex> lock(mutex_);
+      cv_.wait(lock, [&] { return completed_.contains(next_to_emit_) || fatal_.has_value(); });
+      if (fatal_) {
+        terminal_error_ = *fatal_;
+        lock.unlock();
+        StopAndJoin();
+        return *terminal_error_;
+      }
+      auto position = completed_.find(next_to_emit_);
+      Completed item = std::move(position->second);
+      completed_.erase(position);
+      reserved_bytes_ -= estimates_[next_to_emit_];
+      ++next_to_emit_;
+      lock.unlock();
+      cv_.notify_all();
+      AddScanMetrics(metrics_.get(), item.metrics);
+      ++metrics_->parallel_row_groups_completed;
+      if (!item.result.ok()) {
+        terminal_error_ = item.result.status();
+        StopAndJoin();
+        return *terminal_error_;
+      }
+      auto batch = std::move(item.result).ValueUnsafe();
+      if (batch) {
+        return batch;
+      }
+    }
+    StopAndJoin();
+    return std::shared_ptr<arrow::RecordBatch>();
+  }
+
+ private:
+  struct Completed {
+    arrow::Result<std::shared_ptr<arrow::RecordBatch>> result;
+    ScanMetrics metrics;
+  };
+
+  arrow::Status Start() {
+    if (started_) {
+      return terminal_error_.value_or(arrow::Status::OK());
+    }
+    started_ = true;
+    try {
+      workers_.reserve(options_.worker_count);
+      for (uint32_t worker = 0; worker < options_.worker_count; ++worker) {
+        workers_.emplace_back([this] {
+          try {
+            WorkerLoop();
+          } catch (const std::exception& error) {
+            FailWorker(
+                arrow::Status::IOError("[sniffer.scan.parallel] worker failed: ", error.what()));
+          } catch (...) {
+            FailWorker(arrow::Status::IOError("[sniffer.scan.parallel] worker failed"));
+          }
+        });
+        ++metrics_->parallel_workers_started;
+      }
+    } catch (const std::exception& error) {
+      terminal_error_ =
+          arrow::Status::IOError("[sniffer.scan.parallel] cannot start worker: ", error.what());
+      StopAndJoin();
+      return *terminal_error_;
+    }
+    return arrow::Status::OK();
+  }
+
+  void StopAndJoin() {
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      stopped_ = true;
+    }
+    cv_.notify_all();
+    for (auto& worker : workers_) {
+      if (worker.joinable()) {
+        worker.join();
+      }
+    }
+    workers_.clear();
+    // Prefetched work may have read chunks even if the caller stopped early.
+    // Include those completed tasks so I/O metrics describe actual work.
+    for (const auto& [index, item] : completed_) {
+      (void)index;
+      AddScanMetrics(metrics_.get(), item.metrics);
+      ++metrics_->parallel_row_groups_completed;
+    }
+    completed_.clear();
+    metrics_->parallel_peak_in_flight_row_groups = peak_in_flight_;
+    metrics_->parallel_peak_reserved_bytes = peak_reserved_bytes_;
+  }
+
+  void WorkerLoop() {
+    auto worker_metrics = std::make_shared<ScanMetrics>();
+    ScanState state(file_, footer_, indexes_, plan_, resolved_plan_, worker_metrics, schema_);
+    for (;;) {
+      size_t index = 0;
+      {
+        std::unique_lock<std::mutex> lock(mutex_);
+        cv_.wait(lock, [&] {
+          return stopped_ || next_to_dispatch_ == estimates_.size() ||
+                 (next_to_dispatch_ - next_to_emit_ < options_.max_in_flight_row_groups &&
+                  estimates_[next_to_dispatch_] <= options_.max_buffered_bytes - reserved_bytes_);
+        });
+        if (stopped_ || next_to_dispatch_ == estimates_.size()) {
+          return;
+        }
+        index = next_to_dispatch_++;
+        reserved_bytes_ += estimates_[index];
+        peak_in_flight_ = std::max(peak_in_flight_, next_to_dispatch_ - next_to_emit_);
+        peak_reserved_bytes_ = std::max(peak_reserved_bytes_, reserved_bytes_);
+      }
+      auto result = arrow::Result<std::shared_ptr<arrow::RecordBatch>>(
+          arrow::Status::UnknownError("parallel Row Group was not processed"));
+      *worker_metrics = {};
+      try {
+        result = state.ReadRowGroupAt(index, std::numeric_limits<uint64_t>::max());
+      } catch (const std::exception& error) {
+        result = arrow::Status::IOError("[sniffer.scan.parallel] worker failed: ", error.what());
+      } catch (...) {
+        result = arrow::Status::IOError("[sniffer.scan.parallel] worker failed");
+      }
+      {
+        std::lock_guard<std::mutex> lock(mutex_);
+        completed_.emplace(index, Completed{std::move(result), *worker_metrics});
+      }
+      cv_.notify_all();
+    }
+  }
+
+  void FailWorker(arrow::Status status) {
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      if (!fatal_) {
+        fatal_ = std::move(status);
+      }
+      stopped_ = true;
+    }
+    cv_.notify_all();
+  }
+
+  std::shared_ptr<RandomAccessFile> file_;
+  internal::FooterData footer_;
+  std::vector<internal::RowGroupIndex> indexes_;
+  IOPlan plan_;
+  ResolvedScanPlan resolved_plan_;
+  std::shared_ptr<arrow::Schema> schema_;
+  std::shared_ptr<ScanMetrics> metrics_;
+  ScanExecutionOptions options_;
+  std::vector<uint64_t> estimates_;
+  std::mutex mutex_;
+  std::condition_variable cv_;
+  std::map<size_t, Completed> completed_;
+  std::vector<std::thread> workers_;
+  size_t next_to_dispatch_ = 0;
+  size_t next_to_emit_ = 0;
+  uint64_t reserved_bytes_ = 0;
+  size_t peak_in_flight_ = 0;
+  uint64_t peak_reserved_bytes_ = 0;
+  bool started_ = false;
+  bool stopped_ = false;
+  std::optional<arrow::Status> fatal_;
+  std::optional<arrow::Status> terminal_error_;
 };
 
 class SegmentReader::Impl {
@@ -2036,6 +2263,15 @@ class SegmentReader::Impl {
 
   arrow::Result<arrow::RecordBatchIterator> Scan(IOPlan plan,
                                                  std::shared_ptr<ScanMetrics> metrics) const {
+    return Scan(std::move(plan), ScanExecutionOptions{}, std::move(metrics));
+  }
+
+  arrow::Result<arrow::RecordBatchIterator> Scan(IOPlan plan, ScanExecutionOptions options,
+                                                 std::shared_ptr<ScanMetrics> metrics) const {
+    if (options.worker_count == 0 || options.worker_count > 64 ||
+        options.max_in_flight_row_groups == 0 || options.max_buffered_bytes == 0) {
+      return arrow::Status::Invalid("[sniffer.scan.parallel] invalid execution budget");
+    }
     ARROW_ASSIGN_OR_RAISE(auto resolved_plan, ValidatePlan(footer_, plan));
     if (!metrics) {
       metrics = std::make_shared<ScanMetrics>();
@@ -2049,9 +2285,40 @@ class SegmentReader::Impl {
       projected_fields.push_back(full_schema->field(static_cast<int>(field_index)));
     }
     auto output_schema = arrow::schema(std::move(projected_fields), full_schema->metadata());
+    std::shared_ptr<ParallelScanCoordinator> coordinator;
+    if (options.worker_count > 1 && !plan.limit && footer_.row_groups.size() > 1) {
+      options.worker_count =
+          static_cast<uint32_t>(std::min<size_t>(options.worker_count, footer_.row_groups.size()));
+      std::vector<uint64_t> estimates;
+      estimates.reserve(footer_.row_groups.size());
+      bool within_budget = true;
+      for (const auto& row_group : footer_.row_groups) {
+        ARROW_ASSIGN_OR_RAISE(auto estimate,
+                              internal::CheckedMultiply(row_group.row_count, uint64_t{16}));
+        ARROW_ASSIGN_OR_RAISE(estimate, internal::CheckedAdd(estimate, uint64_t{4096}));
+        for (const auto& chunk : row_group.chunks) {
+          // Include both decoded filter inputs and a potentially copied projected output.
+          ARROW_ASSIGN_OR_RAISE(auto column_bytes,
+                                internal::CheckedMultiply(chunk.uncompressed_length, uint64_t{2}));
+          ARROW_ASSIGN_OR_RAISE(estimate, internal::CheckedAdd(estimate, column_bytes));
+        }
+        within_budget &= estimate <= options.max_buffered_bytes;
+        estimates.push_back(estimate);
+      }
+      if (within_budget) {
+        coordinator = std::make_shared<ParallelScanCoordinator>(
+            file_, footer_, indexes_, plan, resolved_plan, output_schema, metrics, options,
+            std::move(estimates));
+      }
+    }
     auto state = std::make_shared<ScanState>(file_, footer_, indexes_, std::move(plan),
                                              std::move(resolved_plan), std::move(metrics),
                                              std::move(output_schema));
+    if (coordinator) {
+      state->SetNextGroup([coordinator](uint64_t remaining_limit) {
+        return coordinator->NextGroup(remaining_limit);
+      });
+    }
     return arrow::MakeFunctionIterator(
         [state]() -> arrow::Result<std::shared_ptr<arrow::RecordBatch>> { return state->Next(); });
   }
@@ -2195,6 +2462,11 @@ arrow::Result<std::vector<std::shared_ptr<arrow::RecordBatch>>> SegmentReader::R
 arrow::Result<arrow::RecordBatchIterator> SegmentReader::Scan(
     IOPlan plan, std::shared_ptr<ScanMetrics> metrics) const {
   return impl_->Scan(std::move(plan), std::move(metrics));
+}
+
+arrow::Result<arrow::RecordBatchIterator> SegmentReader::Scan(
+    IOPlan plan, ScanExecutionOptions options, std::shared_ptr<ScanMetrics> metrics) const {
+  return impl_->Scan(std::move(plan), options, std::move(metrics));
 }
 
 arrow::Status SegmentReader::VerifyFileChecksum() const { return impl_->VerifyFileChecksum(); }

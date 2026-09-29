@@ -163,8 +163,21 @@ plan.output_batch_rows = 4096;
 
 auto metrics = std::make_shared<sniffer::ScanMetrics>();
 ARROW_ASSIGN_OR_RAISE(auto reader, sniffer::SegmentReader::Open("data.seg"));
-ARROW_ASSIGN_OR_RAISE(auto batches, reader->Scan(std::move(plan), metrics));
+ARROW_ASSIGN_OR_RAISE(auto batches, reader->Scan(plan, metrics));
 ```
+
+单请求 Row Group 并行是显式 opt-in，原 `Scan` 仍为串行：
+
+```cpp
+sniffer::ScanExecutionOptions execution;
+execution.worker_count = 4;
+execution.max_in_flight_row_groups = 4;
+execution.max_buffered_bytes = 64U * 1024U * 1024U;
+ARROW_ASSIGN_OR_RAISE(auto batches, reader->Scan(plan, execution, metrics));
+```
+
+含 `limit` 的计划和估算超预算的 Row Group 会退回串行。字节预算约束调度估算，
+不是进程 RSS 硬上限；在短请求上并行可能更慢。
 
 公共头文件位于 [`include/sniffer`](include/sniffer)。完整、可运行代码以
 [`example/example.cpp`](example/example.cpp) 为准。
@@ -237,8 +250,9 @@ sniffer_mem_dir=$(mktemp -d)
 更大文件应另起生成进程，再以新的扫描进程复测；进程 RSS 包含 Reader
 及库初始化，Arrow pool 峰值不包含非 Arrow 分配。方法与结果见
 [`bench/BENCHMARK_V2.md`](bench/BENCHMARK_V2.md)。
-同一可执行文件还提供实验性的 `ShardedSortRangeScan/{1,2,4,8}`：以多个独立
-Scan 分片一个逻辑范围查询，只用于估算并行潜力，不代表 Reader 已实现内部并行。
+同一可执行文件还提供 `BoundedParallelReaderScan/{2,4,8}` 的单请求内部并行
+对照，以及实验性的 `ShardedSortRangeScan/{1,2,4,8}` 应用层范围分片上界；
+两者不是同一执行路径，见 [v0.2 基准记录](bench/BENCHMARK_V2.md)。
 
 性能 benchmark 的 Sniffer 结果还包含 phase counters：writer 的索引、编码选择、编码、checksum
 与文件写入，以及 reader 的元数据、chunk I/O/checksum、解码、谓词、投影和 batch materialization。

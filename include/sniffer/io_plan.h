@@ -33,6 +33,10 @@ struct IOPlan {
 };
 
 struct ScanMetrics {
+  uint64_t parallel_workers_started = 0;
+  uint64_t parallel_row_groups_completed = 0;
+  uint64_t parallel_peak_in_flight_row_groups = 0;
+  uint64_t parallel_peak_reserved_bytes = 0;
   uint64_t row_groups_considered = 0;
   uint64_t row_groups_pruned = 0;
   uint64_t column_chunks_read = 0;

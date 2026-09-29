@@ -1,6 +1,6 @@
 # Decision 0005: Opt-in, bounded parallel Scan execution
 
-- Status: Accepted for v0.2 implementation; no parallel Reader API exists yet
+- Status: Implemented as opt-in v0.2 path; acceptance matrix remains open
 - Date: 2026-09-28
 
 ## Context
@@ -55,5 +55,10 @@ whole file. `IOPlan` v0.1 is intentionally limited to logical query semantics.
 
 The first implementation may be faster only for large scans and may use more memory proportional
 to its explicit worker/in-flight budgets. The existing API and file bytes remain unchanged.
-Until the acceptance checks pass, this record is an execution contract, **not** a claim that
-single-request parallel Scan is implemented or that v0.2 is complete.
+The optional `Scan(IOPlan, ScanExecutionOptions, metrics)` overload now implements this
+contract for no-limit plans. Oversize Row Groups and plans with `limit` use the serial path;
+the original overload remains serial. The scheduler bounds in-flight Row Groups and reserves
+conservative bytes based on twice the uncompressed chunk lengths plus row overhead; this is
+not an exact Arrow allocation/RSS ceiling. Correctness, corruption, cancellation, and TSan
+tests cover the first implementation. Same-plan Parquet, cold-cache, and broader data-shape
+comparisons remain before v0.2 can be called complete.

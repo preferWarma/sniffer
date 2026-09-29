@@ -13,6 +13,13 @@
 
 namespace sniffer {
 
+struct ScanExecutionOptions {
+  uint32_t worker_count = 1;
+  uint32_t max_in_flight_row_groups = 4;
+  // Budget for conservative Row Group scheduling estimates, not a process RSS cap.
+  uint64_t max_buffered_bytes = 64U * 1024U * 1024U;
+};
+
 struct ReaderMetrics {
   uint64_t file_handles_opened = 0;
   uint64_t envelope_io_nanoseconds = 0;
@@ -45,6 +52,10 @@ class SegmentReader {
   // Each Scan iterator owns its execution state and outlives Reader destruction.
   [[nodiscard]] arrow::Result<arrow::RecordBatchIterator> Scan(
       IOPlan plan, std::shared_ptr<ScanMetrics> metrics = nullptr) const;
+  // Opt-in parallel execution; plans with limit retain serial early-stop semantics.
+  [[nodiscard]] arrow::Result<arrow::RecordBatchIterator> Scan(
+      IOPlan plan, ScanExecutionOptions options,
+      std::shared_ptr<ScanMetrics> metrics = nullptr) const;
   [[nodiscard]] arrow::Status VerifyFileChecksum() const;
 
  private:
