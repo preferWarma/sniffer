@@ -70,9 +70,10 @@ std::string BinaryValue(int64_t row, uint32_t width) {
   return value;
 }
 
-std::string ProjectedBinaryValue(int64_t row, uint32_t width) {
+std::string ProjectedBinaryValue(int64_t row, uint32_t width, uint32_t projection = 0) {
   std::string value(width, '\0');
-  uint64_t state = static_cast<uint64_t>(row);
+  uint64_t state =
+      static_cast<uint64_t>(row) ^ (static_cast<uint64_t>(projection) * 0xD6E8FEB86659FD93ULL);
   for (uint32_t index = 0; index < width; ++index) {
     state += 0x9E3779B97F4A7C15ULL;
     uint64_t sample = state;
@@ -85,7 +86,7 @@ std::string ProjectedBinaryValue(int64_t row, uint32_t width) {
 }
 
 arrow::Status VerifyGeneratedValues(const arrow::Array& values, int64_t* expected_row,
-                                    uint32_t projected_binary_bytes) {
+                                    uint32_t projected_binary_bytes, uint32_t projection = 0) {
   if (projected_binary_bytes > 0) {
     if (values.type_id() != arrow::Type::BINARY) {
       return arrow::Status::Invalid("generated benchmark expected binary values");
@@ -98,7 +99,7 @@ arrow::Status VerifyGeneratedValues(const arrow::Array& values, int64_t* expecte
         }
       } else if (binary.IsNull(row) ||
                  binary.GetView(row) !=
-                     ProjectedBinaryValue(*expected_row, projected_binary_bytes)) {
+                     ProjectedBinaryValue(*expected_row, projected_binary_bytes, projection)) {
         return arrow::Status::Invalid("generated benchmark binary value mismatch");
       }
     }
@@ -130,6 +131,12 @@ arrow::Status VerifyGeneratedProjection(const arrow::RecordBatch& batch, int64_t
                                             options.projected_binary_bytes));
   for (uint32_t projection = 1; projection < options.projected_columns; ++projection) {
     const auto values = batch.column(first_column + static_cast<int>(projection))->Slice(skip);
+    if (options.projected_binary_bytes > 0) {
+      int64_t expected = first_row;
+      ARROW_RETURN_NOT_OK(
+          VerifyGeneratedValues(*values, &expected, options.projected_binary_bytes, projection));
+      continue;
+    }
     if (values->type_id() != arrow::Type::INT64) {
       return arrow::Status::Invalid("generated benchmark expected int64 extra column");
     }
@@ -176,6 +183,22 @@ arrow::Result<std::shared_ptr<arrow::RecordBatch>> MakeGeneratedBatch(
   }
   std::vector<std::shared_ptr<arrow::Array>> columns = {std::move(key), std::move(value)};
   for (uint32_t projection = 1; projection < projected_columns; ++projection) {
+    if (projected_binary_bytes > 0) {
+      arrow::BinaryBuilder extra_builder;
+      for (int64_t row = 0; row < count; ++row) {
+        const int64_t id = offset + row;
+        if (id % 17 == 0) {
+          ARROW_RETURN_NOT_OK(extra_builder.AppendNull());
+        } else {
+          ARROW_RETURN_NOT_OK(
+              extra_builder.Append(ProjectedBinaryValue(id, projected_binary_bytes, projection)));
+        }
+      }
+      std::shared_ptr<arrow::Array> extra;
+      ARROW_RETURN_NOT_OK(extra_builder.Finish(&extra));
+      columns.push_back(std::move(extra));
+      continue;
+    }
     arrow::Int64Builder extra_builder;
     ARROW_RETURN_NOT_OK(extra_builder.Reserve(count));
     for (int64_t row = 0; row < count; ++row) {
@@ -219,8 +242,9 @@ arrow::Status GenerateSegment(const Options& config) {
         config.projected_binary_bytes > 0, nullptr}},
   };
   for (uint32_t projection = 1; projection < config.projected_columns; ++projection) {
-    schema.fields.push_back(
-        {projection + 2U, "value_" + std::to_string(projection), arrow::int64(), false, nullptr});
+    schema.fields.push_back({projection + 2U, "value_" + std::to_string(projection),
+                             config.projected_binary_bytes > 0 ? arrow::binary() : arrow::int64(),
+                             config.projected_binary_bytes > 0, nullptr});
   }
   if (config.unprojected_binary_bytes > 0) {
     schema.fields.push_back({3, "unused_payload", arrow::binary(), false, nullptr});
@@ -252,8 +276,9 @@ arrow::Status GenerateParquet(const Options& config, const std::string& path,
         config.projected_binary_bytes > 0, nullptr}},
   };
   for (uint32_t projection = 1; projection < config.projected_columns; ++projection) {
-    schema.fields.push_back(
-        {projection + 2U, "value_" + std::to_string(projection), arrow::int64(), false, nullptr});
+    schema.fields.push_back({projection + 2U, "value_" + std::to_string(projection),
+                             config.projected_binary_bytes > 0 ? arrow::binary() : arrow::int64(),
+                             config.projected_binary_bytes > 0, nullptr});
   }
   ARROW_ASSIGN_OR_RAISE(auto arrow_schema, schema.ToArrowSchema());
   ARROW_ASSIGN_OR_RAISE(auto output, arrow::io::FileOutputStream::Open(path));
@@ -764,15 +789,14 @@ int main(int argc, char** argv) {
       (options.projected_binary_bytes > 0 && options.projected_binary_bytes < 20) ||
       (options.unprojected_binary_bytes > 0 && options.projected_binary_bytes > 0) ||
       options.projected_columns == 0 || options.projected_columns > 15 ||
-      (options.projected_columns > 1 &&
-       (options.projected_binary_bytes > 0 || options.unprojected_binary_bytes > 0)) ||
+      (options.projected_columns > 1 && options.unprojected_binary_bytes > 0) ||
       options.buffered_budget_bytes == 0 ||
       (options.unprojected_binary_bytes > 0 && options.generate_path.empty())) {
     std::cerr << "use 1 <= --rows=N <= 100000000 with exactly one of "
                  "--generate=PATH, --generate-parquet=PATH, "
                  "--generate-parquet-zstd=PATH or --segment=PATH; optional Segment-only "
-                 "--unprojected-binary-bytes=20..4096 (Segment generator only) or "
-                 "--projected-binary-bytes=20..4096; or --projected-columns=1..15; "
+                 "--unprojected-binary-bytes=20..4096 (Segment generator only), "
+                 "--projected-binary-bytes=20..4096, --projected-columns=1..15; "
                  "positive --buffer-budget-bytes=N\n";
     return 1;
   }

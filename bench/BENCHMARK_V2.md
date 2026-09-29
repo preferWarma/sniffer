@@ -1196,3 +1196,57 @@ sniffer_wide_projection_dir=$(mktemp -d)
   '--benchmark_filter=^BoundedParallelReaderScan/4/real_time$' \
   --benchmark_repetitions=20 --benchmark_min_time=0.05s --benchmark_format=csv
 ```
+
+## 2026-09-29：4 列 nullable 高熵 binary 宽投影
+
+将前述单列 binary 场景扩展为 4 列、每个非 null 值 32 B：每列用不同的
+确定性伪随机种子生成高熵字节，每 17 行一个 null。总共 5 列（包括递增
+int64 key），查询 `key >= rows/2` 并投影全部 4 个 binary 列。Sniffer
+与 Parquet 未压缩/ZSTD 使用同一生成函数、8,192 行 Row Group、输出 batch
+上限 4,096；四条测量路径在计时前均逐列验证字节、null 和行序。
+Apple M4（10 逻辑核）、AppleClang 21、Arrow C++ 23.0.1、Release `-O3`、
+系统临时目录、warm-cache。每 case 独立进程，20 次重复、每次至少 0.05 秒；
+P95 为排序后第 19 个样本。RSS/Arrow pool 来自同参数另外 7 次重复的
+median counter，包含 Reader 打开与计时前校验高水位。
+
+| 行数 | 执行路径 | 文件 B | P50 / P95 ms | 候选列块 / 字节 | RSS / Arrow pool 峰值 MB |
+| ---: | --- | ---: | ---: | ---: | ---: |
+| 100,000 | Sniffer 串行 | 13,866,903 | 3.050 / 3.093 | 29 / ≈6.979 MB（实际列块读取） | 11.99 / 2.81 |
+| 100,000 | Sniffer 4-worker | 13,866,903 | 1.169 / 1.197 | 29 / ≈6.979 MB（实际列块读取） | 26.00 / 6.25 |
+| 100,000 | Parquet 未压缩 | 15,240,976 | 3.232 / 3.341 | 29 / ≈7.329 MB（元数据候选量） | 20.04 / 8.15 |
+| 100,000 | Parquet ZSTD | 13,800,765 | 7.153 / 7.252 | 29 / ≈6.891 MB（元数据候选量） | 21.94 / 9.09 |
+| 1,000,000 | Sniffer 串行 | 138,666,963 | 32.193 / 32.466 | 249 / ≈68.545 MB（实际列块读取） | 12.03 / 2.81 |
+| 1,000,000 | Sniffer 4-worker | 138,666,963 | 9.471 / 9.602 | 249 / ≈68.545 MB（实际列块读取） | 29.07 / 6.21 |
+| 1,000,000 | Parquet 未压缩 | 152,410,904 | 34.105 / 34.633 | 249 / ≈71.430 MB（元数据候选量） | 86.92 / 72.40 |
+| 1,000,000 | Parquet ZSTD | 138,299,872 | 75.746 / 76.460 | 249 / ≈67.840 MB（元数据候选量） | 86.28 / 70.03 |
+
+100K 剪枝 6/13 组，1M 剪枝 61/123 组；4-worker 在途峰值 4 组、
+估算预留峰值约 11.09 MB（配置预算 64 MiB）。高熵使三种文件的空间
+差距收窄，Parquet ZSTD 文件比 Sniffer 略小；此场景下 Sniffer 4-worker
+延迟更低，但 RSS 明显高于 Sniffer 串行。Parquet 候选字节来自元数据
+`total_compressed_size`，**不是物理 I/O**，不得与 Sniffer 实际读取字节
+直接比较。Parquet batch reader 与 Sniffer 流式 Reader 的分配策略不同，
+RSS 差异不是单纯格式属性。此实验只覆盖一种宽度、值长度、null 分布和
+选择率，不代表所有变长宽表或 cold-cache 结果。
+
+复现 1M 行生成与一个测量 case；其他 case 只换 filter，均独立进程：
+
+```sh
+sniffer_binary_wide_dir=$(mktemp -d)
+./build-release/sniffer_core_reader_memory_benchmark \
+  "--generate=$sniffer_binary_wide_dir/data.seg" --rows=1000000 \
+  --projected-binary-bytes=32 --projected-columns=4
+./build-release/sniffer_core_reader_memory_benchmark \
+  "--generate-parquet=$sniffer_binary_wide_dir/data.parquet" --rows=1000000 \
+  --projected-binary-bytes=32 --projected-columns=4
+./build-release/sniffer_core_reader_memory_benchmark \
+  "--generate-parquet-zstd=$sniffer_binary_wide_dir/data.zstd.parquet" --rows=1000000 \
+  --projected-binary-bytes=32 --projected-columns=4
+./build-release/sniffer_core_reader_memory_benchmark \
+  "--segment=$sniffer_binary_wide_dir/data.seg" \
+  "--parquet=$sniffer_binary_wide_dir/data.parquet" \
+  "--parquet-zstd=$sniffer_binary_wide_dir/data.zstd.parquet" \
+  --rows=1000000 --projected-binary-bytes=32 --projected-columns=4 \
+  '--benchmark_filter=^BoundedParallelReaderScan/4/real_time$' \
+  --benchmark_repetitions=20 --benchmark_min_time=0.05s --benchmark_format=csv
+```
