@@ -251,8 +251,12 @@ sniffer_mem_dir=$(mktemp -d)
 及库初始化，Arrow pool 峰值不包含非 Arrow 分配。方法与结果见
 [`bench/BENCHMARK_V2.md`](bench/BENCHMARK_V2.md)。
 同一可执行文件还提供 `BoundedParallelReaderScan/{2,4,8}` 的单请求内部并行
-对照，以及实验性的 `ShardedSortRangeScan/{1,2,4,8}` 应用层范围分片上界；
-两者不是同一执行路径，见 [v0.2 基准记录](bench/BENCHMARK_V2.md)。
+对照、`ParquetReaderOnlyScan/{Uncompressed,ZSTD}` 的同计划 Reader-only 对照
+（先用 `--generate-parquet` / `--generate-parquet-zstd` 生成文件，再传入
+`--parquet` / `--parquet-zstd`），以及实验性的
+`ShardedSortRangeScan/{1,2,4,8}` 应用层范围分片上界；
+内部并行与应用层分片不是同一执行路径，见
+[v0.2 基准记录](bench/BENCHMARK_V2.md)。
 
 性能 benchmark 的 Sniffer 结果还包含 phase counters：writer 的索引、编码选择、编码、checksum
 与文件写入，以及 reader 的元数据、chunk I/O/checksum、解码、谓词、投影和 batch materialization。

@@ -977,7 +977,7 @@ benchmark 样本，`--benchmark_min_time=0.05s`；P95 为排序后第 19 个样�
 
 8 worker 比 4 worker 慢，说明解码并行之外已有调度、内存和线程开销；
 不能把 8-worker 应用层排序范围分片的约 3 ms 结果当作同等内部调度收益。
-这些指标是 warm-cache 合成输入；同计划 Parquet 单请求、cold-cache 和
+这些指标是 warm-cache 合成输入；同计划 Parquet 单请求见下节，cold-cache 和
 宽/变长列的 P50/P95/RSS 尚未补齐，不以此宣称通用格式优势。
 
 复现示例（将路径替换为由本 benchmark 的 `--generate=... --rows=...`
@@ -989,3 +989,57 @@ benchmark 样本，`--benchmark_min_time=0.05s`；P95 为排序后第 19 个样�
   '--benchmark_filter=^BoundedParallelReaderScan/4/real_time$' \
   --benchmark_repetitions=20 --benchmark_min_time=0.05s --benchmark_format=csv
 ```
+
+## 2026-09-29：同计划 Parquet Reader-only 单请求对照
+
+Apple M4（10 逻辑核）、AppleClang 21、Arrow C++ 23.0.1、Release `-O3`，
+系统临时目录、warm-cache。三个文件均由同一生成器逐组写入两列递增 int64，
+Row Group 为 8,192 行；Parquet 分别为未压缩和 ZSTD，Arrow reader 内部线程关闭。
+查询均为 `key >= rows/2`、仅投影 `value`、输出 batch 上限 4,096 行，
+扫描前逐值核对期望行序和值。Parquet 借助 key min/max 剪枝；跨越边界的
+一组读取 key 与 value 并按有序 key 截取，整组命中只读取 value。
+Sniffer 保留原生 SortKey/统计剪枝和串行或显式 4-worker Scan。
+每个 case 独立进程、20 次重复，`--benchmark_min_time=0.05s`；打开 Reader、
+预先逐值校验和生成文件不计入 real time，创建 Scan/Parquet batch reader、
+读取、解码、过滤和拼 batch 计入。P95 为排序后第 19 个样本。
+
+| 行数 | 执行路径 | 文件 B | P50 / P95 ms | 候选列块 / 字节 | RSS / Arrow pool 峰值 MB |
+| ---: | --- | ---: | ---: | ---: | ---: |
+| 100,000 | Sniffer 串行 | 328,793 | 0.145 / 0.146 | 8 / 95,836（实际列块读取） | 6.50 / 0.164 |
+| 100,000 | Sniffer 4-worker | 328,793 | 0.149 / 0.154 | 8 / 95,836（实际列块读取） | 7.49 / 0.419 |
+| 100,000 | Parquet 未压缩 | 1,930,850 | 0.202 / 0.204 | 8 / 568,307（元数据候选量） | 8.63 / 0.493 |
+| 100,000 | Parquet ZSTD | 530,998 | 0.573 / 0.581 | 8 / 154,770（元数据候选量） | 8.55 / 0.371 |
+| 10,000,000 | Sniffer 串行 | 32,915,361 | 9.506 / 9.636 | 612 / ≈8,167,470（实际列块读取） | 7.70 / 0.164 |
+| 10,000,000 | Sniffer 4-worker | 32,915,361 | 6.786 / 7.171 | 612 / ≈8,167,470（实际列块读取） | 11.50 / 0.426 |
+| 10,000,000 | Parquet 未压缩 | 193,084,376 | 18.911 / 19.339 | 612 / ≈48,268,900（元数据候选量） | 85.26 / 48.21 |
+| 10,000,000 | Parquet ZSTD | 52,963,148 | 50.952 / 51.810 | 612 / ≈13,162,600（元数据候选量） | 26.62 / 13.31 |
+
+两种格式均剪枝 100K 的 6/13 组、10M 的 610/1,221 组。Sniffer 字节来自
+`ScanMetrics.column_chunk_bytes_read`；Parquet 字节是被选列的
+`total_compressed_size` 元数据之和，**不是物理 I/O，也不能与 Sniffer
+实际读取字节直接比较**。RSS 是进程高水位，包含库初始化、Reader 打开和
+计时前逐值校验，不是每次迭代的增量；Arrow pool 不含其他分配。
+这个合成有序、无 null、窄投影场景下，Sniffer 更小且查询更快；不能外推至
+宽表、变长列、其他选择率或 cold-cache，也不能据此判定通用格式优劣。
+
+复现时先分别生成 100K 或 10M 的三份文件，生成与测量分进程；每个
+`--benchmark_filter` 也单独启动进程以保留 RSS 口径。例如：
+
+```sh
+sniffer_reader_dir=$(mktemp -d)
+./build-release/sniffer_core_reader_memory_benchmark \
+  "--generate=$sniffer_reader_dir/data.seg" --rows=10000000
+./build-release/sniffer_core_reader_memory_benchmark \
+  "--generate-parquet=$sniffer_reader_dir/data.parquet" --rows=10000000
+./build-release/sniffer_core_reader_memory_benchmark \
+  "--generate-parquet-zstd=$sniffer_reader_dir/data.zstd.parquet" --rows=10000000
+./build-release/sniffer_core_reader_memory_benchmark \
+  "--segment=$sniffer_reader_dir/data.seg" \
+  "--parquet=$sniffer_reader_dir/data.parquet" \
+  "--parquet-zstd=$sniffer_reader_dir/data.zstd.parquet" --rows=10000000 \
+  '--benchmark_filter=^ParquetReaderOnlyScan/ZSTD/real_time$' \
+  --benchmark_repetitions=20 --benchmark_min_time=0.05s --benchmark_format=csv
+```
+
+将 filter 分别换成 `ReaderOnlyScan`、`BoundedParallelReaderScan/4`、
+`ParquetReaderOnlyScan/Uncompressed` 可测另外三条路径。

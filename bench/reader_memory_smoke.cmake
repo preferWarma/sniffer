@@ -4,6 +4,8 @@ endif()
 
 string(RANDOM LENGTH 12 ALPHABET 0123456789abcdef memory_suffix)
 set(segment_path "${READER_MEMORY_TEST_DIR}/reader_memory_${memory_suffix}.seg")
+set(parquet_path "${READER_MEMORY_TEST_DIR}/reader_memory_${memory_suffix}.parquet")
+set(parquet_zstd_path "${READER_MEMORY_TEST_DIR}/reader_memory_${memory_suffix}.zstd.parquet")
 
 execute_process(
   COMMAND "${READER_MEMORY_EXE}" "--generate=${segment_path}" --rows=1024
@@ -28,13 +30,52 @@ if(overwrite_result EQUAL 0)
 endif()
 
 execute_process(
-  COMMAND "${READER_MEMORY_EXE}" "--segment=${segment_path}" --rows=1024
+  COMMAND "${READER_MEMORY_EXE}" "--generate-parquet=${parquet_path}" --rows=1024
+  RESULT_VARIABLE parquet_generate_result
+  OUTPUT_VARIABLE parquet_generate_output
+  ERROR_VARIABLE parquet_generate_error
+)
+if(NOT parquet_generate_result EQUAL 0)
+  file(REMOVE "${segment_path}" "${parquet_path}")
+  message(FATAL_ERROR "Parquet generation failed: ${parquet_generate_output}${parquet_generate_error}")
+endif()
+
+execute_process(
+  COMMAND "${READER_MEMORY_EXE}" "--generate-parquet=${parquet_path}" --rows=1024
+  RESULT_VARIABLE parquet_overwrite_result
+  OUTPUT_QUIET
+  ERROR_QUIET
+)
+if(parquet_overwrite_result EQUAL 0)
+  file(REMOVE "${segment_path}" "${parquet_path}")
+  message(FATAL_ERROR "Parquet generation unexpectedly overwrote an existing file")
+endif()
+
+execute_process(
+  COMMAND "${READER_MEMORY_EXE}" "--generate-parquet-zstd=${parquet_zstd_path}" --rows=1024
+  RESULT_VARIABLE parquet_zstd_generate_result
+  OUTPUT_VARIABLE parquet_zstd_generate_output
+  ERROR_VARIABLE parquet_zstd_generate_error
+)
+if(NOT parquet_zstd_generate_result EQUAL 0)
+  file(REMOVE "${segment_path}" "${parquet_path}" "${parquet_zstd_path}")
+  message(FATAL_ERROR "Parquet ZSTD generation failed: ${parquet_zstd_generate_output}${parquet_zstd_generate_error}")
+endif()
+
+execute_process(
+  COMMAND "${READER_MEMORY_EXE}" "--segment=${segment_path}" "--parquet=${parquet_path}"
+          "--parquet-zstd=${parquet_zstd_path}" --rows=1024
           --benchmark_dry_run
   RESULT_VARIABLE scan_result
   OUTPUT_VARIABLE scan_output
   ERROR_VARIABLE scan_error
 )
-file(REMOVE "${segment_path}")
+file(REMOVE "${segment_path}" "${parquet_path}" "${parquet_zstd_path}")
 if(NOT scan_result EQUAL 0)
   message(FATAL_ERROR "scan failed: ${scan_output}${scan_error}")
+endif()
+if(NOT "${scan_output}${scan_error}" MATCHES "ParquetReaderOnlyScan/Uncompressed" OR
+   NOT "${scan_output}${scan_error}" MATCHES "ParquetReaderOnlyScan/ZSTD" OR
+   "${scan_output}${scan_error}" MATCHES "ERROR OCCURRED")
+  message(FATAL_ERROR "Parquet Reader-only benchmark did not complete: ${scan_output}${scan_error}")
 endif()

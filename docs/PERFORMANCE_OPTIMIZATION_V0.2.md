@@ -246,7 +246,8 @@ SIMD、多级编码链和新压缩算法只有在标量路径完成剖析和优�
   - [x] 多查询 1/2/4/8 线程的 Sniffer 共享/独立 Reader、Parquet 无 codec 压缩/ZSTD
         对照已测；逐值验证 Parquet 结果。单请求内部并行的 100K/10M 同计划
         Reader-only P50/P95、RSS、Arrow pool 峰值和读取量已测，见 benchmark 记录；
-        同条件 Parquet 单请求和 cold-cache 仍未测。
+        同条件 Parquet 未压缩/ZSTD 单请求已测，cold-cache、宽/变长列及完整
+        选择率矩阵仍未测。
 
 ### 8.3 可选向量化（P3）
 
@@ -298,7 +299,18 @@ Release 与 ASan+UBSan 全量 94/94 通过。Apple Arrow 23 静态库默认 mima
 改用 Arrow system memory pool，定向用例连续 20 次及全量 76/76 通过。
 详细 100K/10M、1/2/4/8 worker 数据见
 [`bench/BENCHMARK_V2.md`](../bench/BENCHMARK_V2.md)。该路径仍是显式 opt-in，
-Parquet 同计划单请求和 cold-cache 尚未验收，v0.2 未收尾完成。
+Parquet 同计划单请求见下方新增记录；cold-cache 等维度尚未验收，v0.2 未收尾完成。
+
+### 2026-09-29：同计划 Parquet Reader-only 对照
+
+在双 int64、Row Group 8,192、`key >= rows/2`、仅投影 value 的 warm-cache
+场景，三个格式由同一生成器写出；Sniffer/Parquet 均逐值校验查询输出。
+10M 行、独立进程 20 次测量的 P50/P95：Sniffer 串行 9.506/9.636 ms，
+4-worker 6.786/7.171 ms；Parquet 未压缩 18.911/19.339 ms，ZSTD
+50.952/51.810 ms。对应文件分别为 32.9、193.1、53.0 MB；具体 RSS、
+Arrow pool 和读取量口径见 [`bench/BENCHMARK_V2.md`](../bench/BENCHMARK_V2.md)。
+这只关闭同计划单请求 warm-cache 对照缺口；Parquet 的列字节数来自元数据，
+不是实际物理读取量。cold-cache、宽/变长列、选择率矩阵及资源预算仍待验收。
 
 ### 2026-09-28：按物理 Row Group 的处理单元
 

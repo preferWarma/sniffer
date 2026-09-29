@@ -1,6 +1,8 @@
 #include <arrow/api.h>
 #include <arrow/util/config.h>
 #include <benchmark/benchmark.h>
+#include <parquet/metadata.h>
+#include <parquet/statistics.h>
 
 #include <algorithm>
 #include <charconv>
@@ -8,6 +10,7 @@
 #include <filesystem>
 #include <iostream>
 #include <memory>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -19,6 +22,7 @@
 #endif
 
 #include "benchmark_build_config.h"
+#include "parquet_benchmark_util.h"
 #include "sniffer/segment_reader.h"
 #include "sniffer/segment_writer.h"
 
@@ -29,7 +33,11 @@ constexpr uint32_t kOutputBatchRows = 4096;
 
 struct Options {
   std::string generate_path;
+  std::string generate_parquet_path;
+  std::string generate_parquet_zstd_path;
   std::string segment_path;
+  std::string parquet_path;
+  std::string parquet_zstd_path;
   int64_t rows = 0;
 };
 
@@ -51,15 +59,37 @@ uint64_t ProcessPeakRssBytes() {
 #endif
 }
 
-arrow::Status GenerateSegment(const Options& config) {
+arrow::Result<std::shared_ptr<arrow::RecordBatch>> MakeGeneratedBatch(
+    const std::shared_ptr<arrow::Schema>& arrow_schema, int64_t offset, int64_t count) {
+  arrow::Int64Builder key_builder;
+  arrow::Int64Builder value_builder;
+  ARROW_RETURN_NOT_OK(key_builder.Reserve(count));
+  ARROW_RETURN_NOT_OK(value_builder.Reserve(count));
+  for (int64_t row = 0; row < count; ++row) {
+    ARROW_RETURN_NOT_OK(key_builder.Append(offset + row));
+    ARROW_RETURN_NOT_OK(value_builder.Append(offset + row));
+  }
+  std::shared_ptr<arrow::Array> key;
+  std::shared_ptr<arrow::Array> value;
+  ARROW_RETURN_NOT_OK(key_builder.Finish(&key));
+  ARROW_RETURN_NOT_OK(value_builder.Finish(&value));
+  return arrow::RecordBatch::Make(arrow_schema, count, {std::move(key), std::move(value)});
+}
+
+arrow::Status CheckNewPath(const std::string& path) {
   std::error_code path_error;
-  const bool exists = std::filesystem::exists(config.generate_path, path_error);
+  const bool exists = std::filesystem::exists(path, path_error);
   if (path_error) {
     return arrow::Status::IOError("cannot inspect output path: ", path_error.message());
   }
   if (exists) {
-    return arrow::Status::Invalid("refusing to overwrite existing benchmark Segment");
+    return arrow::Status::Invalid("refusing to overwrite benchmark output: ", path);
   }
+  return arrow::Status::OK();
+}
+
+arrow::Status GenerateSegment(const Options& config) {
+  ARROW_RETURN_NOT_OK(CheckNewPath(config.generate_path));
   const sniffer::TableSchema schema{
       1,
       {{1, "key", arrow::int64(), false, nullptr}, {2, "value", arrow::int64(), false, nullptr}},
@@ -73,22 +103,38 @@ arrow::Status GenerateSegment(const Options& config) {
                         sniffer::SegmentWriter::Open(config.generate_path, schema, layout));
   for (int64_t offset = 0; offset < config.rows; offset += kRowGroupRows) {
     const int64_t count = std::min<int64_t>(kRowGroupRows, config.rows - offset);
-    arrow::Int64Builder key_builder;
-    arrow::Int64Builder value_builder;
-    ARROW_RETURN_NOT_OK(key_builder.Reserve(count));
-    ARROW_RETURN_NOT_OK(value_builder.Reserve(count));
-    for (int64_t row = 0; row < count; ++row) {
-      ARROW_RETURN_NOT_OK(key_builder.Append(offset + row));
-      ARROW_RETURN_NOT_OK(value_builder.Append(offset + row));
-    }
-    std::shared_ptr<arrow::Array> key;
-    std::shared_ptr<arrow::Array> value;
-    ARROW_RETURN_NOT_OK(key_builder.Finish(&key));
-    ARROW_RETURN_NOT_OK(value_builder.Finish(&value));
-    auto batch = arrow::RecordBatch::Make(arrow_schema, count, {std::move(key), std::move(value)});
+    ARROW_ASSIGN_OR_RAISE(auto batch, MakeGeneratedBatch(arrow_schema, offset, count));
     ARROW_RETURN_NOT_OK(writer->Append(std::move(batch)));
   }
   return writer->Finish();
+}
+
+arrow::Status GenerateParquet(const Options& config, const std::string& path,
+                              parquet::Compression::type compression) {
+  ARROW_RETURN_NOT_OK(CheckNewPath(path));
+  const sniffer::TableSchema schema{
+      1,
+      {{1, "key", arrow::int64(), false, nullptr}, {2, "value", arrow::int64(), false, nullptr}},
+  };
+  ARROW_ASSIGN_OR_RAISE(auto arrow_schema, schema.ToArrowSchema());
+  ARROW_ASSIGN_OR_RAISE(auto output, arrow::io::FileOutputStream::Open(path));
+  parquet::WriterProperties::Builder properties;
+  properties.compression(compression);
+  properties.max_row_group_length(kRowGroupRows);
+  parquet::ArrowWriterProperties::Builder arrow_properties;
+  arrow_properties.set_use_threads(false);
+  arrow_properties.store_schema();
+  ARROW_ASSIGN_OR_RAISE(auto writer, parquet::arrow::FileWriter::Open(
+                                         *arrow_schema, arrow::default_memory_pool(), output,
+                                         properties.build(), arrow_properties.build()));
+  for (int64_t offset = 0; offset < config.rows; offset += kRowGroupRows) {
+    const int64_t count = std::min<int64_t>(kRowGroupRows, config.rows - offset);
+    ARROW_ASSIGN_OR_RAISE(auto batch, MakeGeneratedBatch(arrow_schema, offset, count));
+    ARROW_RETURN_NOT_OK(writer->NewBufferedRowGroup());
+    ARROW_RETURN_NOT_OK(writer->WriteRecordBatch(*batch));
+  }
+  ARROW_RETURN_NOT_OK(writer->Close());
+  return output->Close();
 }
 
 void ReaderOnlyScanImpl(benchmark::State& state, uint32_t workers) {
@@ -104,6 +150,37 @@ void ReaderOnlyScanImpl(benchmark::State& state, uint32_t workers) {
       {1, sniffer::Predicate::Op::kGe, std::make_shared<arrow::Int64Scalar>(options.rows / 2)}};
   plan.output_batch_rows = kOutputBatchRows;
   const uint64_t expected_rows = static_cast<uint64_t>(options.rows - options.rows / 2);
+  {
+    auto checked = reader->Scan(plan);
+    if (!checked.ok()) {
+      state.SkipWithError(checked.status().ToString());
+      return;
+    }
+    auto iterator = std::move(checked).ValueUnsafe();
+    int64_t expected_value = options.rows / 2;
+    for (;;) {
+      auto next = iterator.Next();
+      if (!next.ok()) {
+        state.SkipWithError(next.status().ToString());
+        return;
+      }
+      auto batch = std::move(next).ValueUnsafe();
+      if (!batch) {
+        break;
+      }
+      const auto& values = static_cast<const arrow::Int64Array&>(*batch->column(0));
+      for (int64_t row = 0; row < values.length(); ++row) {
+        if (values.IsNull(row) || values.Value(row) != expected_value++) {
+          state.SkipWithError("Sniffer scan differs from generated reference values");
+          return;
+        }
+      }
+    }
+    if (expected_value != options.rows) {
+      state.SkipWithError("Sniffer scan omitted generated reference rows");
+      return;
+    }
+  }
   sniffer::ScanMetrics totals;
   uint64_t peak_in_flight = 0;
   uint64_t peak_reserved_bytes = 0;
@@ -194,6 +271,148 @@ BENCHMARK(BoundedParallelReaderScan)
     ->Arg(8)
     ->UseRealTime()
     ->Unit(benchmark::kMillisecond);
+
+struct ParquetMeasurement {
+  uint64_t output_rows = 0;
+  uint64_t row_groups_pruned = 0;
+  uint64_t candidate_column_bytes = 0;
+  uint64_t candidate_column_chunks = 0;
+};
+
+arrow::Result<ParquetMeasurement> ScanParquetOnce(parquet::arrow::FileReader* reader, int64_t rows,
+                                                  bool verify_values) {
+  const int64_t lower = rows / 2;
+  const auto metadata = reader->parquet_reader()->metadata();
+  std::vector<int> full_groups;
+  std::optional<int> boundary_group;
+  ParquetMeasurement measured;
+  for (int group = 0; group < reader->num_row_groups(); ++group) {
+    const auto row_group = metadata->RowGroup(group);
+    const auto statistics = row_group->ColumnChunk(0)->statistics();
+    if (!statistics || !statistics->HasMinMax() ||
+        statistics->physical_type() != parquet::Type::INT64) {
+      return arrow::Status::Invalid("Parquet benchmark requires int64 key statistics");
+    }
+    const auto& key_stats = static_cast<const parquet::Int64Statistics&>(*statistics);
+    if (key_stats.max() < lower) {
+      ++measured.row_groups_pruned;
+      continue;
+    }
+    const int64_t value_bytes = row_group->ColumnChunk(1)->total_compressed_size();
+    if (value_bytes < 0) {
+      return arrow::Status::Invalid("Parquet benchmark has invalid column byte length");
+    }
+    measured.candidate_column_bytes += static_cast<uint64_t>(value_bytes);
+    ++measured.candidate_column_chunks;
+    if (key_stats.min() >= lower) {
+      full_groups.push_back(group);
+    } else {
+      if (boundary_group || !full_groups.empty()) {
+        return arrow::Status::Invalid("Parquet benchmark expects one leading boundary group");
+      }
+      boundary_group = group;
+      const int64_t key_bytes = row_group->ColumnChunk(0)->total_compressed_size();
+      if (key_bytes < 0) {
+        return arrow::Status::Invalid("Parquet benchmark has invalid key byte length");
+      }
+      measured.candidate_column_bytes += static_cast<uint64_t>(key_bytes);
+      ++measured.candidate_column_chunks;
+    }
+  }
+
+  int64_t expected_value = lower;
+  const auto consume = [&](const std::vector<int>& groups, const std::vector<int>& columns,
+                           bool filter_boundary) -> arrow::Status {
+    if (groups.empty()) {
+      return arrow::Status::OK();
+    }
+    ARROW_ASSIGN_OR_RAISE(auto stream, reader->GetRecordBatchReader(groups, columns));
+    for (;;) {
+      ARROW_ASSIGN_OR_RAISE(auto batch, stream->Next());
+      if (!batch) {
+        break;
+      }
+      int64_t skip = 0;
+      if (filter_boundary) {
+        const auto& keys = static_cast<const arrow::Int64Array&>(*batch->column(0));
+        skip = std::lower_bound(keys.raw_values(), keys.raw_values() + keys.length(), lower) -
+               keys.raw_values();
+      }
+      const auto values = batch->column(filter_boundary ? 1 : 0)->Slice(skip);
+      if (verify_values) {
+        const auto& typed = static_cast<const arrow::Int64Array&>(*values);
+        for (int64_t row = 0; row < typed.length(); ++row) {
+          if (typed.IsNull(row) || typed.Value(row) != expected_value++) {
+            return arrow::Status::Invalid("Parquet scan differs from generated reference values");
+          }
+        }
+      }
+      measured.output_rows += static_cast<uint64_t>(values->length());
+      benchmark::DoNotOptimize(values->data().get());
+    }
+    return arrow::Status::OK();
+  };
+  if (boundary_group) {
+    ARROW_RETURN_NOT_OK(consume({*boundary_group}, {0, 1}, true));
+  }
+  ARROW_RETURN_NOT_OK(consume(full_groups, {1}, false));
+  if (measured.output_rows != static_cast<uint64_t>(rows - lower) ||
+      (verify_values && expected_value != rows)) {
+    return arrow::Status::Invalid("Parquet benchmark output row count mismatch");
+  }
+  return measured;
+}
+
+void ParquetReaderOnlyScan(benchmark::State& state, bool zstd) {
+  const auto& path = zstd ? options.parquet_zstd_path : options.parquet_path;
+  if (path.empty()) {
+    state.SkipWithError(zstd ? "--parquet-zstd=PATH is required" : "--parquet=PATH is required");
+    return;
+  }
+  auto opened = sniffer_bench::OpenParquet(path, kOutputBatchRows);
+  if (!opened.ok()) {
+    state.SkipWithError(opened.status().ToString());
+    return;
+  }
+  auto reader = std::move(opened).ValueUnsafe();
+  const auto verified = ScanParquetOnce(reader.get(), options.rows, true);
+  if (!verified.ok()) {
+    state.SkipWithError(verified.status().ToString());
+    return;
+  }
+  ParquetMeasurement last;
+  for (auto _ : state) {
+    (void)_;
+    auto result = ScanParquetOnce(reader.get(), options.rows, false);
+    if (!result.ok()) {
+      state.SkipWithError(result.status().ToString());
+      return;
+    }
+    last = *result;
+  }
+  std::error_code file_error;
+  const uint64_t file_bytes = std::filesystem::file_size(path, file_error);
+  if (file_error) {
+    state.SkipWithError(file_error.message());
+    return;
+  }
+  state.counters["input_rows"] = static_cast<double>(options.rows);
+  state.counters["output_rows"] = static_cast<double>(last.output_rows);
+  state.counters["file_bytes"] = static_cast<double>(file_bytes);
+  state.counters["row_groups"] = static_cast<double>(reader->num_row_groups());
+  state.counters["row_groups_pruned"] = static_cast<double>(last.row_groups_pruned);
+  state.counters["candidate_column_chunks"] = static_cast<double>(last.candidate_column_chunks);
+  state.counters["candidate_column_bytes"] = static_cast<double>(last.candidate_column_bytes);
+  state.counters["process_peak_rss_bytes"] = static_cast<double>(ProcessPeakRssBytes());
+  state.counters["arrow_pool_peak_bytes"] =
+      static_cast<double>(arrow::default_memory_pool()->max_memory());
+  state.SetItemsProcessed(state.iterations() * (options.rows - options.rows / 2));
+}
+
+BENCHMARK_CAPTURE(ParquetReaderOnlyScan, Uncompressed, false)
+    ->UseRealTime()
+    ->Unit(benchmark::kMillisecond);
+BENCHMARK_CAPTURE(ParquetReaderOnlyScan, ZSTD, true)->UseRealTime()->Unit(benchmark::kMillisecond);
 
 sniffer::IOPlan ShardPlan(int64_t lower, int64_t upper) {
   sniffer::IOPlan plan;
@@ -325,8 +544,18 @@ int main(int argc, char** argv) {
     const std::string_view argument(argv[index]);
     if (argument.starts_with("--generate=")) {
       options.generate_path = argument.substr(std::string_view("--generate=").size());
+    } else if (argument.starts_with("--generate-parquet=")) {
+      options.generate_parquet_path =
+          argument.substr(std::string_view("--generate-parquet=").size());
+    } else if (argument.starts_with("--generate-parquet-zstd=")) {
+      options.generate_parquet_zstd_path =
+          argument.substr(std::string_view("--generate-parquet-zstd=").size());
     } else if (argument.starts_with("--segment=")) {
       options.segment_path = argument.substr(std::string_view("--segment=").size());
+    } else if (argument.starts_with("--parquet=")) {
+      options.parquet_path = argument.substr(std::string_view("--parquet=").size());
+    } else if (argument.starts_with("--parquet-zstd=")) {
+      options.parquet_zstd_path = argument.substr(std::string_view("--parquet-zstd=").size());
     } else if (argument.starts_with("--rows=")) {
       const auto digits = argument.substr(std::string_view("--rows=").size());
       const auto [end, error] =
@@ -339,10 +568,14 @@ int main(int argc, char** argv) {
       benchmark_args.push_back(argv[index]);
     }
   }
-  if (options.rows <= 0 || options.rows > 100000000 ||
-      (options.generate_path.empty() == options.segment_path.empty())) {
+  const int mode_count = static_cast<int>(!options.generate_path.empty()) +
+                         static_cast<int>(!options.generate_parquet_path.empty()) +
+                         static_cast<int>(!options.generate_parquet_zstd_path.empty()) +
+                         static_cast<int>(!options.segment_path.empty());
+  if (options.rows <= 0 || options.rows > 100000000 || mode_count != 1) {
     std::cerr << "use 1 <= --rows=N <= 100000000 with exactly one of "
-                 "--generate=PATH or --segment=PATH\n";
+                 "--generate=PATH, --generate-parquet=PATH, "
+                 "--generate-parquet-zstd=PATH or --segment=PATH\n";
     return 1;
   }
   if (!options.generate_path.empty()) {
@@ -353,16 +586,37 @@ int main(int argc, char** argv) {
     }
     return 0;
   }
+  if (!options.generate_parquet_path.empty()) {
+    const auto status =
+        GenerateParquet(options, options.generate_parquet_path, parquet::Compression::UNCOMPRESSED);
+    if (!status.ok()) {
+      std::cerr << status.ToString() << '\n';
+      return 1;
+    }
+    return 0;
+  }
+  if (!options.generate_parquet_zstd_path.empty()) {
+    const auto status =
+        GenerateParquet(options, options.generate_parquet_zstd_path, parquet::Compression::ZSTD);
+    if (!status.ok()) {
+      std::cerr << status.ToString() << '\n';
+      return 1;
+    }
+    return 0;
+  }
   benchmark::AddCustomContext("source_revision", SNIFFER_BENCHMARK_SOURCE_REVISION);
   benchmark::AddCustomContext("compiler", SNIFFER_BENCHMARK_COMPILER);
   benchmark::AddCustomContext("arrow_version", ARROW_VERSION_STRING);
   benchmark::AddCustomContext("scope", "fresh_process_reader_only_no_writer_or_input_batch");
+  benchmark::AddCustomContext("parquet_compression", "UNCOMPRESSED and ZSTD; explicit input paths");
   benchmark::AddCustomContext("row_group_rows", std::to_string(kRowGroupRows));
   benchmark::AddCustomContext("output_batch_rows", std::to_string(kOutputBatchRows));
-  benchmark::AddCustomContext("query",
-                              "ReaderOnlyScan and BoundedParallelReaderScan: key >= rows/2; "
-                              "ShardedSortRangeScan: partition sort-key range "
-                              "[rows/2,rows); project value");
+  benchmark::AddCustomContext(
+      "query",
+      "ReaderOnlyScan, BoundedParallelReaderScan and ParquetReaderOnlyScan: "
+      "key >= rows/2, project value; "
+      "ShardedSortRangeScan: partition sort-key range "
+      "[rows/2,rows); project value");
   int benchmark_argc = static_cast<int>(benchmark_args.size());
   benchmark::Initialize(&benchmark_argc, benchmark_args.data());
   if (benchmark::ReportUnrecognizedArguments(benchmark_argc, benchmark_args.data())) {

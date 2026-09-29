@@ -214,7 +214,7 @@ if(SNIFFER_BUILD_BENCHMARK)
     sniffer_core_reader_memory_benchmark PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/generated"
   )
   target_link_libraries(
-    sniffer_core_reader_memory_benchmark PRIVATE sniffer_core benchmark::benchmark
+    sniffer_core_reader_memory_benchmark PRIVATE sniffer_core sniffer_parquet benchmark::benchmark
   )
   if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
     target_compile_options(
