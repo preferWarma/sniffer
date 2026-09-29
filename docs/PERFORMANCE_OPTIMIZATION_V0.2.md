@@ -251,9 +251,10 @@ SIMD、多级编码链和新压缩算法只有在标量路径完成剖析和优�
         Reader-only P50/P95、RSS、Arrow pool 峰值和读取量已测，见 benchmark 记录；
         同条件 Parquet 未压缩/ZSTD 单请求已测。另补含 null 的高熵 binary
         窄投影同计划对照；另补 15 列相关递增整数的宽投影对照。
-        再补 4 列 nullable 高熵 binary 宽投影同计划对照；cold-cache、
-        同文件 1/10/50/100% 选择率也已测。cold-cache、其他宽度/变长分布、
-        Row Group × 投影 × 选择率的完整交叉矩阵仍未测。
+        再补 4 列 nullable 高熵 binary 宽投影同计划对照，以及同文件
+        1/10/50/100% 选择率。1M 行数据又覆盖 1K/8K/64K/256K Row Group ×
+        1%/50% 选择率；256K 默认预算回退与提高预算后的时间/RSS 已测。
+        cold-cache、其他宽度/变长分布及 Row Group × 投影 × 选择率的完整交叉矩阵仍未测。
 
 ### 8.3 可选向量化（P3）
 

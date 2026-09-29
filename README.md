@@ -263,6 +263,8 @@ sniffer_mem_dir=$(mktemp -d)
 多列 binary 宽投影。生成文件与扫描参数须一致。
 扫描可用 `--selectivity-percent=1..100` 改变 `key` 阈值，默认 50；
 同一个生成文件可复用来比较不同选择率。
+生成与扫描均可指定 `--row-group-rows=1..262144`（默认 8192）；扫描时必须传入
+与文件生成时相同的分组大小。该参数仅用于此 benchmark，不改变库的格式或默认扫描策略。
 
 性能 benchmark 的 Sniffer 结果还包含 phase counters：writer 的索引、编码选择、编码、checksum
 与文件写入，以及 reader 的元数据、chunk I/O/checksum、解码、谓词、投影和 batch materialization。

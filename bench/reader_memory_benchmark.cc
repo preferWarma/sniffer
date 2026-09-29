@@ -28,7 +28,7 @@
 
 namespace {
 
-constexpr uint32_t kRowGroupRows = 8192;
+constexpr uint32_t kDefaultRowGroupRows = 8192;
 constexpr uint32_t kOutputBatchRows = 4096;
 
 struct Options {
@@ -43,6 +43,7 @@ struct Options {
   uint32_t projected_binary_bytes = 0;
   uint32_t projected_columns = 1;
   uint32_t selectivity_percent = 50;
+  uint32_t row_group_rows = kDefaultRowGroupRows;
   uint64_t buffered_budget_bytes = 64U * 1024U * 1024U;
 };
 
@@ -50,6 +51,11 @@ Options options;
 
 int64_t QueryLowerBound() {
   return options.rows * static_cast<int64_t>(100U - options.selectivity_percent) / 100;
+}
+
+uint64_t ExpectedRowGroups() {
+  return (static_cast<uint64_t>(options.rows) + options.row_group_rows - 1U) /
+         options.row_group_rows;
 }
 
 uint64_t ProcessPeakRssBytes() {
@@ -256,13 +262,13 @@ arrow::Status GenerateSegment(const Options& config) {
   }
   ARROW_ASSIGN_OR_RAISE(auto arrow_schema, schema.ToArrowSchema());
   sniffer::LayoutPolicy layout;
-  layout.target_row_group_rows = kRowGroupRows;
+  layout.target_row_group_rows = config.row_group_rows;
   layout.sort_key_field_ids = {1};
   layout.statistics_field_ids = {1};
   ARROW_ASSIGN_OR_RAISE(auto writer,
                         sniffer::SegmentWriter::Open(config.generate_path, schema, layout));
-  for (int64_t offset = 0; offset < config.rows; offset += kRowGroupRows) {
-    const int64_t count = std::min<int64_t>(kRowGroupRows, config.rows - offset);
+  for (int64_t offset = 0; offset < config.rows; offset += config.row_group_rows) {
+    const int64_t count = std::min<int64_t>(config.row_group_rows, config.rows - offset);
     ARROW_ASSIGN_OR_RAISE(
         auto batch, MakeGeneratedBatch(arrow_schema, offset, count, config.unprojected_binary_bytes,
                                        config.projected_binary_bytes, config.projected_columns));
@@ -289,15 +295,15 @@ arrow::Status GenerateParquet(const Options& config, const std::string& path,
   ARROW_ASSIGN_OR_RAISE(auto output, arrow::io::FileOutputStream::Open(path));
   parquet::WriterProperties::Builder properties;
   properties.compression(compression);
-  properties.max_row_group_length(kRowGroupRows);
+  properties.max_row_group_length(config.row_group_rows);
   parquet::ArrowWriterProperties::Builder arrow_properties;
   arrow_properties.set_use_threads(false);
   arrow_properties.store_schema();
   ARROW_ASSIGN_OR_RAISE(auto writer, parquet::arrow::FileWriter::Open(
                                          *arrow_schema, arrow::default_memory_pool(), output,
                                          properties.build(), arrow_properties.build()));
-  for (int64_t offset = 0; offset < config.rows; offset += kRowGroupRows) {
-    const int64_t count = std::min<int64_t>(kRowGroupRows, config.rows - offset);
+  for (int64_t offset = 0; offset < config.rows; offset += config.row_group_rows) {
+    const int64_t count = std::min<int64_t>(config.row_group_rows, config.rows - offset);
     ARROW_ASSIGN_OR_RAISE(
         auto batch, MakeGeneratedBatch(arrow_schema, offset, count, 0,
                                        config.projected_binary_bytes, config.projected_columns));
@@ -315,6 +321,10 @@ void ReaderOnlyScanImpl(benchmark::State& state, uint32_t workers) {
     return;
   }
   auto reader = std::move(*maybe_reader);
+  if (reader->num_row_groups() != ExpectedRowGroups()) {
+    state.SkipWithError("Segment Row Group count differs from --row-group-rows");
+    return;
+  }
   sniffer::IOPlan plan;
   for (uint32_t projection = 0; projection < options.projected_columns; ++projection) {
     plan.projection_field_ids.push_back(projection + 2U);
@@ -563,6 +573,10 @@ void ParquetReaderOnlyScan(benchmark::State& state, bool zstd) {
     return;
   }
   auto reader = std::move(opened).ValueUnsafe();
+  if (static_cast<uint64_t>(reader->num_row_groups()) != ExpectedRowGroups()) {
+    state.SkipWithError("Parquet Row Group count differs from --row-group-rows");
+    return;
+  }
   const auto verified = ScanParquetOnce(reader.get(), options.rows, true);
   if (!verified.ok()) {
     state.SkipWithError(verified.status().ToString());
@@ -650,6 +664,10 @@ void ShardedSortRangeScan(benchmark::State& state) {
     return;
   }
   auto reader = std::move(*maybe_reader);
+  if (reader->num_row_groups() != ExpectedRowGroups()) {
+    state.SkipWithError("Segment Row Group count differs from --row-group-rows");
+    return;
+  }
   const int64_t workers = state.range(0);
   const int64_t first = QueryLowerBound();
   const int64_t matching_rows = options.rows - first;
@@ -781,6 +799,14 @@ int main(int argc, char** argv) {
         std::cerr << "invalid --selectivity-percent value\n";
         return 1;
       }
+    } else if (argument.starts_with("--row-group-rows=")) {
+      const auto digits = argument.substr(std::string_view("--row-group-rows=").size());
+      const auto [end, error] =
+          std::from_chars(digits.data(), digits.data() + digits.size(), options.row_group_rows);
+      if (error != std::errc{} || end != digits.data() + digits.size()) {
+        std::cerr << "invalid --row-group-rows value\n";
+        return 1;
+      }
     } else if (argument.starts_with("--buffer-budget-bytes=")) {
       const auto digits = argument.substr(std::string_view("--buffer-budget-bytes=").size());
       const auto [end, error] = std::from_chars(digits.data(), digits.data() + digits.size(),
@@ -805,6 +831,7 @@ int main(int argc, char** argv) {
       (options.unprojected_binary_bytes > 0 && options.projected_binary_bytes > 0) ||
       options.projected_columns == 0 || options.projected_columns > 15 ||
       options.selectivity_percent == 0 || options.selectivity_percent > 100 ||
+      options.row_group_rows == 0 || options.row_group_rows > 262144 ||
       (options.projected_columns > 1 && options.unprojected_binary_bytes > 0) ||
       options.buffered_budget_bytes == 0 ||
       (options.unprojected_binary_bytes > 0 && options.generate_path.empty())) {
@@ -813,7 +840,8 @@ int main(int argc, char** argv) {
                  "--generate-parquet-zstd=PATH or --segment=PATH; optional Segment-only "
                  "--unprojected-binary-bytes=20..4096 (Segment generator only), "
                  "--projected-binary-bytes=20..4096, --projected-columns=1..15; "
-                 "--selectivity-percent=1..100 and positive --buffer-budget-bytes=N\n";
+                 "--selectivity-percent=1..100, --row-group-rows=1..262144 "
+                 "and positive --buffer-budget-bytes=N\n";
     return 1;
   }
   if (!options.generate_path.empty()) {
@@ -847,7 +875,7 @@ int main(int argc, char** argv) {
   benchmark::AddCustomContext("arrow_version", ARROW_VERSION_STRING);
   benchmark::AddCustomContext("scope", "fresh_process_reader_only_no_writer_or_input_batch");
   benchmark::AddCustomContext("parquet_compression", "UNCOMPRESSED and ZSTD; explicit input paths");
-  benchmark::AddCustomContext("row_group_rows", std::to_string(kRowGroupRows));
+  benchmark::AddCustomContext("row_group_rows", std::to_string(options.row_group_rows));
   benchmark::AddCustomContext("output_batch_rows", std::to_string(kOutputBatchRows));
   benchmark::AddCustomContext("buffered_budget_bytes",
                               std::to_string(options.buffered_budget_bytes));

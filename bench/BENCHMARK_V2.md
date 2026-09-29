@@ -1251,6 +1251,83 @@ sniffer_binary_wide_dir=$(mktemp -d)
   --benchmark_repetitions=20 --benchmark_min_time=0.05s --benchmark_format=csv
 ```
 
+## 2026-09-30：Row Group × 选择率（高熵 binary 宽投影）
+
+继续使用 1M 行、4 列 nullable 高熵 32 B binary、递增 int64 key、每列每 17 行
+一个 null 的 Reader-only 场景。分别生成 1,024、8,192、65,536、262,144 行
+Row Group 的 Sniffer、Parquet 未压缩和 Parquet ZSTD 文件；四条扫描路径均在计时前
+逐列校验字节、null 与行序。谓词为 `key >= floor(rows * (100 - selectivity_percent) / 100)`，
+投影 4 个 binary 列，输出 batch 上限 4,096 行。Apple M4（10 逻辑核）、
+AppleClang 21、Arrow C++ 23.0.1、Release `-O3`、系统临时目录、warm-cache。
+每个 case 独立进程，20 次重复、每次至少 0.05 秒；P95 为排序后的第 19 个样本。
+这次实验只改变文件的 Row Group 大小与查询选择率，不是格式或库版本的前后对比。
+
+| Row Group 行数 | 选择率 | Sniffer 串行 P50/P95 ms | Sniffer 4-worker P50/P95 ms | Parquet 未压缩 P50/P95 ms | Parquet ZSTD P50/P95 ms |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 1,024 | 1% | 0.811 / 0.854 | 2.860 / 2.906 | 1.473 / 1.511 | 2.397 / 2.457 |
+| 1,024 | 50% | 36.627 / 37.110 | 13.659 / 14.519 | 44.145 / 45.229 | 87.507 / 89.257 |
+| 8,192 | 1% | 0.904 / 0.911 | 0.883 / 0.897 | 1.182 / 1.213 | 2.532 / 2.583 |
+| 8,192 | 50% | 32.645 / 33.051 | 9.634 / 9.685 | 34.797 / 36.337 | 77.168 / 78.137 |
+| 65,536 | 1% | 0.929 / 0.941 | 0.998 / 1.009 | 1.092 / 1.116 | 2.292 / 2.315 |
+| 65,536 | 50% | 33.217 / 33.786 | 13.679 / 13.933 | 31.729 / 33.516 | 62.890 / 64.514 |
+| 262,144 | 1% | 8.957 / 9.345 | 8.904 / 9.038 | 10.736 / 10.898 | 23.780 / 24.572 |
+| 262,144 | 50% | 42.859 / 43.448 | 42.904 / 44.794 | 36.934 / 37.947 | 78.812 / 79.999 |
+
+| Row Group 行数 | Sniffer / Parquet / ZSTD 文件 MB | 总组数 | 剪枝组 1% / 50% | Sniffer 读取列块 1% / 50% | Sniffer 实际列块读取 MB 1% / 50% |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 1,024 | 138.787 / 151.895 / 138.617 | 977 | 966 / 488 | 45 / 1,957 | 1.48 / 68.58 |
+| 8,192 | 138.667 / 152.411 / 138.300 | 123 | 120 / 61 | 13 / 249 | 2.34 / 68.55 |
+| 65,536 | 138.978 / 149.910 / 133.625 | 16 | 15 / 7 | 5 / 37 | 2.35 / 74.27 |
+| 262,144 | 139.223 / 146.471 / 130.344 | 4 | 3 / 1 | 5 / 13 | 29.73 / 101.66 |
+
+文件 MB 与读取 MB 均为十进制 10⁶ B。1% 查询在 256K 分组上只命中尾组的一小部分，
+但列块仍以整组为单位读取；Sniffer 实际读取约 29.73 MB，明显多于 8K 分组的
+2.34 MB。1K 分组的 1% 查询只需 11 个候选组，4-worker 的调度成本超过工作量；
+50% 查询则以 8K 分组的 4-worker P50 最低。Parquet 的候选列字节是 Footer 元数据
+`total_compressed_size`，不是物理读取量，此处不与 Sniffer 实际 I/O 字节直接比较。
+这些是同一分布的方向性结果，不能据此确定通用最优 Row Group。
+
+默认 `--buffer-budget-bytes=67108864` 时，256K 分组的单组估算已超过预算，
+4-worker case 实际 `parallel_workers_started=0`，安全回退串行。因此上表该行
+不代表真正的并行吞吐。另在 256K、50% 场景显式增大预算，20 次重复的延迟与
+另起进程 7 次重复的 median counters 如下：
+
+| 4-worker 预算 MiB | 在途组峰值 | P50/P95 ms | 进程 RSS 高水位 MB | Arrow pool 峰值 MB |
+| ---: | ---: | ---: | ---: | ---: |
+| 64（默认，回退） | 0 | 42.904 / 44.794 | 121.27 | 67.12 |
+| 128 | 1 | 42.017 / 43.268 | 144.34 | 67.12 |
+| 256 | 3 | 18.921 / 19.297 | 197.05 | 69.05 |
+| 512 | 4 | 18.919 / 19.384 | 164.00 | 69.05 |
+
+256K 串行扫描的独立 RSS median 约 121.18 MB。预算是 Row Group 在途**估算**，
+不是进程 RSS 上限；高水位包含 Reader 打开和计时前校验，独立进程的 RSS 还受分配器
+与系统状态影响，故不能把 256/512 MiB 两行的 RSS 差异解释为预算增加降低内存。
+此工作负载在 50% 时只有 3 个候选组，512 MiB 未带来可确认的额外速度收益。
+默认仍保持串行，内部并行需明确 opt-in；cold-cache、其他宽度/变长分布仍未覆盖。
+
+复现时每种 Row Group 大小分别生成三个文件，扫描传入相同的 `--row-group-rows`；
+下面给出 1,024 行分组的一个 case，其他组合替换参数并新起进程：
+
+```sh
+sniffer_rg_dir=$(mktemp -d)
+./build-release/sniffer_core_reader_memory_benchmark \
+  "--generate=$sniffer_rg_dir/data.seg" --rows=1000000 --row-group-rows=1024 \
+  --projected-binary-bytes=32 --projected-columns=4
+./build-release/sniffer_core_reader_memory_benchmark \
+  "--generate-parquet=$sniffer_rg_dir/data.parquet" --rows=1000000 \
+  --row-group-rows=1024 --projected-binary-bytes=32 --projected-columns=4
+./build-release/sniffer_core_reader_memory_benchmark \
+  "--generate-parquet-zstd=$sniffer_rg_dir/data.zstd.parquet" --rows=1000000 \
+  --row-group-rows=1024 --projected-binary-bytes=32 --projected-columns=4
+./build-release/sniffer_core_reader_memory_benchmark \
+  "--segment=$sniffer_rg_dir/data.seg" "--parquet=$sniffer_rg_dir/data.parquet" \
+  "--parquet-zstd=$sniffer_rg_dir/data.zstd.parquet" --rows=1000000 \
+  --row-group-rows=1024 --projected-binary-bytes=32 --projected-columns=4 \
+  --selectivity-percent=1 \
+  '--benchmark_filter=^ReaderOnlyScan/real_time$' \
+  --benchmark_repetitions=20 --benchmark_min_time=0.05s --benchmark_format=csv
+```
+
 ## 2026-09-29：同文件 1% / 10% / 50% / 100% 选择率
 
 上述 1M 行、4 列 nullable 高熵 binary 文件不变（Sniffer 138,666,963 B，

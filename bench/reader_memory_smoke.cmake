@@ -252,3 +252,54 @@ if(NOT binary_wide_scan_result EQUAL 0 OR
    "${binary_wide_scan_output}${binary_wide_scan_error}" MATCHES "ERROR OCCURRED")
   message(FATAL_ERROR "binary-wide projection scan failed: ${binary_wide_scan_output}${binary_wide_scan_error}")
 endif()
+
+set(small_rg_segment "${READER_MEMORY_TEST_DIR}/reader_memory_${memory_suffix}.rg1024.seg")
+set(small_rg_parquet "${READER_MEMORY_TEST_DIR}/reader_memory_${memory_suffix}.rg1024.parquet")
+set(small_rg_zstd "${READER_MEMORY_TEST_DIR}/reader_memory_${memory_suffix}.rg1024.zstd.parquet")
+foreach(small_rg_case IN ITEMS segment parquet zstd)
+  if(small_rg_case STREQUAL "segment")
+    set(small_rg_generate "--generate=${small_rg_segment}")
+  elseif(small_rg_case STREQUAL "parquet")
+    set(small_rg_generate "--generate-parquet=${small_rg_parquet}")
+  else()
+    set(small_rg_generate "--generate-parquet-zstd=${small_rg_zstd}")
+  endif()
+  execute_process(
+    COMMAND "${READER_MEMORY_EXE}" "${small_rg_generate}" --rows=2048
+            --row-group-rows=1024 --projected-binary-bytes=32 --projected-columns=4
+    RESULT_VARIABLE small_rg_generate_result
+    OUTPUT_VARIABLE small_rg_generate_output
+    ERROR_VARIABLE small_rg_generate_error
+  )
+  if(NOT small_rg_generate_result EQUAL 0)
+    file(REMOVE "${small_rg_segment}" "${small_rg_parquet}" "${small_rg_zstd}")
+    message(FATAL_ERROR "RG 1024 ${small_rg_case} generation failed: ${small_rg_generate_output}${small_rg_generate_error}")
+  endif()
+endforeach()
+
+execute_process(
+  COMMAND "${READER_MEMORY_EXE}" "--segment=${small_rg_segment}"
+          "--parquet=${small_rg_parquet}" "--parquet-zstd=${small_rg_zstd}"
+          --rows=2048 --row-group-rows=1024 --projected-binary-bytes=32
+          --projected-columns=4 --selectivity-percent=1
+          "--benchmark_filter=^(ReaderOnlyScan|BoundedParallelReaderScan/4|ParquetReaderOnlyScan/Uncompressed|ParquetReaderOnlyScan/ZSTD)/real_time$"
+          --benchmark_dry_run
+  RESULT_VARIABLE small_rg_result
+  OUTPUT_VARIABLE small_rg_output
+  ERROR_VARIABLE small_rg_error
+)
+execute_process(
+  COMMAND "${READER_MEMORY_EXE}" "--segment=${small_rg_segment}" --rows=2048
+          --row-group-rows=8192 --projected-binary-bytes=32 --projected-columns=4
+          "--benchmark_filter=^ReaderOnlyScan/real_time$" --benchmark_dry_run
+  OUTPUT_VARIABLE mismatched_rg_output
+  ERROR_VARIABLE mismatched_rg_error
+)
+file(REMOVE "${small_rg_segment}" "${small_rg_parquet}" "${small_rg_zstd}")
+if(NOT small_rg_result EQUAL 0 OR
+   NOT "${small_rg_output}${small_rg_error}" MATCHES "parallel_workers_started=2" OR
+   NOT "${small_rg_output}${small_rg_error}" MATCHES "ParquetReaderOnlyScan/ZSTD" OR
+   "${small_rg_output}${small_rg_error}" MATCHES "ERROR OCCURRED" OR
+   NOT "${mismatched_rg_output}${mismatched_rg_error}" MATCHES "ERROR OCCURRED")
+  message(FATAL_ERROR "RG 1024 scan or mismatch guard failed: ${small_rg_output}${small_rg_error}${mismatched_rg_output}${mismatched_rg_error}")
+endif()
