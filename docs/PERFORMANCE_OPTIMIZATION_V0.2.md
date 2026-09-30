@@ -64,6 +64,10 @@ SIMD、多级编码链和新压缩算法只有在标量路径完成剖析和优�
 - [ ] 增加超过页缓存容量的数据集，并分别报告 warm-cache 与 cold-cache 结果。
   - [x] macOS 为 Sniffer/Parquet Reader-only 增加显式、默认关闭的 `F_NOCACHE`
         缓存旁路对照；这既未驱逐已有缓存，也不等于真正 cold-cache，父项保持未完成。
+  - [x] 在 16 GiB 机器上生成总计 21.12 GB 的三格式高熵语料，分别记录首次读取、
+        七次复读与七次 `F_NOCACHE`；见 `bench/BENCHMARK_V2.md` 最后一节。
+  - [ ] 仍无可核实的物理冷读证据（页缓存状态/实际设备读取量），因此不把
+        “超内存 + 首读”或 `F_NOCACHE` 冒充严格 cold-cache 验收。
 
 ## 4. P0：消除已知重复工作和逐值对象开销
 
@@ -1595,3 +1599,20 @@ CV 为 0.46%。Dictionary payload 仍为 113,058 字节，完整 Segment 仍为 
 参考：[Arrow 25 发布说明](https://arrow.apache.org/blog/2026/07/10/25.0.0-release/)、
 [Arrow bit-unpack 变更](https://github.com/apache/arrow/pull/49756)、
 [Arrow 位解包接口源码](https://github.com/apache/arrow/blob/main/cpp/src/arrow/util/bpacking_internal.h)。
+
+### 2026-09-30：跨分布完整矩阵与超内存缓存对照
+
+新增 Reader-only 数据生成形态（低基数字符串、变长字符串、长 RLE 和窄值域整数，
+均包含 null），与原有递增整数/高熵 nullable binary 组成六分布矩阵。按
+1K/8K/64K/256K Row Group × 1%/10%/50%/100% 选择率 × 1/4 列投影，
+测 Sniffer 串行/4-worker、Parquet 未压缩/ZSTD，默认缓存与 `F_NOCACHE`
+各 192 格、每个 case 7 次重复。完整 1,536 case 的 P50/P95/CV、文件字节、
+剪枝和内存高水位，以及 10,752 个原始测量样本已持久化在
+[`bench/results/V0.2_DISTRIBUTION_MATRIX_2026-09-30.tsv`](../bench/results/V0.2_DISTRIBUTION_MATRIX_2026-09-30.tsv)
+及两套压缩 JSONL。另用 21,121,629,228 B 语料（物理 RAM 17,179,869,184 B）
+测每种格式一次首次读取和 7 次交替 warm/旁路；数据、命令、注意事项及
+具体数字见 [`bench/BENCHMARK_V2.md`](../bench/BENCHMARK_V2.md)。
+
+这完成**跨数据分布矩阵**和**超内存近似冷读/缓存旁路对照**，没有证明严格
+物理 cold-cache；上方父验收项仍开放。并且本轮只扩展 benchmark 与 smoke，
+不改生产 Reader、Segment 格式或公共 API；与 `DESIGN.md` 阶段三范围无偏离。

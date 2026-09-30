@@ -253,6 +253,49 @@ if(NOT binary_wide_scan_result EQUAL 0 OR
   message(FATAL_ERROR "binary-wide projection scan failed: ${binary_wide_scan_output}${binary_wide_scan_error}")
 endif()
 
+# Exercise each nullable cross-distribution generator through both format readers.
+foreach(shape IN ITEMS low-cardinality-string variable-string long-run-int narrow-int)
+  set(shape_segment "${READER_MEMORY_TEST_DIR}/reader_memory_${memory_suffix}.${shape}.seg")
+  set(shape_parquet "${READER_MEMORY_TEST_DIR}/reader_memory_${memory_suffix}.${shape}.parquet")
+  set(shape_zstd "${READER_MEMORY_TEST_DIR}/reader_memory_${memory_suffix}.${shape}.zstd.parquet")
+  foreach(format IN ITEMS segment parquet zstd)
+    if(format STREQUAL "segment")
+      set(generate_option "--generate=${shape_segment}")
+    elseif(format STREQUAL "parquet")
+      set(generate_option "--generate-parquet=${shape_parquet}")
+    else()
+      set(generate_option "--generate-parquet-zstd=${shape_zstd}")
+    endif()
+    execute_process(
+      COMMAND "${READER_MEMORY_EXE}" "${generate_option}" --rows=4096
+              --row-group-rows=1024 --projected-columns=4 "--value-shape=${shape}"
+      RESULT_VARIABLE shape_generate_result
+      OUTPUT_VARIABLE shape_generate_output
+      ERROR_VARIABLE shape_generate_error
+    )
+    if(NOT shape_generate_result EQUAL 0)
+      message(FATAL_ERROR "${shape} ${format} generation failed: ${shape_generate_output}${shape_generate_error}")
+    endif()
+  endforeach()
+  execute_process(
+    COMMAND "${READER_MEMORY_EXE}" "--segment=${shape_segment}"
+            "--parquet=${shape_parquet}" "--parquet-zstd=${shape_zstd}"
+            --rows=4096 --row-group-rows=1024 --projected-columns=4
+            "--value-shape=${shape}" --selectivity-percent=10
+            "--benchmark_filter=^(ReaderOnlyScan|BoundedParallelReaderScan/4|ParquetReaderOnlyScan/Uncompressed|ParquetReaderOnlyScan/ZSTD)/real_time$"
+            --benchmark_dry_run
+    RESULT_VARIABLE shape_scan_result
+    OUTPUT_VARIABLE shape_scan_output
+    ERROR_VARIABLE shape_scan_error
+  )
+  file(REMOVE "${shape_segment}" "${shape_parquet}" "${shape_zstd}")
+  if(NOT shape_scan_result EQUAL 0 OR
+     NOT "${shape_scan_output}${shape_scan_error}" MATCHES "ParquetReaderOnlyScan/ZSTD" OR
+     "${shape_scan_output}${shape_scan_error}" MATCHES "ERROR OCCURRED")
+    message(FATAL_ERROR "${shape} scan failed: ${shape_scan_output}${shape_scan_error}")
+  endif()
+endforeach()
+
 set(small_rg_segment "${READER_MEMORY_TEST_DIR}/reader_memory_${memory_suffix}.rg1024.seg")
 set(small_rg_parquet "${READER_MEMORY_TEST_DIR}/reader_memory_${memory_suffix}.rg1024.parquet")
 set(small_rg_zstd "${READER_MEMORY_TEST_DIR}/reader_memory_${memory_suffix}.rg1024.zstd.parquet")
@@ -367,6 +410,23 @@ if(APPLE)
        "${cache_bypass_output}${cache_bypass_error}" MATCHES "ERROR OCCURRED")
       file(REMOVE "${small_rg_segment}" "${small_rg_parquet}" "${small_rg_zstd}")
       message(FATAL_ERROR "cache-bypass Reader-only smoke failed: ${cache_bypass_output}${cache_bypass_error}")
+    endif()
+    execute_process(
+      COMMAND "${READER_MEMORY_EXE}" "--segment=${small_rg_segment}"
+              "--parquet=${small_rg_parquet}" "--parquet-zstd=${small_rg_zstd}"
+              --rows=2048 --row-group-rows=1024 --projected-binary-bytes=32
+              --projected-columns=4 --cache-bypass --skip-preflight
+              "--benchmark_filter=^(ReaderOnlyScan|ParquetReaderOnlyScan/Uncompressed|ParquetReaderOnlyScan/ZSTD)/real_time$"
+              --benchmark_min_time=1x --benchmark_format=json
+      RESULT_VARIABLE first_read_result
+      OUTPUT_VARIABLE first_read_output
+      ERROR_VARIABLE first_read_error
+    )
+    if(NOT first_read_result EQUAL 0 OR
+       NOT "${first_read_output}" MATCHES "\"preflight\": \"skipped\"" OR
+       "${first_read_output}${first_read_error}" MATCHES "error_occurred")
+      file(REMOVE "${small_rg_segment}" "${small_rg_parquet}" "${small_rg_zstd}")
+      message(FATAL_ERROR "single-pass cache-bypass smoke failed: ${first_read_output}${first_read_error}")
     endif()
   endif()
 endif()

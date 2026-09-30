@@ -2,8 +2,9 @@
 
 本记录从 2026-09-23 起使用 Parquet 作为文件格式对照。v1 的 Arrow IPC 数字保留在
 [`BENCHMARK_V1.md`](BENCHMARK_V1.md)，两版的 Row Group、代码和测量口径不同，不能直接以表中
-绝对值推导版本间提速。本报告已补 16 列宽表、同机旧版对照和完整 warm-cache
-参数矩阵；尚未覆盖超过页缓存的数据集和可信 cold-cache，因此不是 v0.2 最终验收报告。
+绝对值推导版本间提速。本报告已补 16 列宽表、同机旧版对照、跨六种分布的
+warm-cache / `F_NOCACHE` 参数矩阵，以及总量超过物理内存的首次读取实验。
+未能证明每次目标读取都是真正的物理 cold-cache，因此仍不是 v0.2 最终验收报告。
 
 ## 环境与口径
 
@@ -87,7 +88,8 @@ Plain 回退与 offset 开销。
 
 ## 待补齐
 
-- 宽表的多列相关性与宽投影、超页缓存数据和 cold-cache 对照。
+- 宽表的多列相关性与严格可验证的物理 cold-cache 对照；超内存首次读取及
+  `F_NOCACHE` 对照见文末，不能代替严格冷读。
 - 各格式可比的物理读取字节；下文旧场景的 RSS 是写入＋扫描同进程的
   high-water，文末新增 Reader-only 双进程基准，但仍只覆盖 warm-cache。
 - 更广的旧版→当前矩阵复测；下文仅给出相同输入/Row Group 的固定场景与六种压缩分布。
@@ -1620,3 +1622,119 @@ Reader 打开不计时。数据、查询、机器、Release 构建、12 MiB 每�
 的 P50 接近，但非交错 A/B，不能把亚毫秒差异归因于句柄模型。与 Parquet
 现在都可采用每请求独立 Reader 比较；两种格式的扫描实现、batch 缓冲策略
 和可观测 I/O 指标仍不同，且 RSS 包含计时前校验，不构成通用格式胜负结论。
+
+## 2026-09-30：跨数据分布 × Row Group × 选择率 × 投影 × 缓存控制
+
+在 Apple M4（10 逻辑核、16 GiB RAM）、macOS arm64、AppleClang 21、Arrow/Parquet
+23.0.1、Google Benchmark 1.9.4、Release `-O3` 上测量。Google Benchmark 的
+`source_revision` 为 `b47ed98fcfd3-dirty`（本节 benchmark 扩展未提交时的源码）。
+每个文件 1,000,000 行、4 个可投影列、递增 int64 sort key；生成过程按 Row Group
+流式写入，不一次性驻留全部输入。六类分布：
+
+| 分布 | 投影值 | null |
+| --- | --- | --- |
+| `legacy-int` | 非空递增 int64；其余列为按行号线性生成的 int64 | 无 |
+| `high-entropy-binary` | 确定性伪随机 32 B binary | 每 17 行 1 个 |
+| `low-cardinality-string` | 每列 8 种短字符串 | 每 17 行 1 个 |
+| `variable-string` | 16–128 B、随行号变化的字符串 | 每 17 行 1 个 |
+| `long-run-int` | 512 行一段的 int64 重复值 | 每 2,048 行 1 个 |
+| `narrow-int` | 每列 16 种 int64 值 | 每 17 行 1 个 |
+
+矩阵为 6 分布 × 4 种 Row Group（1,024/8,192/65,536/262,144）× 4 档
+选择率（1%/10%/50%/100%）× 1/4 列投影 = **192 个输入/查询格**；每格
+分别测 Sniffer 串行、Sniffer 4-worker、Parquet 未压缩和 Parquet ZSTD。
+Parquet 使用默认 dictionary 配置、与 Segment 相同的 Row Group 大小和 sort-key
+statistics 剪枝。所有格再分别运行默认 OS 缓存与 macOS `F_NOCACHE`，总计
+1,536 个格式/路径/缓存 case，每个 7 次重复（10,752 个原始 `real_time`
+样本，`--benchmark_min_time=0.01s`）。每个格独立进程；默认缓存计时前逐值
+验证所有输出，旁路矩阵跳过预热预检，但复用已在默认缓存矩阵逐值验证过的同批文件。
+两种模式均在计时循环内验证输出行数。同一格的四个格式/执行 case 在同一
+进程顺序运行，RSS/Arrow pool 高水位会受前面 case 影响，不能用于格式间
+独立内存对比。不能把 `F_NOCACHE` 当作驱逐已存在页缓存的严格 cold-cache。
+
+下表只展示 **RG=8,192、50% 选择率、4 列投影** 的 P50（ms）；其它 186 格
+及各格 P95、min、CV、峰值 RSS/Arrow pool、剪枝和读取量见完整 TSV 与原始 JSON。
+
+| 分布 | Sniffer 串行 warm | Sniffer 4-worker warm | Parquet warm | Parquet ZSTD warm | Sniffer 串行 `F_NOCACHE` | Sniffer 4-worker `F_NOCACHE` |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `legacy-int` | 3.796 | 1.355 | 5.665 | 19.041 | 12.975 | 6.072 |
+| `high-entropy-binary` | 32.225 | 9.711 | 34.169 | 76.006 | 81.083 | 26.071 |
+| `low-cardinality-string` | 24.563 | 6.913 | 20.865 | 21.688 | 49.714 | 9.659 |
+| `variable-string` | 64.903 | 20.621 | 55.043 | 120.945 | 153.415 | 46.995 |
+| `long-run-int` | 4.976 | 1.688 | 5.477 | 5.657 | 9.670 | 3.212 |
+| `narrow-int` | 5.099 | 1.748 | 9.377 | 10.439 | 5.143 | 1.756 |
+
+同一切片的文件大小（B，Sniffer / Parquet / Parquet ZSTD）：`legacy-int`
+8,826,382 / 48,267,444 / 13,079,943；`high-entropy-binary` 138,666,963 /
+152,410,904 / 138,299,872；`low-cardinality-string` 6,270,214 / 12,164,147 /
+2,931,210；`variable-string` 305,257,527 / 303,079,433 / 179,901,391；
+`long-run-int` 1,925,038 / 9,860,051 / 2,822,256；`narrow-int` 4,202,318 /
+12,660,951 / 2,928,107。这个切片中均剪枝 61/123 个 Row Group；高熵 binary
+Sniffer 候选 chunk 实读 68,545,000 B，Parquet 未压缩/ZSTD 的候选列块压缩长度
+为 71,429,469 / 67,839,958 B，后两者**不是**物理读取字节。完整矩阵中
+116/1,536 个 case 的 CV 超过 5%，其中 51 个超过 10%；对低耗时或高波动格
+不做微小差异的胜负归因。缓存旁路下 Parquet 的 P50 未必变慢，可能是 CPU
+解码、读取接口和 OS 行为共同作用，不据此声称缓存控制无效。
+
+可复现脚本：
+
+```sh
+python3 bench/run_reader_distribution_matrix.py \
+  --exe ./build-release/sniffer_core_reader_memory_benchmark \
+  --output /private/tmp/matrix-warm.jsonl
+python3 bench/run_reader_distribution_matrix.py \
+  --exe ./build-release/sniffer_core_reader_memory_benchmark \
+  --output /private/tmp/matrix-nocache.jsonl \
+  --existing-data-dir <第一条命令输出的 data_dir> \
+  --cache-bypass --skip-preflight
+python3 bench/summarize_reader_distribution_matrix.py \
+  /private/tmp/matrix-warm.jsonl /private/tmp/matrix-nocache.jsonl \
+  --output /private/tmp/matrix-summary.tsv
+```
+
+本轮逐 case 汇总为 [`results/V0.2_DISTRIBUTION_MATRIX_2026-09-30.tsv`](results/V0.2_DISTRIBUTION_MATRIX_2026-09-30.tsv)，
+两套完整原始 JSONL 分别存于 [`warm`](results/V0.2_DISTRIBUTION_MATRIX_2026-09-30.jsonl.gz)
+与 [`F_NOCACHE`](results/V0.2_DISTRIBUTION_MATRIX_NOCACHE_2026-09-30.jsonl.gz)
+（gzip 压缩，无抽样）。本次临时输入文件已在完成验证后清理，约释放 25 GiB；
+原始结果仍在 Git 中，需复测时按以上命令重新生成数据。
+
+## 2026-09-30：超过内存语料的首次读取 / 复读 / 缓存旁路
+
+使用同一高熵 nullable binary 形态、4 列投影、50,000,000 行、RG=65,536、
+50% 选择率，分别生成 Segment 6,948,972,195 B、Parquet 7,492,770,495 B、
+Parquet ZSTD 6,679,886,538 B；合计 **21,121,629,228 B > 本机物理内存
+17,179,869,184 B**。每个格式独立进程精确执行一次 scan、关闭预热预检；
+首次读取 1 次，之后默认缓存与 `F_NOCACHE` 交替各 7 次。表中复读和旁路为
+7 次 P50，首次读取只是一个样本，单位 ms：
+
+| 格式 | 首次读取 | 复读 P50 | `F_NOCACHE` P50 | 剪枝 Row Group |
+| --- | ---: | ---: | ---: | ---: |
+| Sniffer 串行 | 2,092.717 | 1,566.481 | 1,564.191 | 381 |
+| Parquet 未压缩 | 3,516.019 | 2,060.159 | 1,939.180 | 381 |
+| Parquet ZSTD | 4,614.079 | 3,256.795 | 3,221.524 | 381 |
+
+每条查询输出 25,000,000 行；Sniffer 记录的 chunk 实读为 3,428,655,112 B，
+Parquet 未压缩/ZSTD 的候选列块压缩长度为 3,501,233,186 /
+3,270,987,277 B（不等于物理读取量）。本轮各进程历史峰值 RSS 中位数：
+Sniffer 约 40 MB，Parquet 未压缩约 2.28–3.53 GB，ZSTD 约 2.53–3.30 GB；
+Parquet 此基准一次把所有命中 Row Group 传入 `GetRecordBatchReader`，其缓冲策略
+与 Sniffer 的按组迭代不同，不能把该 RSS 差异解释成格式固有内存比。RSS
+也是进程高水位，不是一次 scan 的净增量。
+
+复现：
+
+```sh
+python3 bench/run_reader_cache_experiment.py \
+  --exe ./build-release/sniffer_core_reader_memory_benchmark \
+  --output /private/tmp/over-ram-cache.jsonl \
+  --physical-ram-bytes 17179869184
+```
+
+完整 45 次单扫描及 context/计数见
+[`results/V0.2_OVER_RAM_CACHE_2026-09-30.jsonl`](results/V0.2_OVER_RAM_CACHE_2026-09-30.jsonl)。
+此实验约 20 GiB 的临时输入文件也已清理；同样可用上述脚本重新生成。
+首次读取相对复读更慢，但生成刚完成时 OS 仍可能缓存目标文件的一部分，且
+文件系统缓存是全局共享资源；“总文件字节数 > RAM”不能证明每次所读候选块
+均不在缓存中。没有驱逐全局缓存，也没有可验证的物理读取计数，因此本节是
+**超内存近似冷读与文件缓存旁路实验，不是严格 cold-cache 验收**。没有以
+单次首次读取声称性能提升。生产 Reader、格式和公共 API 均未改变。

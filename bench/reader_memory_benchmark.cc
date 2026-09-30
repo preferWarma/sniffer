@@ -5,6 +5,7 @@
 #include <parquet/statistics.h>
 
 #include <algorithm>
+#include <array>
 #include <charconv>
 #include <cstdint>
 #include <filesystem>
@@ -31,6 +32,14 @@ namespace {
 constexpr uint32_t kDefaultRowGroupRows = 8192;
 constexpr uint32_t kOutputBatchRows = 4096;
 
+enum class ValueShape {
+  kLegacy,
+  kLowCardinalityString,
+  kVariableString,
+  kLongRunInt,
+  kNarrowInt,
+};
+
 struct Options {
   std::string generate_path;
   std::string generate_parquet_path;
@@ -46,6 +55,8 @@ struct Options {
   uint32_t row_group_rows = kDefaultRowGroupRows;
   uint64_t buffered_budget_bytes = 64U * 1024U * 1024U;
   bool cache_bypass = false;
+  bool skip_preflight = false;
+  ValueShape value_shape = ValueShape::kLegacy;
 };
 
 Options options;
@@ -133,10 +144,135 @@ int64_t ExtraValue(int64_t row, uint32_t projection_index) {
   return row * static_cast<int64_t>(projection_index + 1U) + projection_index;
 }
 
+bool GeneratedNull(int64_t row, ValueShape shape) {
+  return shape == ValueShape::kLongRunInt ? row % 2048 == 0 : row % 17 == 0;
+}
+
+int64_t GeneratedInteger(int64_t row, uint32_t projection, ValueShape shape) {
+  if (shape == ValueShape::kLongRunInt) {
+    return row / 512 + static_cast<int64_t>(projection) * 1000000;
+  }
+  return 1000000 + static_cast<int64_t>(projection) * 1000 + row % 16;
+}
+
+std::string GeneratedString(int64_t row, uint32_t projection, ValueShape shape) {
+  if (shape == ValueShape::kLowCardinalityString) {
+    static constexpr std::array<std::string_view, 8> labels = {
+        "alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf", "hotel"};
+    return std::to_string(projection) + "_" +
+           std::string(labels[(static_cast<uint64_t>(row / 4) + projection) % labels.size()]);
+  }
+  const size_t length =
+      16U + (static_cast<size_t>(row) * 7U + static_cast<size_t>(projection) * 13U) % 113U;
+  std::string value = std::to_string(row) + "_" + std::to_string(projection) + "_";
+  const size_t prefix_length = value.size();
+  value.resize(length, 'a');
+  uint64_t state =
+      static_cast<uint64_t>(row) ^ (static_cast<uint64_t>(projection + 1U) * 0xD6E8FEB86659FD93ULL);
+  for (size_t index = prefix_length; index < value.size(); ++index) {
+    state = state * 6364136223846793005ULL + 1442695040888963407ULL;
+    value[index] = static_cast<char>('a' + (state >> 32U) % 26U);
+  }
+  return value;
+}
+
+std::shared_ptr<arrow::DataType> ProjectionType(const Options& config) {
+  if (config.value_shape == ValueShape::kLowCardinalityString ||
+      config.value_shape == ValueShape::kVariableString) {
+    return arrow::utf8();
+  }
+  return config.projected_binary_bytes > 0 ? arrow::binary() : arrow::int64();
+}
+
+const char* ShapeName(ValueShape shape) {
+  switch (shape) {
+    case ValueShape::kLegacy:
+      return "legacy";
+    case ValueShape::kLowCardinalityString:
+      return "low-cardinality-string";
+    case ValueShape::kVariableString:
+      return "variable-string";
+    case ValueShape::kLongRunInt:
+      return "long-run-int";
+    case ValueShape::kNarrowInt:
+      return "narrow-int";
+  }
+  return "unknown";
+}
+
+arrow::Result<std::shared_ptr<arrow::Array>> MakeShapedProjection(int64_t offset, int64_t count,
+                                                                  uint32_t projection,
+                                                                  ValueShape shape) {
+  if (shape == ValueShape::kLowCardinalityString || shape == ValueShape::kVariableString) {
+    arrow::StringBuilder builder;
+    for (int64_t row = offset; row < offset + count; ++row) {
+      if (GeneratedNull(row, shape)) {
+        ARROW_RETURN_NOT_OK(builder.AppendNull());
+      } else {
+        ARROW_RETURN_NOT_OK(builder.Append(GeneratedString(row, projection, shape)));
+      }
+    }
+    std::shared_ptr<arrow::Array> result;
+    ARROW_RETURN_NOT_OK(builder.Finish(&result));
+    return result;
+  }
+  arrow::Int64Builder builder;
+  ARROW_RETURN_NOT_OK(builder.Reserve(count));
+  for (int64_t row = offset; row < offset + count; ++row) {
+    if (GeneratedNull(row, shape)) {
+      ARROW_RETURN_NOT_OK(builder.AppendNull());
+    } else {
+      ARROW_RETURN_NOT_OK(builder.Append(GeneratedInteger(row, projection, shape)));
+    }
+  }
+  std::shared_ptr<arrow::Array> result;
+  ARROW_RETURN_NOT_OK(builder.Finish(&result));
+  return result;
+}
+
 arrow::Status VerifyGeneratedProjection(const arrow::RecordBatch& batch, int64_t skip,
                                         int first_column, int64_t* expected_row) {
   if (batch.num_columns() != first_column + static_cast<int>(options.projected_columns)) {
     return arrow::Status::Invalid("generated benchmark projection column count mismatch");
+  }
+  if (options.value_shape != ValueShape::kLegacy) {
+    const int64_t first_row = *expected_row;
+    for (uint32_t projection = 0; projection < options.projected_columns; ++projection) {
+      const auto values = batch.column(first_column + static_cast<int>(projection))->Slice(skip);
+      const bool string_shape = options.value_shape == ValueShape::kLowCardinalityString ||
+                                options.value_shape == ValueShape::kVariableString;
+      if (string_shape && values->type_id() != arrow::Type::STRING) {
+        return arrow::Status::TypeError("generated benchmark expected string projection");
+      }
+      if (!string_shape && values->type_id() != arrow::Type::INT64) {
+        return arrow::Status::TypeError("generated benchmark expected int64 projection");
+      }
+      for (int64_t row = 0; row < values->length(); ++row) {
+        const int64_t id = first_row + row;
+        if (GeneratedNull(id, options.value_shape)) {
+          if (!values->IsNull(row)) {
+            return arrow::Status::Invalid("generated benchmark expected null projection");
+          }
+          continue;
+        }
+        if (values->IsNull(row)) {
+          return arrow::Status::Invalid("generated benchmark unexpected null projection");
+        }
+        if (string_shape) {
+          const auto& typed = static_cast<const arrow::StringArray&>(*values);
+          if (typed.GetView(row) != GeneratedString(id, projection, options.value_shape)) {
+            return arrow::Status::Invalid("generated benchmark string projection mismatch");
+          }
+        } else {
+          const auto& typed = static_cast<const arrow::Int64Array&>(*values);
+          if (typed.Value(row) != GeneratedInteger(id, projection, options.value_shape)) {
+            return arrow::Status::Invalid("generated benchmark integer projection mismatch");
+          }
+        }
+      }
+    }
+    *expected_row += batch.num_rows() - skip;
+    return arrow::Status::OK();
   }
   const int64_t first_row = *expected_row;
   ARROW_RETURN_NOT_OK(VerifyGeneratedValues(*batch.column(first_column)->Slice(skip), expected_row,
@@ -164,8 +300,8 @@ arrow::Status VerifyGeneratedProjection(const arrow::RecordBatch& batch, int64_t
 
 arrow::Result<std::shared_ptr<arrow::RecordBatch>> MakeGeneratedBatch(
     const std::shared_ptr<arrow::Schema>& arrow_schema, int64_t offset, int64_t count,
-    uint32_t unprojected_binary_bytes, uint32_t projected_binary_bytes,
-    uint32_t projected_columns) {
+    uint32_t unprojected_binary_bytes, uint32_t projected_binary_bytes, uint32_t projected_columns,
+    ValueShape shape) {
   arrow::Int64Builder key_builder;
   ARROW_RETURN_NOT_OK(key_builder.Reserve(count));
   for (int64_t row = 0; row < count; ++row) {
@@ -174,7 +310,9 @@ arrow::Result<std::shared_ptr<arrow::RecordBatch>> MakeGeneratedBatch(
   std::shared_ptr<arrow::Array> key;
   std::shared_ptr<arrow::Array> value;
   ARROW_RETURN_NOT_OK(key_builder.Finish(&key));
-  if (projected_binary_bytes > 0) {
+  if (shape != ValueShape::kLegacy) {
+    ARROW_ASSIGN_OR_RAISE(value, MakeShapedProjection(offset, count, 0, shape));
+  } else if (projected_binary_bytes > 0) {
     arrow::BinaryBuilder value_builder;
     for (int64_t row = 0; row < count; ++row) {
       const int64_t id = offset + row;
@@ -195,6 +333,11 @@ arrow::Result<std::shared_ptr<arrow::RecordBatch>> MakeGeneratedBatch(
   }
   std::vector<std::shared_ptr<arrow::Array>> columns = {std::move(key), std::move(value)};
   for (uint32_t projection = 1; projection < projected_columns; ++projection) {
+    if (shape != ValueShape::kLegacy) {
+      ARROW_ASSIGN_OR_RAISE(auto extra, MakeShapedProjection(offset, count, projection, shape));
+      columns.push_back(std::move(extra));
+      continue;
+    }
     if (projected_binary_bytes > 0) {
       arrow::BinaryBuilder extra_builder;
       for (int64_t row = 0; row < count; ++row) {
@@ -250,13 +393,13 @@ arrow::Status GenerateSegment(const Options& config) {
   sniffer::TableSchema schema{
       1,
       {{1, "key", arrow::int64(), false, nullptr},
-       {2, "value", config.projected_binary_bytes > 0 ? arrow::binary() : arrow::int64(),
-        config.projected_binary_bytes > 0, nullptr}},
+       {2, "value", ProjectionType(config),
+        config.value_shape != ValueShape::kLegacy || config.projected_binary_bytes > 0, nullptr}},
   };
   for (uint32_t projection = 1; projection < config.projected_columns; ++projection) {
-    schema.fields.push_back({projection + 2U, "value_" + std::to_string(projection),
-                             config.projected_binary_bytes > 0 ? arrow::binary() : arrow::int64(),
-                             config.projected_binary_bytes > 0, nullptr});
+    schema.fields.push_back(
+        {projection + 2U, "value_" + std::to_string(projection), ProjectionType(config),
+         config.value_shape != ValueShape::kLegacy || config.projected_binary_bytes > 0, nullptr});
   }
   if (config.unprojected_binary_bytes > 0) {
     schema.fields.push_back({3, "unused_payload", arrow::binary(), false, nullptr});
@@ -272,7 +415,8 @@ arrow::Status GenerateSegment(const Options& config) {
     const int64_t count = std::min<int64_t>(config.row_group_rows, config.rows - offset);
     ARROW_ASSIGN_OR_RAISE(
         auto batch, MakeGeneratedBatch(arrow_schema, offset, count, config.unprojected_binary_bytes,
-                                       config.projected_binary_bytes, config.projected_columns));
+                                       config.projected_binary_bytes, config.projected_columns,
+                                       config.value_shape));
     ARROW_RETURN_NOT_OK(writer->Append(std::move(batch)));
   }
   return writer->Finish();
@@ -284,13 +428,13 @@ arrow::Status GenerateParquet(const Options& config, const std::string& path,
   sniffer::TableSchema schema{
       1,
       {{1, "key", arrow::int64(), false, nullptr},
-       {2, "value", config.projected_binary_bytes > 0 ? arrow::binary() : arrow::int64(),
-        config.projected_binary_bytes > 0, nullptr}},
+       {2, "value", ProjectionType(config),
+        config.value_shape != ValueShape::kLegacy || config.projected_binary_bytes > 0, nullptr}},
   };
   for (uint32_t projection = 1; projection < config.projected_columns; ++projection) {
-    schema.fields.push_back({projection + 2U, "value_" + std::to_string(projection),
-                             config.projected_binary_bytes > 0 ? arrow::binary() : arrow::int64(),
-                             config.projected_binary_bytes > 0, nullptr});
+    schema.fields.push_back(
+        {projection + 2U, "value_" + std::to_string(projection), ProjectionType(config),
+         config.value_shape != ValueShape::kLegacy || config.projected_binary_bytes > 0, nullptr});
   }
   ARROW_ASSIGN_OR_RAISE(auto arrow_schema, schema.ToArrowSchema());
   ARROW_ASSIGN_OR_RAISE(auto output, arrow::io::FileOutputStream::Open(path));
@@ -306,8 +450,9 @@ arrow::Status GenerateParquet(const Options& config, const std::string& path,
   for (int64_t offset = 0; offset < config.rows; offset += config.row_group_rows) {
     const int64_t count = std::min<int64_t>(config.row_group_rows, config.rows - offset);
     ARROW_ASSIGN_OR_RAISE(
-        auto batch, MakeGeneratedBatch(arrow_schema, offset, count, 0,
-                                       config.projected_binary_bytes, config.projected_columns));
+        auto batch,
+        MakeGeneratedBatch(arrow_schema, offset, count, 0, config.projected_binary_bytes,
+                           config.projected_columns, config.value_shape));
     ARROW_RETURN_NOT_OK(writer->NewBufferedRowGroup());
     ARROW_RETURN_NOT_OK(writer->WriteRecordBatch(*batch));
   }
@@ -335,7 +480,7 @@ void ReaderOnlyScanImpl(benchmark::State& state, uint32_t workers) {
       {1, sniffer::Predicate::Op::kGe, std::make_shared<arrow::Int64Scalar>(QueryLowerBound())}};
   plan.output_batch_rows = kOutputBatchRows;
   const uint64_t expected_rows = static_cast<uint64_t>(options.rows - QueryLowerBound());
-  {
+  if (!options.skip_preflight) {
     sniffer::ScanExecutionOptions checked_execution;
     checked_execution.worker_count = workers;
     checked_execution.max_in_flight_row_groups = std::max<uint32_t>(workers, 2U);
@@ -559,10 +704,12 @@ void ConcurrentReaderScan(benchmark::State& state, uint32_t workers_per_query, b
     return measured;
   };
 
-  auto checked = run(true);
-  if (!checked.ok()) {
-    state.SkipWithError(checked.status().ToString());
-    return;
+  if (!options.skip_preflight) {
+    auto checked = run(true);
+    if (!checked.ok()) {
+      state.SkipWithError(checked.status().ToString());
+      return;
+    }
   }
   Measurement totals;
   for (auto _ : state) {
@@ -753,10 +900,12 @@ void ParquetReaderOnlyScan(benchmark::State& state, bool zstd) {
     state.SkipWithError("Parquet Row Group count differs from --row-group-rows");
     return;
   }
-  const auto verified = ScanParquetOnce(reader.get(), options.rows, true);
-  if (!verified.ok()) {
-    state.SkipWithError(verified.status().ToString());
-    return;
+  if (!options.skip_preflight) {
+    const auto verified = ScanParquetOnce(reader.get(), options.rows, true);
+    if (!verified.ok()) {
+      state.SkipWithError(verified.status().ToString());
+      return;
+    }
   }
   ParquetMeasurement last;
   for (auto _ : state) {
@@ -843,10 +992,12 @@ void ConcurrentParquetReaderScan(benchmark::State& state, bool zstd) {
     return measured;
   };
 
-  auto checked = run(true);
-  if (!checked.ok()) {
-    state.SkipWithError(checked.status().ToString());
-    return;
+  if (!options.skip_preflight) {
+    auto checked = run(true);
+    if (!checked.ok()) {
+      state.SkipWithError(checked.status().ToString());
+      return;
+    }
   }
   ParquetMeasurement totals;
   for (auto _ : state) {
@@ -936,6 +1087,10 @@ arrow::Result<uint64_t> ScanShard(sniffer::SegmentReader& reader, const sniffer:
 }
 
 void ShardedSortRangeScan(benchmark::State& state) {
+  if (options.value_shape != ValueShape::kLegacy) {
+    state.SkipWithError("ShardedSortRangeScan supports legacy values only");
+    return;
+  }
   auto maybe_reader = sniffer::SegmentReader::OpenWithOptions(
       options.segment_path, sniffer::ReaderOpenOptions{.bypass_os_cache = options.cache_bypass});
   if (!maybe_reader.ok()) {
@@ -963,10 +1118,12 @@ void ShardedSortRangeScan(benchmark::State& state) {
     const int64_t upper = first + matching_rows * (worker + 1) / workers;
     bounds.emplace_back(lower, upper);
     plans.push_back(ShardPlan(lower, upper));
-    const auto check = ScanShard(*reader, plans.back(), lower, upper, true, nullptr);
-    if (!check.ok()) {
-      state.SkipWithError(check.status().ToString());
-      return;
+    if (!options.skip_preflight) {
+      const auto check = ScanShard(*reader, plans.back(), lower, upper, true, nullptr);
+      if (!check.ok()) {
+        state.SkipWithError(check.status().ToString());
+        return;
+      }
     }
   }
   uint64_t chunk_bytes_read = 0;
@@ -1096,6 +1253,24 @@ int main(int argc, char** argv) {
       }
     } else if (argument == "--cache-bypass") {
       options.cache_bypass = true;
+    } else if (argument == "--skip-preflight") {
+      options.skip_preflight = true;
+    } else if (argument.starts_with("--value-shape=")) {
+      const auto shape = argument.substr(std::string_view("--value-shape=").size());
+      if (shape == "legacy")
+        options.value_shape = ValueShape::kLegacy;
+      else if (shape == "low-cardinality-string")
+        options.value_shape = ValueShape::kLowCardinalityString;
+      else if (shape == "variable-string")
+        options.value_shape = ValueShape::kVariableString;
+      else if (shape == "long-run-int")
+        options.value_shape = ValueShape::kLongRunInt;
+      else if (shape == "narrow-int")
+        options.value_shape = ValueShape::kNarrowInt;
+      else {
+        std::cerr << "invalid --value-shape value\n";
+        return 1;
+      }
     } else {
       benchmark_args.push_back(argv[index]);
     }
@@ -1114,16 +1289,22 @@ int main(int argc, char** argv) {
       options.selectivity_percent == 0 || options.selectivity_percent > 100 ||
       options.row_group_rows == 0 || options.row_group_rows > 262144 ||
       (options.projected_columns > 1 && options.unprojected_binary_bytes > 0) ||
+      (options.value_shape != ValueShape::kLegacy &&
+       (options.projected_binary_bytes > 0 || options.unprojected_binary_bytes > 0)) ||
       options.buffered_budget_bytes == 0 ||
       (options.cache_bypass && options.segment_path.empty()) ||
+      (options.skip_preflight && options.segment_path.empty()) ||
       (options.unprojected_binary_bytes > 0 && options.generate_path.empty())) {
-    std::cerr << "use 1 <= --rows=N <= 100000000 with exactly one of "
-                 "--generate=PATH, --generate-parquet=PATH, "
-                 "--generate-parquet-zstd=PATH or --segment=PATH; optional Segment-only "
-                 "--unprojected-binary-bytes=20..4096 (Segment generator only), "
-                 "--projected-binary-bytes=20..4096, --projected-columns=1..15; "
-                 "--selectivity-percent=1..100, --row-group-rows=1..262144 "
-                 "positive --buffer-budget-bytes=N; scan-only --cache-bypass on macOS\n";
+    std::cerr
+        << "use 1 <= --rows=N <= 100000000 with exactly one of "
+           "--generate=PATH, --generate-parquet=PATH, "
+           "--generate-parquet-zstd=PATH or --segment=PATH; optional Segment-only "
+           "--unprojected-binary-bytes=20..4096 (Segment generator only), "
+           "--projected-binary-bytes=20..4096, --projected-columns=1..15; "
+           "--value-shape=legacy|low-cardinality-string|variable-string|long-run-int|narrow-int; "
+           "--selectivity-percent=1..100, --row-group-rows=1..262144 "
+           "positive --buffer-budget-bytes=N; scan-only --cache-bypass on macOS and "
+           "--skip-preflight for one-pass cache experiments\n";
     return 1;
   }
   if (!options.generate_path.empty()) {
@@ -1159,12 +1340,14 @@ int main(int argc, char** argv) {
   benchmark::AddCustomContext("parquet_compression", "UNCOMPRESSED and ZSTD; explicit input paths");
   benchmark::AddCustomContext("row_group_rows", std::to_string(options.row_group_rows));
   benchmark::AddCustomContext("cache_mode", options.cache_bypass ? "macOS_F_NOCACHE" : "default");
+  benchmark::AddCustomContext("preflight", options.skip_preflight ? "skipped" : "full_value_check");
   benchmark::AddCustomContext("output_batch_rows", std::to_string(kOutputBatchRows));
   benchmark::AddCustomContext("buffered_budget_bytes",
                               std::to_string(options.buffered_budget_bytes));
   benchmark::AddCustomContext("projected_binary_bytes",
                               std::to_string(options.projected_binary_bytes));
   benchmark::AddCustomContext("projected_columns", std::to_string(options.projected_columns));
+  benchmark::AddCustomContext("value_shape", ShapeName(options.value_shape));
   benchmark::AddCustomContext("selectivity_percent", std::to_string(options.selectivity_percent));
   benchmark::AddCustomContext(
       "query",
