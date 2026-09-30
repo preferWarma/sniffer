@@ -4,10 +4,11 @@
 Arrow `RecordBatch` 写成自描述文件，并通过索引剪枝、列投影和谓词下推，以
 `RecordBatchIterator` 的形式流式读取查询结果。
 
-项目当前处于 **experimental** 阶段：v0.1 的格式、索引扫描和基础编码三阶段已实现，
-v0.2 的性能与并发读取专项正在收尾，尚未通过全部发布验收。当前基准只代表指定硬件、
-数据分布与 warm-cache 条件，不能视为通用生产性能承诺。验收进度与未完成项见
-[`docs/PERFORMANCE_OPTIMIZATION_V0.2.md`](docs/PERFORMANCE_OPTIMIZATION_V0.2.md)。
+项目当前处于 **experimental** 阶段：v0.1 的格式、索引扫描和基础编码三阶段已实现；
+v0.2 性能与并发读取专项已按范围决定收尾，但未通过全部原始发布验收。
+基准只代表指定硬件、数据分布和缓存条件，不能视为通用生产性能承诺。
+收尾取舍见 [`v0.2 收尾记录`](docs/V0.2_CLOSEOUT.md)，原始验收与未完成项见
+[`v0.2 专项 TODO`](docs/PERFORMANCE_OPTIMIZATION_V0.2.md)。
 
 ## 当前能力
 
@@ -296,6 +297,7 @@ standalone smoke corpus，用于检查任意 Segment 输入的解析、checksum�
 - [阶段二索引与扫描格式决策](docs/decisions/0002-phase-two-index-and-scan-format.md)
 - [阶段三编码与选择器决策](docs/decisions/0003-phase-three-encodings-and-selection.md)
 - [v0.2 性能优化专项 TODO](docs/PERFORMANCE_OPTIMIZATION_V0.2.md)
+- [v0.2 工作阶段收尾记录](docs/V0.2_CLOSEOUT.md)
 
 ## 当前边界
 

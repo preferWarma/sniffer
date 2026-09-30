@@ -1,10 +1,12 @@
-# Sniffer Core v0.2：基准与 Parquet 对照（进行中）
+# Sniffer Core v0.2：基准与 Parquet 对照（阶段归档）
 
 本记录从 2026-09-23 起使用 Parquet 作为文件格式对照。v1 的 Arrow IPC 数字保留在
 [`BENCHMARK_V1.md`](BENCHMARK_V1.md)，两版的 Row Group、代码和测量口径不同，不能直接以表中
 绝对值推导版本间提速。本报告已补 16 列宽表、同机旧版对照、跨六种分布的
 warm-cache / `F_NOCACHE` 参数矩阵，以及总量超过物理内存的首次读取实验。
-未能证明每次目标读取都是真正的物理 cold-cache，因此仍不是 v0.2 最终验收报告。
+未能证明每次目标读取都是真正的物理 cold-cache，因此本报告不是对原始发布
+验收条件全部通过的声明。v0.2 按范围决定收尾，未通过项与取舍见
+[`v0.2 收尾记录`](../docs/V0.2_CLOSEOUT.md)。
 
 ## 环境与口径
 
