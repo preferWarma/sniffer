@@ -251,9 +251,14 @@ sniffer_mem_dir=$(mktemp -d)
 及库初始化，Arrow pool 峰值不包含非 Arrow 分配。方法与结果见
 [`bench/BENCHMARK_V2.md`](bench/BENCHMARK_V2.md)。
 同一可执行文件还提供 `BoundedParallelReaderScan/{2,4,8}` 的单请求内部并行
-对照、`ParquetReaderOnlyScan/{Uncompressed,ZSTD}` 的同计划 Reader-only 对照
+对照，以及 `ConcurrentReaderScan/*/{2,4}` 的多请求对照：
+`SerialPerRequest` / `InternalParallelPerRequest` 共享 Reader，
+`IndependentSerialPerRequest` / `IndependentInternalParallelPerRequest` 每请求独立 Reader。
+这些 case 把调用线程创建计入时间，并按请求分别应用缓冲预算。
+`ParquetReaderOnlyScan/{Uncompressed,ZSTD}` 是同计划 Reader-only 对照
 （先用 `--generate-parquet` / `--generate-parquet-zstd` 生成文件，再传入
-`--parquet` / `--parquet-zstd`），以及实验性的
+`--parquet` / `--parquet-zstd`）；`ConcurrentParquetReaderScan/{Uncompressed,ZSTD}/{2,4}`
+使用每请求独立 Parquet Reader 作多请求对照。另有实验性的
 `ShardedSortRangeScan/{1,2,4,8}` 应用层范围分片上界；
 内部并行与应用层分片不是同一执行路径，见
 [v0.2 基准记录](bench/BENCHMARK_V2.md)。

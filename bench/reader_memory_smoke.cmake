@@ -295,6 +295,44 @@ execute_process(
   OUTPUT_VARIABLE mismatched_rg_output
   ERROR_VARIABLE mismatched_rg_error
 )
+execute_process(
+  COMMAND "${READER_MEMORY_EXE}" "--segment=${small_rg_segment}" --rows=2048
+          --row-group-rows=1024 --projected-binary-bytes=32 --projected-columns=4
+          "--benchmark_filter=^ConcurrentReaderScan/(SerialPerRequest|InternalParallelPerRequest|IndependentSerialPerRequest|IndependentInternalParallelPerRequest)/2/real_time$"
+          --benchmark_dry_run
+  RESULT_VARIABLE concurrent_result
+  OUTPUT_VARIABLE concurrent_output
+  ERROR_VARIABLE concurrent_error
+)
+if(NOT concurrent_result EQUAL 0 OR
+   NOT "${concurrent_output}${concurrent_error}" MATCHES "ConcurrentReaderScan/SerialPerRequest/2" OR
+   NOT "${concurrent_output}${concurrent_error}" MATCHES "ConcurrentReaderScan/InternalParallelPerRequest/2" OR
+   NOT "${concurrent_output}${concurrent_error}" MATCHES "ConcurrentReaderScan/IndependentSerialPerRequest/2" OR
+   NOT "${concurrent_output}${concurrent_error}" MATCHES "ConcurrentReaderScan/IndependentInternalParallelPerRequest/2" OR
+   NOT "${concurrent_output}${concurrent_error}" MATCHES "reader_handles=2" OR
+   NOT "${concurrent_output}${concurrent_error}" MATCHES "workers_started_total=4" OR
+   "${concurrent_output}${concurrent_error}" MATCHES "ERROR OCCURRED")
+  file(REMOVE "${small_rg_segment}" "${small_rg_parquet}" "${small_rg_zstd}")
+  message(FATAL_ERROR "concurrent Reader-only scan failed: ${concurrent_output}${concurrent_error}")
+endif()
+execute_process(
+  COMMAND "${READER_MEMORY_EXE}" "--segment=${small_rg_segment}"
+          "--parquet=${small_rg_parquet}" "--parquet-zstd=${small_rg_zstd}"
+          --rows=2048 --row-group-rows=1024 --projected-binary-bytes=32 --projected-columns=4
+          "--benchmark_filter=^ConcurrentParquetReaderScan/(Uncompressed|ZSTD)/2/real_time$"
+          --benchmark_dry_run
+  RESULT_VARIABLE concurrent_parquet_result
+  OUTPUT_VARIABLE concurrent_parquet_output
+  ERROR_VARIABLE concurrent_parquet_error
+)
+if(NOT concurrent_parquet_result EQUAL 0 OR
+   NOT "${concurrent_parquet_output}${concurrent_parquet_error}" MATCHES "ConcurrentParquetReaderScan/Uncompressed/2" OR
+   NOT "${concurrent_parquet_output}${concurrent_parquet_error}" MATCHES "ConcurrentParquetReaderScan/ZSTD/2" OR
+   NOT "${concurrent_parquet_output}${concurrent_parquet_error}" MATCHES "reader_handles=2" OR
+   "${concurrent_parquet_output}${concurrent_parquet_error}" MATCHES "ERROR OCCURRED")
+  file(REMOVE "${small_rg_segment}" "${small_rg_parquet}" "${small_rg_zstd}")
+  message(FATAL_ERROR "concurrent Parquet Reader-only scan failed: ${concurrent_parquet_output}${concurrent_parquet_error}")
+endif()
 if(APPLE)
   execute_process(
     COMMAND "${READER_MEMORY_EXE}" "--segment=${small_rg_segment}"

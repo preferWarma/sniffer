@@ -458,11 +458,185 @@ void BoundedParallelReaderScan(benchmark::State& state) {
   ReaderOnlyScanImpl(state, static_cast<uint32_t>(state.range(0)));
 }
 
+void ConcurrentReaderScan(benchmark::State& state, uint32_t workers_per_query, bool share_reader) {
+  const uint32_t queries = static_cast<uint32_t>(state.range(0));
+  std::vector<std::unique_ptr<sniffer::SegmentReader>> readers;
+  readers.reserve(share_reader ? 1U : queries);
+  for (uint32_t index = 0; index < (share_reader ? 1U : queries); ++index) {
+    auto opened = sniffer::SegmentReader::OpenWithOptions(
+        options.segment_path, sniffer::ReaderOpenOptions{.bypass_os_cache = options.cache_bypass});
+    if (!opened.ok()) {
+      state.SkipWithError(opened.status().ToString());
+      return;
+    }
+    if ((*opened)->num_row_groups() != ExpectedRowGroups()) {
+      state.SkipWithError("Segment Row Group count differs from --row-group-rows");
+      return;
+    }
+    readers.push_back(std::move(*opened));
+  }
+  sniffer::IOPlan plan;
+  for (uint32_t projection = 0; projection < options.projected_columns; ++projection) {
+    plan.projection_field_ids.push_back(projection + 2U);
+  }
+  plan.conjunctive_predicates = {
+      {1, sniffer::Predicate::Op::kGe, std::make_shared<arrow::Int64Scalar>(QueryLowerBound())}};
+  plan.output_batch_rows = kOutputBatchRows;
+  sniffer::ScanExecutionOptions execution;
+  execution.worker_count = workers_per_query;
+  execution.max_in_flight_row_groups = std::max<uint32_t>(workers_per_query, 2U);
+  execution.max_buffered_bytes = options.buffered_budget_bytes;
+  const uint64_t expected_rows = static_cast<uint64_t>(options.rows - QueryLowerBound());
+
+  struct Measurement {
+    uint64_t total_rows = 0;
+    uint64_t row_groups_pruned = 0;
+    uint64_t chunks_read = 0;
+    uint64_t bytes_read = 0;
+    uint64_t workers_started = 0;
+    uint64_t peak_in_flight_per_query = 0;
+    uint64_t peak_reserved_per_query = 0;
+  };
+  const auto run = [&](bool verify_values) -> arrow::Result<Measurement> {
+    std::vector<arrow::Status> statuses(queries);
+    std::vector<uint64_t> rows(queries, 0);
+    std::vector<std::shared_ptr<sniffer::ScanMetrics>> metrics(queries);
+    std::vector<std::jthread> callers;
+    callers.reserve(queries);
+    for (uint32_t query = 0; query < queries; ++query) {
+      metrics[query] = std::make_shared<sniffer::ScanMetrics>();
+      callers.emplace_back([&, query] {
+        auto created = readers[share_reader ? 0U : query]->Scan(plan, execution, metrics[query]);
+        if (!created.ok()) {
+          statuses[query] = created.status();
+          return;
+        }
+        auto iterator = std::move(*created);
+        int64_t expected_value = QueryLowerBound();
+        for (;;) {
+          auto next = iterator.Next();
+          if (!next.ok()) {
+            statuses[query] = next.status();
+            return;
+          }
+          if (!*next) {
+            break;
+          }
+          rows[query] += static_cast<uint64_t>((*next)->num_rows());
+          if (verify_values) {
+            const auto status = VerifyGeneratedProjection(**next, 0, 0, &expected_value);
+            if (!status.ok()) {
+              statuses[query] = status;
+              return;
+            }
+          } else {
+            for (const auto& column : (*next)->columns()) {
+              benchmark::DoNotOptimize(column->data().get());
+            }
+          }
+        }
+        if (rows[query] != expected_rows || (verify_values && expected_value != options.rows)) {
+          statuses[query] = arrow::Status::Invalid("concurrent scan output mismatch");
+        }
+      });
+    }
+    for (auto& caller : callers) {
+      caller.join();
+    }
+    Measurement measured;
+    for (uint32_t query = 0; query < queries; ++query) {
+      ARROW_RETURN_NOT_OK(statuses[query]);
+      measured.total_rows += rows[query];
+      measured.row_groups_pruned += metrics[query]->row_groups_pruned;
+      measured.chunks_read += metrics[query]->column_chunks_read;
+      measured.bytes_read += metrics[query]->chunk_bytes_read;
+      measured.workers_started += metrics[query]->parallel_workers_started;
+      measured.peak_in_flight_per_query = std::max(
+          measured.peak_in_flight_per_query, metrics[query]->parallel_peak_in_flight_row_groups);
+      measured.peak_reserved_per_query =
+          std::max(measured.peak_reserved_per_query, metrics[query]->parallel_peak_reserved_bytes);
+    }
+    return measured;
+  };
+
+  auto checked = run(true);
+  if (!checked.ok()) {
+    state.SkipWithError(checked.status().ToString());
+    return;
+  }
+  Measurement totals;
+  for (auto _ : state) {
+    (void)_;
+    auto result = run(false);
+    if (!result.ok()) {
+      state.SkipWithError(result.status().ToString());
+      return;
+    }
+    totals.total_rows += result->total_rows;
+    totals.row_groups_pruned += result->row_groups_pruned;
+    totals.chunks_read += result->chunks_read;
+    totals.bytes_read += result->bytes_read;
+    totals.workers_started = std::max(totals.workers_started, result->workers_started);
+    totals.peak_in_flight_per_query =
+        std::max(totals.peak_in_flight_per_query, result->peak_in_flight_per_query);
+    totals.peak_reserved_per_query =
+        std::max(totals.peak_reserved_per_query, result->peak_reserved_per_query);
+  }
+  std::error_code file_error;
+  const uint64_t file_bytes = std::filesystem::file_size(options.segment_path, file_error);
+  if (file_error) {
+    state.SkipWithError(file_error.message());
+    return;
+  }
+  state.counters["concurrent_queries"] = static_cast<double>(queries);
+  state.counters["reader_handles"] = static_cast<double>(readers.size());
+  state.counters["file_bytes"] = static_cast<double>(file_bytes);
+  state.counters["workers_per_query"] = static_cast<double>(workers_per_query);
+  state.counters["workers_started_total"] = static_cast<double>(totals.workers_started);
+  state.counters["buffered_budget_bytes_per_query"] =
+      static_cast<double>(options.buffered_budget_bytes);
+  state.counters["peak_in_flight_per_query"] = static_cast<double>(totals.peak_in_flight_per_query);
+  state.counters["peak_reserved_bytes_per_query"] =
+      static_cast<double>(totals.peak_reserved_per_query);
+  state.counters["output_rows_per_iteration"] =
+      static_cast<double>(totals.total_rows) / static_cast<double>(state.iterations());
+  state.counters["row_groups_pruned_per_iteration"] =
+      static_cast<double>(totals.row_groups_pruned) / static_cast<double>(state.iterations());
+  state.counters["column_chunks_read_per_iteration"] =
+      static_cast<double>(totals.chunks_read) / static_cast<double>(state.iterations());
+  state.counters["chunk_bytes_read_per_iteration"] =
+      static_cast<double>(totals.bytes_read) / static_cast<double>(state.iterations());
+  state.counters["process_peak_rss_bytes"] = static_cast<double>(ProcessPeakRssBytes());
+  state.counters["arrow_pool_peak_bytes"] =
+      static_cast<double>(arrow::default_memory_pool()->max_memory());
+  state.SetItemsProcessed(state.iterations() * static_cast<int64_t>(expected_rows) * queries);
+}
+
 BENCHMARK(ReaderOnlyScan)->UseRealTime()->Unit(benchmark::kMillisecond);
 BENCHMARK(BoundedParallelReaderScan)
     ->Arg(2)
     ->Arg(4)
     ->Arg(8)
+    ->UseRealTime()
+    ->Unit(benchmark::kMillisecond);
+BENCHMARK_CAPTURE(ConcurrentReaderScan, SerialPerRequest, 1, true)
+    ->Arg(2)
+    ->Arg(4)
+    ->UseRealTime()
+    ->Unit(benchmark::kMillisecond);
+BENCHMARK_CAPTURE(ConcurrentReaderScan, InternalParallelPerRequest, 4, true)
+    ->Arg(2)
+    ->Arg(4)
+    ->UseRealTime()
+    ->Unit(benchmark::kMillisecond);
+BENCHMARK_CAPTURE(ConcurrentReaderScan, IndependentSerialPerRequest, 1, false)
+    ->Arg(2)
+    ->Arg(4)
+    ->UseRealTime()
+    ->Unit(benchmark::kMillisecond);
+BENCHMARK_CAPTURE(ConcurrentReaderScan, IndependentInternalParallelPerRequest, 4, false)
+    ->Arg(2)
+    ->Arg(4)
     ->UseRealTime()
     ->Unit(benchmark::kMillisecond);
 
@@ -618,6 +792,108 @@ BENCHMARK_CAPTURE(ParquetReaderOnlyScan, Uncompressed, false)
     ->UseRealTime()
     ->Unit(benchmark::kMillisecond);
 BENCHMARK_CAPTURE(ParquetReaderOnlyScan, ZSTD, true)->UseRealTime()->Unit(benchmark::kMillisecond);
+
+void ConcurrentParquetReaderScan(benchmark::State& state, bool zstd) {
+  const auto& path = zstd ? options.parquet_zstd_path : options.parquet_path;
+  if (path.empty()) {
+    state.SkipWithError(zstd ? "--parquet-zstd=PATH is required" : "--parquet=PATH is required");
+    return;
+  }
+  const uint32_t queries = static_cast<uint32_t>(state.range(0));
+  std::vector<std::unique_ptr<parquet::arrow::FileReader>> readers;
+  readers.reserve(queries);
+  for (uint32_t query = 0; query < queries; ++query) {
+    auto opened = sniffer_bench::OpenParquet(path, kOutputBatchRows, options.cache_bypass);
+    if (!opened.ok()) {
+      state.SkipWithError(opened.status().ToString());
+      return;
+    }
+    if (static_cast<uint64_t>((*opened)->num_row_groups()) != ExpectedRowGroups()) {
+      state.SkipWithError("Parquet Row Group count differs from --row-group-rows");
+      return;
+    }
+    readers.push_back(std::move(*opened));
+  }
+  const auto run = [&](bool verify_values) -> arrow::Result<ParquetMeasurement> {
+    std::vector<arrow::Status> statuses(queries);
+    std::vector<ParquetMeasurement> measurements(queries);
+    std::vector<std::jthread> callers;
+    callers.reserve(queries);
+    for (uint32_t query = 0; query < queries; ++query) {
+      callers.emplace_back([&, query] {
+        auto result = ScanParquetOnce(readers[query].get(), options.rows, verify_values);
+        if (!result.ok()) {
+          statuses[query] = result.status();
+        } else {
+          measurements[query] = std::move(*result);
+        }
+      });
+    }
+    for (auto& caller : callers) {
+      caller.join();
+    }
+    ParquetMeasurement measured;
+    for (uint32_t query = 0; query < queries; ++query) {
+      ARROW_RETURN_NOT_OK(statuses[query]);
+      measured.output_rows += measurements[query].output_rows;
+      measured.row_groups_pruned += measurements[query].row_groups_pruned;
+      measured.candidate_column_bytes += measurements[query].candidate_column_bytes;
+      measured.candidate_column_chunks += measurements[query].candidate_column_chunks;
+    }
+    return measured;
+  };
+
+  auto checked = run(true);
+  if (!checked.ok()) {
+    state.SkipWithError(checked.status().ToString());
+    return;
+  }
+  ParquetMeasurement totals;
+  for (auto _ : state) {
+    (void)_;
+    auto result = run(false);
+    if (!result.ok()) {
+      state.SkipWithError(result.status().ToString());
+      return;
+    }
+    totals.output_rows += result->output_rows;
+    totals.row_groups_pruned += result->row_groups_pruned;
+    totals.candidate_column_bytes += result->candidate_column_bytes;
+    totals.candidate_column_chunks += result->candidate_column_chunks;
+  }
+  std::error_code file_error;
+  const uint64_t file_bytes = std::filesystem::file_size(path, file_error);
+  if (file_error) {
+    state.SkipWithError(file_error.message());
+    return;
+  }
+  state.counters["concurrent_queries"] = static_cast<double>(queries);
+  state.counters["reader_handles"] = static_cast<double>(queries);
+  state.counters["file_bytes"] = static_cast<double>(file_bytes);
+  state.counters["output_rows_per_iteration"] =
+      static_cast<double>(totals.output_rows) / static_cast<double>(state.iterations());
+  state.counters["row_groups_pruned_per_iteration"] =
+      static_cast<double>(totals.row_groups_pruned) / static_cast<double>(state.iterations());
+  state.counters["candidate_column_chunks_per_iteration"] =
+      static_cast<double>(totals.candidate_column_chunks) / static_cast<double>(state.iterations());
+  state.counters["candidate_column_bytes_per_iteration"] =
+      static_cast<double>(totals.candidate_column_bytes) / static_cast<double>(state.iterations());
+  state.counters["process_peak_rss_bytes"] = static_cast<double>(ProcessPeakRssBytes());
+  state.counters["arrow_pool_peak_bytes"] =
+      static_cast<double>(arrow::default_memory_pool()->max_memory());
+  state.SetItemsProcessed(state.iterations() * (options.rows - QueryLowerBound()) * queries);
+}
+
+BENCHMARK_CAPTURE(ConcurrentParquetReaderScan, Uncompressed, false)
+    ->Arg(2)
+    ->Arg(4)
+    ->UseRealTime()
+    ->Unit(benchmark::kMillisecond);
+BENCHMARK_CAPTURE(ConcurrentParquetReaderScan, ZSTD, true)
+    ->Arg(2)
+    ->Arg(4)
+    ->UseRealTime()
+    ->Unit(benchmark::kMillisecond);
 
 sniffer::IOPlan ShardPlan(int64_t lower, int64_t upper) {
   sniffer::IOPlan plan;
@@ -892,8 +1168,13 @@ int main(int argc, char** argv) {
   benchmark::AddCustomContext("selectivity_percent", std::to_string(options.selectivity_percent));
   benchmark::AddCustomContext(
       "query",
-      "ReaderOnlyScan, BoundedParallelReaderScan and ParquetReaderOnlyScan: "
+      "ReaderOnlyScan, BoundedParallelReaderScan, ConcurrentReaderScan, ParquetReaderOnlyScan "
+      "and ConcurrentParquetReaderScan: "
       "key >= rows * (100 - selectivity_percent) / 100, project value and optional extra columns; "
+      "ConcurrentReaderScan has shared/independent Reader variants and includes caller-thread "
+      "creation; "
+      "ConcurrentParquetReaderScan uses one Reader per request and includes caller-thread "
+      "creation; "
       "ShardedSortRangeScan: partition sort-key range "
       "[lower,rows); project value");
   int benchmark_argc = static_cast<int>(benchmark_args.size());

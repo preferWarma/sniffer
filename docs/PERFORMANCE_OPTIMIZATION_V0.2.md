@@ -254,6 +254,17 @@ SIMD、多级编码链和新压缩算法只有在标量路径完成剖析和优�
   - [x] 预算估算改为仅计谓词/排序键/投影列并集，不因无关宽列退回串行；
         1 MiB 预算下的 nullable/binary 回归与 100K/1M Reader-only 基准已记录。
         worker 在该窄投影场景可启动但比串行慢，故保持显式 opt-in。
+  - [x] 对 1M 行、8K Row Group、4 列 nullable binary 宽投影扫掠 1/4/8/12/16/64 MiB
+        调度预算；记录在途组数、估算预留、进程高水位 RSS 和 Arrow pool 峰值。
+        预算不是 RSS 上限；其他 Row Group/宽度的内存矩阵仍待验证。
+  - [x] 同一 Reader 上 2/4 个并发请求 × 每请求串行/4-worker 的同数据对照已测，
+        分别记录进程 RSS、Arrow pool、输出与实际读取量；每请求预算不能作为
+        多请求总内存上限，仍缺跨数据分布的对照。
+  - [x] 同一批文件和查询的 Parquet 未压缩/ZSTD 多查询对照已测；每个 Parquet
+        请求用独立 Reader，候选列块大小与 Sniffer 实际读取字节不可等同。
+  - [x] 再补 Sniffer 每请求独立 Reader 的同数据控制组，使其与 Parquet 的
+        Reader 数量对齐；共享/独立模型的本轮 P50 接近，但非交错 A/B，
+        扫描实现仍不同，不能据此归纳格式固有的内存或速度差异。
 - [ ] 增加 1/2/4/8 线程吞吐、单请求延迟、峰值 RSS 和分配量 benchmark；并发多查询与单查询
       内部并行分别报告，在相同硬件、数据、Row Group、选择率与线程预算下对照 Parquet。
   - [x] 多查询 1/2/4/8 线程的 Sniffer 共享/独立 Reader、Parquet 无 codec 压缩/ZSTD
@@ -301,6 +312,53 @@ SIMD、多级编码链和新压缩算法只有在标量路径完成剖析和优�
 - [x] 更新 README 的性能状态，不把合成 benchmark 结果表述为通用生产性能。
 
 ## 11. 执行记录
+
+### 2026-09-30：多请求独立 Reader 控制组
+
+同一 1M 行 binary 文件、每请求 12 MiB 预算下，为 Sniffer 增加每请求独立
+Reader 的 2/4 请求基准。串行 P50 为 33.709/35.061 ms，内部 4-worker
+为 13.569/22.696 ms；相应进程高水位 RSS 为 16.94/31.91 MiB 与
+58.52/93.02 MiB。每请求逐值验证、输出行数、剪枝和 ColumnChunk 读取量
+与共享 Reader 路径相同。两种 Reader 模型结果接近，不能将微小差异归因；
+原始 7 次样本及与 Parquet 的独立 Reader 对照见
+[`bench/BENCHMARK_V2.md`](../bench/BENCHMARK_V2.md)。仍需 cold-cache、
+跨数据分布和不同扫描实现的归因分析。
+
+### 2026-09-30：同数据多请求 Parquet 未压缩/ZSTD 对照
+
+`ConcurrentParquetReaderScan` 用每请求独立 Parquet Reader，在与上一节 Sniffer
+相同的 1M 行、8K Row Group、4 列 nullable binary、50% 选择率条件下运行。
+2/4 个请求的未压缩 P50 为 35.781/38.722 ms，ZSTD 为 77.377/82.468 ms；
+对应进程高水位 RSS 为 168.20/328.59 MiB、168.45/329.53 MiB。
+每条请求逐值验证输出 500,000 行、剪枝 61/123 组；Parquet 只报告元数据
+候选列块大小，不冒充实测物理读取字节。原始 7 次样本、Sniffer 并列表和资源
+口径见 [`bench/BENCHMARK_V2.md`](../bench/BENCHMARK_V2.md)。上节已补 Sniffer
+独立 Reader 控制组，但两种格式的扫描/缓冲策略仍不同；这只是在特定实现上的
+warm-cache 对照，不完成 cold-cache 或完整并发矩阵验收。
+
+### 2026-09-30：多请求叠加内部并行
+
+Reader-only benchmark 新增同一 Reader 的 2/4 个并发请求，对比每请求串行与
+每请求 opt-in 4-worker；请求线程创建与 join 计入时间。1M 行、8K Row Group、
+4 列 nullable 高熵 binary、50% 选择率、每请求 12 MiB 调度预算、各 case
+独立进程 7 次重复：2 个请求的串行/内部并行 P50 为 34.036/13.893 ms，
+进程高水位 RSS 为 18.63/58.84 MiB；4 个请求为 34.970/22.534 ms，
+RSS 为 31.33/95.14 MiB。每请求输出/剪枝/读取量一致，原始样本见
+[`bench/BENCHMARK_V2.md`](../bench/BENCHMARK_V2.md)。Release 与 ASan+UBSan
+Reader-only smoke 均通过。多请求总内存会随内部并行显著增大；进程高水位包含
+计时前校验，仍不是实际单次扫描增量或严格 RSS 上限。
+
+### 2026-09-30：并行调度预算与实际内存
+
+同一 1M 行、8K Row Group、4 列 nullable 高熵 binary、50% 选择率文件，
+4-worker 单请求的调度预算从 1 MiB 扫到 64 MiB；独立进程各重复 7 次。
+1 MiB 回退串行；4 MiB 峰值 2 组在途、P50 31.770 ms；8 MiB 峰值 3 组、
+P50 12.325 ms；12/16/64 MiB 均达到 4 组、P50 9.492/9.497/9.465 ms。
+12 MiB 档估算预留峰值 10.58 MiB，而进程高水位 RSS 为 24.73 MiB：
+这证实 `max_buffered_bytes` 只能作为调度估算预算，不能承诺进程内存硬上限。
+测量方法、7 次原始样本、Arrow pool 与 RSS 限制见
+[`bench/BENCHMARK_V2.md`](../bench/BENCHMARK_V2.md)；不因此勾选完整内存/
+并发矩阵或 cold-cache 验收项。
 
 ### 2026-09-30：同一 Reader 的混合内部并行回归
 
